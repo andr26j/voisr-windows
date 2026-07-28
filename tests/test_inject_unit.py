@@ -325,3 +325,30 @@ def test_injection_failure_still_restores_held_modifiers(monkeypatch):
     with pytest.raises(OSError):
         inject._post_ctrl_v()
     assert restored == [inject.VK_MENU]
+
+
+def test_paste_blocked_when_foreground_is_our_own_window(monkeypatch):
+    monkeypatch.setattr(inject, "foreground_is_elevated", lambda: False)
+    monkeypatch.setattr(inject, "foreground_is_own_process", lambda: True)
+    sent = []
+    monkeypatch.setattr(inject, "_send_ctrl_v", lambda: sent.append(True))
+    assert inject._post_ctrl_v() is False
+    assert sent == []
+
+
+def test_paste_proceeds_when_foreground_is_another_process(monkeypatch):
+    monkeypatch.setattr(inject, "foreground_is_elevated", lambda: False)
+    monkeypatch.setattr(inject, "foreground_is_own_process", lambda: False)
+    monkeypatch.setattr(inject, "_send_ctrl_v", lambda: True)
+    assert inject._post_ctrl_v() is True
+
+
+def test_own_process_check_failure_does_not_block_paste(monkeypatch):
+    """Unknown must not mean blocked — that would refuse pastes that
+    would have worked, which is worse than the rare self-paste."""
+    monkeypatch.setattr(inject, "foreground_is_elevated", lambda: False)
+    monkeypatch.setattr(
+        inject, "_foreground_pid",
+        lambda: (_ for _ in ()).throw(OSError("no window")))
+    monkeypatch.setattr(inject, "_send_ctrl_v", lambda: True)
+    assert inject._post_ctrl_v() is True

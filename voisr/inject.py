@@ -123,21 +123,40 @@ def _process_integrity_level(pid: int) -> int | None:
         kernel32.CloseHandle(handle)
 
 
+def _foreground_pid() -> int | None:
+    """PID owning the foreground window, or None if there is none."""
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+
 def foreground_is_elevated() -> bool:
     """True when the focused window outranks us, meaning SendInput will be
     silently swallowed by UIPI. Unknown is treated as not-elevated: guessing
     'blocked' would refuse pastes that would have worked."""
     try:
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd:
+        pid = _foreground_pid()
+        if pid is None:
             return False
-        pid = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        theirs = _process_integrity_level(pid.value)
+        theirs = _process_integrity_level(pid)
         ours = _process_integrity_level(kernel32.GetCurrentProcessId())
         if theirs is None or ours is None:
             return False
         return theirs > ours
+    except Exception:
+        return False
+
+
+def foreground_is_own_process() -> bool:
+    """True when the foreground window belongs to our own process, meaning
+    a paste would land in our own webview instead of the target app. Unknown
+    is treated as not-ours: guessing 'blocked' would refuse pastes that
+    would have worked."""
+    try:
+        return _foreground_pid() == kernel32.GetCurrentProcessId()
     except Exception:
         return False
 
@@ -147,6 +166,8 @@ def _post_ctrl_v() -> bool:
     reports success in that case, so checking beforehand is the only way to
     avoid claiming a paste that never happened."""
     if foreground_is_elevated():
+        return False
+    if foreground_is_own_process():
         return False
     held = _held_modifiers()
     for vk in held:
