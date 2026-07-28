@@ -41,8 +41,10 @@ def _default_registry():
 
 
 def _launch_command() -> str:
+    # voisr.ui, not voisr.app: launching at login should bring up the
+    # dashboard (which starts the hotkey service itself), not the bare CLI.
     pythonw = sys.executable.replace("python.exe", "pythonw.exe")
-    return f'"{pythonw}" -m voisr.app'
+    return f'"{pythonw}" -m voisr.ui'
 
 
 def is_enabled(registry=None) -> bool:
