@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from voisr.cleanup import clean
+from voisr.history import HistoryStore
 from voisr.inject import paste_at_cursor, set_clipboard
 from voisr.keys import DEFAULT_HOTKEY, key_label, resolve_key
 from voisr.keytap import WindowsKeyListener
@@ -55,10 +56,12 @@ class DictationResult:
 class DictationSession:
     """One press/release cycle. Owns the temp WAV and its cleanup."""
 
-    def __init__(self, recorder=None, config=None):
+    def __init__(self, recorder=None, config=None, history=None):
         self.recorder = recorder or StreamRecorder()
         self.config = config or DEFAULT_CONFIG
+        self.history = history or HistoryStore(ensure_app_data_dir() / "history.jsonl")
         self._wav = None
+        self._press_time = None
 
     def press(self, wav_path=None) -> None:
         if self._wav is not None:
@@ -68,10 +71,20 @@ class DictationSession:
             os.close(fd)
             wav_path = Path(name)
         self._wav = Path(wav_path)
+        self._press_time = time.time()
         self.recorder.start(self._wav)
+
+    def _record(self, text: str, duration_s: float) -> None:
+        try:
+            self.history.add(text, duration_s)
+        except Exception as error:
+            # History is secondary: a full disk or lock failure must not
+            # cost the user their dictation.
+            print(f"voisr: failed to record history: {error}", flush=True)
 
     def release(self) -> DictationResult | None:
         wav, self._wav = self._wav, None
+        press_time, self._press_time = self._press_time, None
         if wav is None:
             return None
         try:
@@ -83,14 +96,18 @@ class DictationSession:
             )
             if not text.strip():
                 return DictationResult("", delivered=False)
+            duration_s = time.time() - press_time if press_time else 0.0
             if not self.config.get("paste", True):
                 set_clipboard(text)
+                self._record(text, duration_s)
                 return DictationResult(text, delivered=False)
             try:
                 paste_at_cursor(text)
             except PasteDeliveryError as error:
+                self._record(text, duration_s)
                 return DictationResult(text, delivered=bool(error.pasted),
                                        blocked=not error.pasted)
+            self._record(text, duration_s)
             return DictationResult(text, delivered=True)
         finally:
             wav.unlink(missing_ok=True)

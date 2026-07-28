@@ -84,3 +84,67 @@ def test_blocked_paste_is_reported_not_swallowed(monkeypatch, tmp_path):
     result = s.release()
     assert result.blocked is True
     assert result.text == "Raw text"
+
+
+def test_successful_dictation_is_recorded(monkeypatch, tmp_path):
+    recorded = []
+
+    class FakeHistory:
+        def add(self, text, duration_s):
+            recorded.append((text, duration_s))
+            return {"id": "x", "text": text}
+
+    s, _ = session(monkeypatch, transcribe=lambda wav, **kw: "hello world")
+    s.history = FakeHistory()
+    s.press(tmp_path / "a.wav")
+    s.release()
+    assert recorded and recorded[0][0] == "Hello world"
+
+
+def test_empty_transcript_is_not_recorded(monkeypatch, tmp_path):
+    recorded = []
+
+    class FakeHistory:
+        def add(self, text, duration_s):
+            recorded.append(text)
+            return {}
+
+    s, _ = session(monkeypatch, transcribe=lambda wav, **kw: "   ")
+    s.history = FakeHistory()
+    s.press(tmp_path / "a.wav")
+    s.release()
+    assert recorded == []
+
+
+def test_blocked_paste_is_still_recorded(monkeypatch, tmp_path):
+    """A blocked paste still produced a transcript; losing it would be the
+    worst outcome, since the user cannot re-speak what they already said."""
+    recorded = []
+
+    class FakeHistory:
+        def add(self, text, duration_s):
+            recorded.append(text)
+            return {}
+
+    def blocked(text, **kw):
+        raise PasteDeliveryError("paste was blocked; clipboard preserved")
+
+    s, _ = session(monkeypatch, deliver=blocked)
+    s.history = FakeHistory()
+    s.press(tmp_path / "a.wav")
+    s.release()
+    assert recorded == ["Raw text"]
+
+
+def test_history_failure_never_loses_the_paste(monkeypatch, tmp_path):
+    """History is secondary. If it fails, the dictation must still land."""
+    class ExplodingHistory:
+        def add(self, text, duration_s):
+            raise OSError("disk full")
+
+    s, delivered = session(monkeypatch, transcribe=lambda wav, **kw: "hello")
+    s.history = ExplodingHistory()
+    s.press(tmp_path / "a.wav")
+    result = s.release()
+    assert delivered == ["Hello"]
+    assert result.delivered is True
