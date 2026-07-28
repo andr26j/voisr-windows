@@ -28,6 +28,11 @@ DEFAULT_CONFIG = {
     "paste": True,
     "dictionary": {},
     "model": None,
+    "show_widget": True,
+    "pill_theme": "classic",
+    "pill_color": None,
+    "launch_at_login": False,
+    "appearance": "system",
 }
 
 
