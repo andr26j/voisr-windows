@@ -82,10 +82,23 @@ class HistoryStore:
         return FileLock(self.lock_path)
 
     def _read(self) -> list[dict]:
-        try:
-            contents = self.path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return []
+        # A file that was just replaced (os.replace onto self.path) can be
+        # transiently locked by Windows Defender / the search indexer
+        # scanning it. That is an external, momentary condition, not
+        # corruption — retry briefly rather than raising out of list().
+        contents = None
+        last_error = None
+        for attempt in range(20):
+            try:
+                contents = self.path.read_text(encoding="utf-8")
+                break
+            except FileNotFoundError:
+                return []
+            except PermissionError as error:
+                last_error = error
+                time.sleep(0.01)
+        else:
+            raise last_error
         items = []
         for line in contents.splitlines():
             if not line.strip():
