@@ -186,7 +186,7 @@ class WindowsClipboard:
         self._open()
         try:
             self._w.empty()
-            if not self._w.set_data(CF_UNICODETEXT, text.encode("utf-16-le")):
+            if not self._w.set_data(CF_UNICODETEXT, text.encode("utf-16-le") + b"\x00\x00"):
                 raise ClipboardPreservationError("temporary clipboard write failed")
         finally:
             self._w.close()
