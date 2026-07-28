@@ -272,7 +272,7 @@ it is a fallback and why the spike runs before anything depends on it.
 
 ## Testing
 
-The 27 Python test files split the same way the modules do. Portable tests
+The 25 `test_*.py` files split the same way the modules do. Portable tests
 travel with their module. Platform tests are rewritten — and the Windows test is
 written *first* in each case, because the existing macOS test is a precise
 statement of the contract the new implementation must meet.
