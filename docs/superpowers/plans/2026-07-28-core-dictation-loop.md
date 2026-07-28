@@ -1315,7 +1315,12 @@ class KEYBDINPUT(ctypes.Structure):
 
 
 class _INPUTUNION(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("padding", ctypes.c_byte * 24)]
+    # The padding MUST be 32, not sizeof(KEYBDINPUT). The real Win32 INPUT
+    # union is sized by its largest member, MOUSEINPUT — so sizeof(INPUT) is
+    # 40 on x64, not 32. Get this wrong and SendInput rejects every call with
+    # ERROR_INVALID_PARAMETER (87) while unit tests that mock the send still
+    # pass. Nothing is injected and nothing complains.
+    _fields_ = [("ki", KEYBDINPUT), ("padding", ctypes.c_byte * 32)]
 
 
 class INPUT(ctypes.Structure):
@@ -1574,7 +1579,11 @@ def paste_at_cursor(text: str, restore_clipboard: bool = True) -> bool:
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `./venv/Scripts/python -m pytest tests/test_inject_unit.py -v`
-Expected: all pass — roughly 19 tests (14 ported + 5 new).
+Expected: all pass — 21 tests (16 ported + 5 new).
+
+Note these tests mock `_send_ctrl_v`, so they pass even if the `INPUT` struct
+layout is wrong and `SendInput` never fires. Step 6's real paste is the only
+thing that proves injection actually works. Do not skip it.
 
 - [ ] **Step 6: Verify a real paste**
 
