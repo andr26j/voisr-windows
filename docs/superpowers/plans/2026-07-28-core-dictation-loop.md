@@ -854,7 +854,18 @@ def test_write_text_returns_new_sequence_and_sets_unicode():
     snap = clip.snapshot()
     count = clip.write_text_if_unchanged("bye", snap)
     assert count == win32.sequence
-    assert win32.formats[CF_UNICODETEXT] == "bye".encode("utf-16-le")
+    assert win32.formats[CF_UNICODETEXT] == "bye".encode("utf-16-le") + b"\x00\x00"
+
+
+def test_written_text_is_null_terminated():
+    """CF_UNICODETEXT must be null-terminated or readers drop the last
+    character — observed truncating 'TEMPORARY-VOISR' to 'TEMPORARY-VOIS'."""
+    win32 = FakeWin32()
+    clip = make(win32)
+    snap = clip.snapshot()
+    clip.write_text_if_unchanged("hello", snap)
+    assert win32.formats[CF_UNICODETEXT].endswith(b"\x00\x00")
+    assert win32.formats[CF_UNICODETEXT].decode("utf-16-le").rstrip("\x00") == "hello"
 
 
 def test_write_text_refuses_when_clipboard_changed():
@@ -1087,11 +1098,18 @@ class WindowsClipboard:
         self._open()
         try:
             self._w.empty()
-            if not self._w.set_data(CF_UNICODETEXT, text.encode("utf-16-le")):
+            # The null terminator is mandatory. Without it readers drop the
+            # last character — observed truncating "TEMPORARY-VOISR" to
+            # "TEMPORARY-VOIS", which would corrupt every dictation.
+            if not self._w.set_data(CF_UNICODETEXT,
+                                    text.encode("utf-16-le") + b"\x00\x00"):
                 raise ClipboardPreservationError("temporary clipboard write failed")
-            return self._w.get_sequence()
         finally:
             self._w.close()
+        # Read the sequence AFTER close: CloseClipboard itself bumps the
+        # counter (the clipboard-history service reacts to WM_CLIPBOARDUPDATE),
+        # so a value read before closing is stale and restore would refuse.
+        return self._w.get_sequence()
 
     def restore_if_unchanged(self, snapshot, expected_change_count) -> bool:
         if self._w.get_sequence() != expected_change_count:
@@ -1112,7 +1130,7 @@ class WindowsClipboard:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `./venv/Scripts/python -m pytest tests/test_pasteboard.py -v`
-Expected: 14 passed
+Expected: 15 passed
 
 - [ ] **Step 5: Verify against the real clipboard**
 
