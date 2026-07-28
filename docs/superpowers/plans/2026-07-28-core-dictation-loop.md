@@ -2515,7 +2515,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `./venv/Scripts/python -m pytest tests/test_app.py -v`
-Expected: 9 passed
+Expected: 8 passed
 
 - [ ] **Step 5: Run the whole suite**
 
