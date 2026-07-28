@@ -1433,7 +1433,9 @@ def _write_text(text: str) -> None:
     clip._open()
     try:
         win32.empty()
-        if not win32.set_data(CF_UNICODETEXT, text.encode("utf-16-le")):
+        # Null terminator is mandatory — without it readers drop the last
+        # character. Same requirement as pasteboard.write_text_if_unchanged.
+        if not win32.set_data(CF_UNICODETEXT, text.encode("utf-16-le") + b"\x00\x00"):
             raise ClipboardPreservationError("clipboard write failed")
     finally:
         win32.close()
