@@ -104,6 +104,22 @@ def test_epoch_guard_allows_current_updates():
     assert len(widget._window.evaluated) > before
 
 
+def test_create_does_not_start_the_webview_loop(monkeypatch):
+    """webview.start() may be called exactly once per process, on the main
+    thread, after every window has been created -- pywebview raises if it
+    is called off-thread, and a second call (e.g. one owned internally by
+    the pill) can never coexist with the dashboard's own start() call.
+    create() must only register the window, never start the loop itself."""
+    calls = []
+    monkeypatch.setattr(overlay, "webview", type("_FakeWebview", (), {
+        "create_window": staticmethod(lambda *a, **kw: FakeWindow()),
+        "start": staticmethod(lambda *a, **kw: calls.append("start")),
+    })())
+    widget = RecordingWidget()
+    widget.create()
+    assert calls == [], "create() must not call webview.start()"
+
+
 def test_evaluate_js_failure_never_propagates():
     widget = RecordingWidget()
 

@@ -101,6 +101,36 @@ class RecordingWidget:
         self._hwnd = None
         self._shown = False
         self._guard_started = False
+        self._visibility_guard_started = False
+
+    def _start_visibility_guard(self) -> None:
+        """Continuously re-hide the window for as long as it should be
+        hidden. Measured on real Windows: pywebview's EdgeChromium backend
+        has a "hack to make transparent window work" (see its
+        on_navigation_start) that unconditionally Shows and Activates any
+        transparent=True window once its page starts loading -- regardless
+        of the hidden=True passed to create_window, and regardless of
+        anything create()'s finish_setup already did. That fires AFTER
+        finish_setup's one-shot hide, so without this the pill sits
+        visible (and was even briefly focused) for the entire time it is
+        not dictating. Same continuous-reassertion approach as
+        _start_foreground_guard, for the same reason: a one-shot fix loses
+        this race."""
+        if self._visibility_guard_started:
+            return
+        self._visibility_guard_started = True
+
+        def guard():
+            while True:
+                try:
+                    hwnd = self._hwnd
+                    if hwnd and not self._shown and user32.IsWindowVisible(hwnd):
+                        user32.ShowWindow(hwnd, SW_HIDE)
+                except Exception:
+                    pass
+                threading.Event().wait(0.03)
+
+        threading.Thread(target=guard, daemon=True).start()
 
     def _start_foreground_guard(self) -> None:
         """Continuously reclaim the foreground from the pill for as long as
@@ -133,8 +163,20 @@ class RecordingWidget:
         threading.Thread(target=guard, daemon=True).start()
 
     def create(self) -> None:
-        """Build the window and locate its HWND. Safe to call once; any
-        failure is swallowed so a broken pill never blocks dictation."""
+        """Register the pill's pywebview window. Must be called on the main
+        thread, before the single webview.start() call for the process.
+
+        pywebview enforces exactly one webview.start() call per process --
+        it raises WebViewException off the main thread, and every window
+        that should appear must be created (via webview.create_window())
+        before that one call, which then runs every window's message loop
+        together. So this method only builds and registers the window; it
+        does not start the loop itself. The caller (voisr.ui.main()) owns
+        the single webview.start() call, covering both the pill and the
+        dashboard window.
+
+        Safe to call once; any failure is swallowed so a broken pill never
+        blocks dictation."""
         try:
             screen_w = user32.GetSystemMetrics(SM_CXSCREEN)
             screen_h = user32.GetSystemMetrics(SM_CYSCREEN)
@@ -150,6 +192,7 @@ class RecordingWidget:
             )
 
             self._start_foreground_guard()
+            self._start_visibility_guard()
 
             # The Edge Chromium backend reveals its window asynchronously
             # once the WebView2 control finishes initializing, and that
@@ -196,7 +239,6 @@ class RecordingWidget:
                 finish_setup()
 
             threading.Thread(target=fallback_poll, daemon=True).start()
-            webview.start(gui="edgechromium")
         except Exception:
             pass
 
