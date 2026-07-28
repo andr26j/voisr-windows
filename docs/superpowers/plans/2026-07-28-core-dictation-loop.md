@@ -1885,6 +1885,20 @@ _UP_MESSAGES = (WM_KEYUP, WM_SYSKEYUP)
 HOOKPROC = ctypes.WINFUNCTYPE(
     ctypes.c_longlong, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 
+# These argtypes are MANDATORY. Without them ctypes defaults integer
+# arguments to 32-bit c_int, and lparam is pointer-sized — so every real
+# keystroke raises "OverflowError: int too long to convert" inside the
+# callback, where ctypes silently swallows it. Unit tests mock
+# CallNextHookEx and pass anyway; only a real hook exposes this.
+user32.SetWindowsHookExW.restype = wintypes.HHOOK
+user32.SetWindowsHookExW.argtypes = [
+    ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+user32.CallNextHookEx.restype = ctypes.c_longlong
+user32.CallNextHookEx.argtypes = [
+    wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
