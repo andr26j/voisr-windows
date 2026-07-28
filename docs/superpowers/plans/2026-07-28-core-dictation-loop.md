@@ -2218,22 +2218,22 @@ class RecordingWidget:
 Run: `./venv/Scripts/python -m pytest tests/test_overlay.py -v`
 Expected: 7 passed
 
-- [ ] **Step 6: Check widget.html exposes the state hook**
+- [ ] **Step 6: Confirm the real widget.html JS contract**
 
-Run: `grep -n "voisrSetState" voisr/web/widget.html`
+`widget.html` needs no modification. It already exports three globals:
 
-If absent, the macOS version is driven differently. Add this before `</body>`, adapting the class names to the ones already in the file:
+| Function | Contract |
+|---|---|
+| `setState(state)` | `"recording"` \| `"processing"` \| `"done"` \| `"error"`. No `"hidden"` — hiding is a window operation, not a DOM state. |
+| `setTheme(theme)` | One of `classic, ember, aurora, ocean, neon, breathe, scanner`. Unknown falls back to classic. |
+| `setColor(hex)` | `#RRGGBB`, or `null` to use the theme's designed colour. |
 
-```html
-<script>
-  window.voisrSetState = ({state, theme, color}) => {
-    const pill = document.querySelector(".pill");
-    pill.dataset.state = state;
-    if (theme) pill.dataset.theme = theme;
-    if (color) pill.style.setProperty("--pill-color", color);
-  };
-</script>
-```
+Verify with: `grep -n "window.setState\|window.setTheme\|window.setColor" voisr/web/widget.html`
+
+Python sanitizes both values before interpolating them into JS, mirroring
+`sanitize_pill_theme` / `sanitize_pill_color` in the macOS `ui.py`. The JS
+validates too, but config-file content must never reach an `evaluate_js`
+string unchecked.
 
 - [ ] **Step 7: Delete the spike**
 
