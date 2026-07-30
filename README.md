@@ -1,6 +1,15 @@
 # Voisr (Windows)
 
-A local-only Windows port of [Wispr Flow](https://wisprflow.ai)'s core loop: **hold a key, speak, and clean text appears at your cursor** — in any app. All processing happens on your machine (whisper.cpp, GPU-accelerated); no audio or text ever leaves it.
+A local-only Windows port of [Wispr Flow](https://wisprflow.ai)'s core loop: **hold a key, speak, and clean text appears at your cursor** — in any app. All processing happens on your machine (whisper.cpp); no audio or text ever leaves it.
+
+## Download
+
+Grab `VoisrSetup.exe` from your release channel and run it. No Python, no git checkout, no admin rights.
+
+- **The installer is unsigned.** There's no code-signing certificate yet, so Windows SmartScreen will show "Windows protected your PC" on first run. Click **More info**, then **Run anyway**. This is expected.
+- **The distributable is CPU-only.** It bundles whisper.cpp's BLAS build, not CUDA — the audience is employees on their own machines, most without an NVIDIA GPU. Measured on this machine: **~3.1 seconds to transcribe a ~14-second utterance.** Developers running from source with `scripts\setup.ps1` get the CUDA build instead, which is faster.
+- Installs per-user to `%LOCALAPPDATA%\Programs\Voisr` — no admin prompt. Uninstalling leaves `%LOCALAPPDATA%\Voisr` (your config and dictation history) alone.
+- Installer size: **~150–160 MB** compressed (the frozen bundle itself is ~300 MB, dominated by the bundled `ggml-base.en` model and whisper.cpp's BLAS DLLs).
 
 ## What it does
 
@@ -23,7 +32,7 @@ Creates the dev venv, downloads the CUDA whisper.cpp build into `bin\`, and down
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 ```
 
-This copies the runtime to `%LOCALAPPDATA%\Voisr\app` (code, whisper binary, model, and a dedicated venv) and creates Start Menu and Desktop shortcuts. It is **not** a distributable installer — it installs from this working checkout, so `scripts\setup.ps1` must have already populated `bin\` and `models\`. Someone without this repo and a Python install can't run it; see [Possible future work](#possible-future-work).
+This copies the runtime to `%LOCALAPPDATA%\Voisr\app` (code, whisper binary, model, and a dedicated venv) and creates Start Menu and Desktop shortcuts. It installs from this working checkout, so `scripts\setup.ps1` must have already populated `bin\` and `models\` — it's for developers, not end users. Someone without this repo and a Python install should use `VoisrSetup.exe` instead (see [Download](#download)); the two installs coexist and share the same config/history.
 
 The installer is safe to re-run: it skips re-copying `bin\` and `models\` when they already exist at the destination (both are large), and never touches an existing `config.json` or `history.jsonl`. Re-run it after pulling code changes to update the installed copy.
 
@@ -91,7 +100,7 @@ Removes the shortcuts, the launch-at-login registry entry, and `%LOCALAPPDATA%\V
 - **Dictation does not work over elevated windows** (Task Manager, an admin terminal, etc.). Windows' UIPI blocks input injection from an unelevated process into an elevated one. The failure is reported and your clipboard is preserved — not silent.
 - **No Mica/acrylic backdrop on Windows 10** — the dashboard falls back to a flat background there. (Windows 11 gets the translucent effect.)
 - **English-only by default** (`ggml-base.en`). Swap in a multilingual `ggml-*.bin` in `models\` and update `voisr\transcriber.py` if you need another language.
-- **Requires an NVIDIA GPU.** The bundled whisper.cpp build is cuBLAS/CUDA. A CPU build of whisper.cpp exists upstream but is slower and isn't what `scripts\setup.ps1` downloads.
+- **The developer install requires an NVIDIA GPU.** `scripts\setup.ps1` downloads whisper.cpp's cuBLAS/CUDA build. The distributable installer (`VoisrSetup.exe`) uses the CPU/BLAS build instead and works on any machine — see [Download](#download).
 
 ## Development
 
@@ -102,6 +111,24 @@ node --test tests/js/*.test.mjs
 
 `node --test tests/js/` (without the glob) fails on Node 24 — it treats the directory path as a module specifier instead of discovering the `.test.mjs` files inside it. Use the glob form.
 
+## Building a release
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
+```
+
+One command, end to end: fetches the CPU whisper.cpp build into `build\_whisper_cpu` (leaving the repo's CUDA `bin\` untouched), freezes the app with PyInstaller (`build\voisr.spec`) into `build\dist\Voisr`, and compiles `build\voisr.iss` with Inno Setup into `build\Output\VoisrSetup.exe`. Requires:
+
+- The dev venv set up (`scripts\setup.ps1`)
+- [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`)
+
+Neither `build\dist\` nor `build\Output\` is committed — see `.gitignore`.
+
+**Code signing:** not done yet (no certificate). `scripts\build_release.ps1` has a commented-out `signtool` block right after the Inno Setup step — filling in a certificate path and re-enabling it is the only change needed once one is available.
+
 ## Possible future work
 
-A distributable `.exe` that runs without this repo or a separate Python install would need PyInstaller (which has friction with `sounddevice`'s PortAudio DLL, `pythonnet`/CLR, and WebView2) plus an installer builder like Inno Setup, and would have to bundle or fetch the 141 MB model on first run. Out of scope here; `install.ps1` installs from a working checkout only.
+- **Code signing**, once a certificate exists (see above) — removes the SmartScreen warning.
+- **Auto-update.** Employees currently reinstall manually.
+- **CUDA in the distributable.** Developer-only for now; the payload would grow from ~300 MB to over 1 GB.
+- **MSI/Intune packaging**, if the company needs managed deployment instead of a manually-run installer.
