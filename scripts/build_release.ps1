@@ -8,16 +8,17 @@ $root = Split-Path -Parent $PSScriptRoot
 $buildDir = Join-Path $root "build"
 
 # ---------------------------------------------------------------------------
-# 1. CPU whisper build, staged separately from the repo's bin\ (CUDA, dev-only)
+# 1. whisper build, staged under build\ rather than reused from the repo's
+#    bin\ so a release never depends on setup.ps1 having been run first.
+#    Same CPU/BLAS binaries either way.
 # ---------------------------------------------------------------------------
 $whisperCpuDir = Join-Path $buildDir "_whisper_cpu"
-Write-Host "==> Fetching CPU whisper build"
-& "$PSScriptRoot\fetch_whisper.ps1" -Variant cpu -Destination $whisperCpuDir
+Write-Host "==> Fetching whisper build"
+& "$PSScriptRoot\fetch_whisper.ps1" -Destination $whisperCpuDir
 
 # ---------------------------------------------------------------------------
-# 2. Model. Shared between the CUDA and CPU builds -- fetched once by
-#    setup.ps1 into the repo's models\, and build\voisr.spec bundles it
-#    straight from there.
+# 2. Model. Fetched once by setup.ps1 into the repo's models\, and
+#    build\voisr.spec bundles it straight from there.
 # ---------------------------------------------------------------------------
 $model = "ggml-base.en.bin"
 $modelPath = Join-Path $root "models\$model"

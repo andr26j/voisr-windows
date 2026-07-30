@@ -1,20 +1,16 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("cpu", "cuda")]
-    [string]$Variant,
-
-    [Parameter(Mandatory = $true)]
     [string]$Destination
 )
 
-# Fetches a whisper.cpp release build (CPU/BLAS or CUDA) to $Destination.
+# Fetches the whisper.cpp CPU/BLAS release build to $Destination. CPU is the
+# only build Voisr ships: it runs on any machine, and the CUDA build it used
+# to offer was a 1.1 GB payload that only helped the minority with an NVIDIA
+# GPU. Dev and release builds now use the identical binaries.
 $ErrorActionPreference = "Stop"
 
 $WHISPER_TAG = "v1.9.1"
-$ASSET = @{
-    cpu  = "whisper-blas-bin-x64.zip"
-    cuda = "whisper-cublas-12.4.0-bin-x64.zip"
-}[$Variant]
+$ASSET = "whisper-blas-bin-x64.zip"
 
 Write-Host "==> whisper.cpp $WHISPER_TAG ($ASSET)"
 New-Item -ItemType Directory -Force $Destination | Out-Null

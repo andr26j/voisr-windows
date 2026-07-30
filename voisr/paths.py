@@ -40,8 +40,8 @@ ASSETS_DIR = assets_dir()
 def find_binary(name: str) -> str | None:
     """Resolve a CLI tool: bundled bin/ first, then PATH.
 
-    bin/ wins because the CUDA whisper build ships its DLLs alongside the
-    exe, and Windows searches an executable's own directory first — a
+    bin/ wins because the whisper build ships its DLLs alongside the exe,
+    and Windows searches an executable's own directory first — a
     whisper-cli.exe found on PATH would not have them.
     """
     exe = name if name.lower().endswith(".exe") else name + ".exe"

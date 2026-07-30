@@ -7,14 +7,14 @@ A local-only Windows port of [Wispr Flow](https://wisprflow.ai)'s core loop: **h
 Grab `VoisrSetup.exe` from your release channel and run it. No Python, no git checkout, no admin rights.
 
 - **The installer is unsigned.** There's no code-signing certificate yet, so Windows SmartScreen will show "Windows protected your PC" on first run. Click **More info**, then **Run anyway**. This is expected.
-- **The distributable is CPU-only.** It bundles whisper.cpp's BLAS build, not CUDA — the audience is employees on their own machines, most without an NVIDIA GPU. Measured on this machine: **~3.1 seconds to transcribe a ~14-second utterance.** Developers running from source with `scripts\setup.ps1` get the CUDA build instead, which is faster.
+- **Voisr is CPU-only.** It bundles whisper.cpp's BLAS build — the audience is employees on their own machines, most without an NVIDIA GPU, so there's no GPU build to pick. Measured on this machine: **~3.1 seconds to transcribe a ~14-second utterance.** Running from source with `scripts\setup.ps1` gets the same binaries.
 - Installs per-user to `%LOCALAPPDATA%\Programs\Voisr` — no admin prompt. Uninstalling leaves `%LOCALAPPDATA%\Voisr` (your config and dictation history) alone.
 - Installer size: **~150–160 MB** compressed (the frozen bundle itself is ~300 MB, dominated by the bundled `ggml-base.en` model and whisper.cpp's BLAS DLLs).
 
 ## What it does
 
 1. **Capture** — records your mic while you hold the hotkey
-2. **Transcribe** — on-device speech-to-text via whisper.cpp (`ggml-base.en`), CUDA-accelerated
+2. **Transcribe** — on-device speech-to-text via whisper.cpp (`ggml-base.en`), CPU/BLAS
 3. **Clean up** — strips filler words (um, uh, hmm…), normalizes spacing/punctuation, capitalizes, and applies your custom dictionary (e.g. `"trademake" → "TradeMate"` for names the ASR mishears)
 4. **Insert** — pastes the result at the cursor of the frontmost window (Ctrl+V via `SendInput`), restoring your clipboard afterwards. If the paste is blocked, your original clipboard is preserved and the failure is reported, not silent. The dictation is recorded to history either way.
 
@@ -24,7 +24,7 @@ Grab `VoisrSetup.exe` from your release channel and run it. No Python, no git ch
 powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 ```
 
-Creates the dev venv, downloads the CUDA whisper.cpp build into `bin\`, and downloads the `ggml-base.en` model (~141 MB) into `models\`.
+Creates the dev venv, downloads the whisper.cpp CPU/BLAS build into `bin\`, and downloads the `ggml-base.en` model (~141 MB) into `models\`. No GPU required.
 
 ## Install (Start Menu app)
 
@@ -100,13 +100,19 @@ Removes the shortcuts, the launch-at-login registry entry, and `%LOCALAPPDATA%\V
 - **Dictation does not work over elevated windows** (Task Manager, an admin terminal, etc.). Windows' UIPI blocks input injection from an unelevated process into an elevated one. The failure is reported and your clipboard is preserved — not silent.
 - **No Mica/acrylic backdrop on Windows 10** — the dashboard falls back to a flat background there. (Windows 11 gets the translucent effect.)
 - **English-only by default** (`ggml-base.en`). Swap in a multilingual `ggml-*.bin` in `models\` and update `voisr\transcriber.py` if you need another language.
-- **The developer install requires an NVIDIA GPU.** `scripts\setup.ps1` downloads whisper.cpp's cuBLAS/CUDA build. The distributable installer (`VoisrSetup.exe`) uses the CPU/BLAS build instead and works on any machine — see [Download](#download).
+- **No GPU acceleration.** Transcription is CPU-only on every install; see [Download](#download) for the measured timing.
 
 ## Development
 
 ```powershell
 venv\Scripts\python -m pytest -v
 node --test tests/js/*.test.mjs
+```
+
+The two tests marked `slow` need **ffmpeg** on PATH (`winget install Gyan.FFmpeg`, then open a new shell). They synthesize speech with SAPI and resample it to 16 kHz through `voisr\audio.py`, which shells out to ffmpeg; the app itself doesn't — it records via `voisr\stream_recorder.py`. `scripts\setup.ps1` warns if ffmpeg is missing. To skip those two instead:
+
+```powershell
+venv\Scripts\python -m pytest -m "not slow"
 ```
 
 `node --test tests/js/` (without the glob) fails on Node 24 — it treats the directory path as a module specifier instead of discovering the `.test.mjs` files inside it. Use the glob form.
@@ -117,7 +123,7 @@ node --test tests/js/*.test.mjs
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 ```
 
-One command, end to end: fetches the CPU whisper.cpp build into `build\_whisper_cpu` (leaving the repo's CUDA `bin\` untouched), freezes the app with PyInstaller (`build\voisr.spec`) into `build\dist\Voisr`, and compiles `build\voisr.iss` with Inno Setup into `build\Output\VoisrSetup.exe`. Requires:
+One command, end to end: fetches the whisper.cpp build into `build\_whisper_cpu` (staged there so a release build doesn't depend on `scripts\setup.ps1` having populated `bin\`), freezes the app with PyInstaller (`build\voisr.spec`) into `build\dist\Voisr`, and compiles `build\voisr.iss` with Inno Setup into `build\Output\VoisrSetup.exe`. Requires:
 
 - The dev venv set up (`scripts\setup.ps1`)
 - [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`)
@@ -130,5 +136,4 @@ Neither `build\dist\` nor `build\Output\` is committed — see `.gitignore`.
 
 - **Code signing**, once a certificate exists (see above) — removes the SmartScreen warning.
 - **Auto-update.** Employees currently reinstall manually.
-- **CUDA in the distributable.** Developer-only for now; the payload would grow from ~300 MB to over 1 GB.
 - **MSI/Intune packaging**, if the company needs managed deployment instead of a manually-run installer.

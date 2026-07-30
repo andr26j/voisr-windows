@@ -29,7 +29,7 @@ Copy-Item "$root\requirements.txt" $appDir -Force
 New-Item -ItemType Directory -Force (Join-Path $appDir "assets") | Out-Null
 Copy-Item "$root\assets\voisr.ico" (Join-Path $appDir "assets\voisr.ico") -Force
 
-# bin/ (whisper-cli.exe + CUDA DLLs) and models/ (~700 MB total): only copy
+# bin/ (whisper-cli.exe + BLAS DLLs) and models/: only copy
 # files that are missing at the destination, never re-copy what's there.
 Write-Host "==> Syncing bin/ and models/ (skipping files already present)"
 foreach ($pair in @(@{src = "bin"; dst = "bin" }, @{src = "models"; dst = "models" })) {

@@ -4,9 +4,9 @@
 # One-folder build. Resource paths route through voisr.paths.resource_root(),
 # which resolves to sys._MEIPASS when frozen -- see voisr/paths.py.
 #
-# WHISPER_DIR must point at a CPU whisper.cpp build (fetch with
-# scripts\fetch_whisper.ps1 -Variant cpu -Destination <dir>), NOT the repo's
-# bin/, which is the 1.1 GB CUDA build and useless without an NVIDIA GPU.
+# WHISPER_DIR must point at a whisper.cpp build (fetch with
+# scripts\fetch_whisper.ps1 -Destination <dir>). scripts\build_release.ps1
+# stages one under build\_whisper_cpu and points this at it.
 import os
 
 block_cipher = None

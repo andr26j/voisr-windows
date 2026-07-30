@@ -84,9 +84,9 @@ def test_nonzero_exit_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(transcriber, "find_binary", lambda name: "whisper-cli.exe")
     monkeypatch.setattr(
         transcriber.subprocess, "run",
-        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "cuda error"))
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "whisper failed"))
 
-    with pytest.raises(TranscriptionError, match="cuda error"):
+    with pytest.raises(TranscriptionError, match="whisper failed"):
         transcribe(wav, model_path=model)
 
 
