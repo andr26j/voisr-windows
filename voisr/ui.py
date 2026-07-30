@@ -23,7 +23,8 @@ from voisr.keys import DEFAULT_HOTKEY, hotkey_options, key_label, resolve_key
 from voisr.keytap import WindowsKeyListener, capture_next_vk
 from voisr.overlay import RecordingWidget, sanitize_pill_color, sanitize_pill_theme
 from voisr.pasteboard import PasteDeliveryError
-from voisr.paths import REPO_ROOT, app_icon
+from voisr.paths import app_icon
+from voisr.paths import web_dir as _web_dir
 
 # Taskbar identity. Without an explicit AppUserModelID, Windows attributes
 # our window to the host process (pythonw.exe) -- so it groups with any
@@ -50,7 +51,7 @@ from voisr.status_item import StatusItem
 from voisr.stream_recorder import StreamRecorder
 from voisr.window_chrome import apply_chrome
 
-WEB_DIR = REPO_ROOT / "voisr" / "web"
+WEB_DIR = _web_dir()
 WINDOW_TITLE = "Voisr"
 
 # Adding a theme? Also update: widget.html (theme CSS + THEME_VALUES),

@@ -1,3 +1,5 @@
+import sys
+
 import voisr.paths as paths
 
 
@@ -62,3 +64,49 @@ def test_real_app_icon_exists():
     """Guards the actual shipped asset. Without it pywebview falls back to
     extracting pythonw.exe's icon and the taskbar shows Python's logo."""
     assert paths.app_icon() is not None
+
+
+def test_resource_root_is_repo_root_when_not_frozen(monkeypatch):
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    assert paths.resource_root() == paths.REPO_ROOT
+
+
+def test_resource_root_is_meipass_when_frozen(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert paths.resource_root() == tmp_path
+
+
+def test_bin_dir_follows_resource_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert paths.bin_dir() == tmp_path / "bin"
+
+
+def test_models_dir_follows_resource_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert paths.models_dir() == tmp_path / "models"
+
+
+def test_web_dir_follows_resource_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert paths.web_dir() == tmp_path / "voisr" / "web"
+
+
+def test_assets_dir_follows_resource_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert paths.assets_dir() == tmp_path / "assets"
+
+
+def test_app_data_dir_is_unaffected_by_freezing(monkeypatch, tmp_path):
+    """User data must NEVER move into the bundle -- it would be wiped on
+    every upgrade, and _MEIPASS is a temp dir for one-file builds."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\x\AppData\Local")
+    assert "Voisr" in str(paths.app_data_dir())
+    assert str(tmp_path) not in str(paths.app_data_dir())

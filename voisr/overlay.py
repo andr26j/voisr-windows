@@ -14,9 +14,9 @@ from pathlib import Path
 
 import webview
 
-from voisr.paths import REPO_ROOT
+from voisr.paths import web_dir as _web_dir
 
-WEB_DIR = REPO_ROOT / "voisr" / "web"
+WEB_DIR = _web_dir()
 
 WIDTH, HEIGHT = 232, 52
 BOTTOM_MARGIN = 72

@@ -2,8 +2,9 @@ import subprocess
 from pathlib import Path
 
 from voisr.paths import find_binary
+from voisr.paths import models_dir as _models_dir
 
-MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+MODELS_DIR = _models_dir()
 MODEL_PATH = MODELS_DIR / "ggml-base.en.bin"
 
 # best available first: small.en is a large accuracy jump over base.en

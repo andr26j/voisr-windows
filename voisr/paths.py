@@ -1,10 +1,40 @@
 import os
 import shutil
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BIN_DIR = REPO_ROOT / "bin"
-ASSETS_DIR = REPO_ROOT / "assets"
+
+
+def resource_root() -> Path:
+    """Where bundled resources live: the repo when running from source,
+    PyInstaller's extraction dir when frozen."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    return Path(meipass) if meipass else REPO_ROOT
+
+
+def bin_dir() -> Path:
+    return resource_root() / "bin"
+
+
+def models_dir() -> Path:
+    return resource_root() / "models"
+
+
+def web_dir() -> Path:
+    return resource_root() / "voisr" / "web"
+
+
+def assets_dir() -> Path:
+    return resource_root() / "assets"
+
+
+# Module-level constants kept for compatibility with existing call sites and
+# tests that monkeypatch them directly. Safe as one-time values because
+# sys.frozen/_MEIPASS are set by the bootloader before any app code runs, so
+# they never change over the life of the process.
+BIN_DIR = bin_dir()
+ASSETS_DIR = assets_dir()
 
 
 def find_binary(name: str) -> str | None:
@@ -22,7 +52,12 @@ def find_binary(name: str) -> str | None:
 
 
 def app_data_dir() -> Path:
-    """Per-user data root: %LOCALAPPDATA%\\Voisr."""
+    """Per-user data root: %LOCALAPPDATA%\\Voisr.
+
+    Deliberately independent of resource_root(): config and history must
+    survive upgrades and must not live inside a one-file build's temp
+    extraction dir, which disappears when the process exits.
+    """
     base = os.environ.get("LOCALAPPDATA")
     root = Path(base) if base else Path.home() / "AppData" / "Local"
     return root / "Voisr"
