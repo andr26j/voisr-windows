@@ -11,6 +11,20 @@ Grab `VoisrSetup.exe` from your release channel and run it. No Python, no git ch
 - Installs per-user to `%LOCALAPPDATA%\Programs\Voisr` — no admin prompt. Uninstalling leaves `%LOCALAPPDATA%\Voisr` (your config and dictation history) alone.
 - Installer size: **~150–160 MB** compressed (the frozen bundle itself is ~300 MB, dominated by the bundled `ggml-base.en` model and whisper.cpp's BLAS DLLs).
 
+### What the installer brings with it
+
+Nothing needs installing first. Everything Voisr needs at runtime either ships inside the bundle or is installed for you, all without admin:
+
+- **Python, PortAudio, pythonnet** — frozen into the bundle by PyInstaller.
+- **The MSVC runtime** (`MSVCP140`, `VCRUNTIME140`, `VCRUNTIME140_1`) and **OpenMP** (`VCOMP140`) — deployed app-local into `bin\` beside `whisper-cli.exe`, so no Visual C++ redistributable is required. They go in `bin\` specifically because Windows searches a process's own directory first; PyInstaller's copies one level up are invisible to `whisper-cli.exe`.
+- **whisper.cpp + the `ggml-base.en` model** — bundled. The CPU variants ship from `ggml-cpu-x64` (baseline) up to `ggml-cpu-alderlake`, and whisper picks by CPU at load, so pre-AVX2 machines work too.
+- **The Edge WebView2 Runtime** — the dashboard's renderer. Already present on Windows 11 and anywhere with a recent Edge; where it isn't, setup installs it silently per-user via the Evergreen Bootstrapper. This step needs an internet connection, and setup stops with an explanation if it fails.
+
+Two things are outside the installer's reach:
+
+- **.NET Framework 4.7.2+**, which pythonnet hosts the dashboard on. In-box on Windows 10 1803 and later and on Windows 11, so every supported Windows already has it — but it cannot be installed per-user, so an ancient build would need it added by an admin.
+- **Microphone permission.** On by default, but if dictation records silence check Settings → Privacy & security → Microphone → *Let desktop apps access your microphone*.
+
 ## What it does
 
 1. **Capture** — records your mic while you hold the hotkey

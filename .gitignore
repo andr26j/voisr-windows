@@ -14,5 +14,8 @@ build/dist/
 build/work/
 build/_whisper_cpu/
 
+# WebView2 bootstrapper, fetched by scripts/build_release.ps1
+build/MicrosoftEdgeWebview2Setup.exe
+
 # Inno Setup compiled installer
 build/Output/

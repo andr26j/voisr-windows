@@ -53,6 +53,10 @@ Name: "launchatlogin"; Description: "Start Voisr when I log in"; GroupDescriptio
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+; WebView2 Evergreen Bootstrapper, fetched by scripts\build_release.ps1. Not
+; installed to {app} -- extracted to {tmp} and run only when the runtime is
+; missing. dontcopy keeps it out of the installed tree entirely.
+Source: "MicrosoftEdgeWebview2Setup.exe"; Flags: dontcopy noencryption
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "{#MyAppId}"
@@ -103,14 +107,37 @@ begin
   end;
 end;
 
-procedure InitializeWizard();
+// Install the WebView2 runtime ourselves rather than sending the user to a
+// download page: without it the dashboard cannot render at all. The Evergreen
+// Bootstrapper installs per-user when run unelevated, so this keeps the
+// installer's no-admin promise. Already present on Windows 11 and on any PC
+// with a recent Edge, where this is a no-op.
+//
+// PrepareToInstall (not InitializeWizard) so the work happens on the progress
+// page and a failure can be reported through Setup's own error path.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-  ErrorCode: Integer;
+  ExitCode: Integer;
 begin
-  if not WebView2RuntimeInstalled() then begin
-    if MsgBox('Voisr needs the Microsoft Edge WebView2 Runtime, which was not detected on this PC.' + #13#10 + #13#10 +
-       'Open the download page now? You can also install it later and run Voisr again.',
-       mbConfirmation, MB_YESNO) = IDYES then
-      ShellExec('open', WebView2DownloadUrl, '', '', SW_SHOWNORMAL, ewNoWait, ErrorCode);
+  Result := '';
+  if WebView2RuntimeInstalled() then
+    exit;
+
+  WizardForm.StatusLabel.Caption := 'Installing the Microsoft Edge WebView2 Runtime...';
+  ExtractTemporaryFile('MicrosoftEdgeWebview2Setup.exe');
+  if not Exec(ExpandConstant('{tmp}\MicrosoftEdgeWebview2Setup.exe'),
+              '/silent /install', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then begin
+    Result := 'Could not start the WebView2 Runtime installer.';
+    exit;
   end;
+  if ExitCode <> 0 then begin
+    Result := 'The WebView2 Runtime installer failed (exit code ' + IntToStr(ExitCode) + ').' + #13#10 +
+      'It needs an internet connection. Install it manually from' + #13#10 +
+      WebView2DownloadUrl + #13#10 + 'then run this setup again.';
+    exit;
+  end;
+  // Trust the runtime's own detection over the exit code alone.
+  if not WebView2RuntimeInstalled() then
+    Result := 'The WebView2 Runtime still was not detected after installing it.' + #13#10 +
+      'Install it manually from ' + WebView2DownloadUrl + ' then run this setup again.';
 end;

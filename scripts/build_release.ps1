@@ -29,7 +29,18 @@ if (-not (Test-Path $modelPath)) {
 }
 
 # ---------------------------------------------------------------------------
-# 3. PyInstaller -- one-folder frozen bundle at build\dist\Voisr
+# 3. WebView2 Evergreen Bootstrapper. build\voisr.iss embeds this (dontcopy)
+#    and runs it silently when the runtime is missing, so ISCC needs it
+#    present at compile time. ~2 MB; it downloads the runtime itself.
+# ---------------------------------------------------------------------------
+$webview2 = Join-Path $buildDir "MicrosoftEdgeWebview2Setup.exe"
+if (-not (Test-Path $webview2)) {
+    Write-Host "==> Fetching WebView2 bootstrapper"
+    Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $webview2
+}
+
+# ---------------------------------------------------------------------------
+# 4. PyInstaller -- one-folder frozen bundle at build\dist\Voisr
 # ---------------------------------------------------------------------------
 Write-Host "==> Running PyInstaller"
 $env:VOISR_WHISPER_CPU_DIR = $whisperCpuDir
@@ -43,7 +54,7 @@ $frozenExe = Join-Path $buildDir "dist\Voisr\Voisr.exe"
 if (-not (Test-Path $frozenExe)) { throw "Frozen build missing: $frozenExe" }
 
 # ---------------------------------------------------------------------------
-# 4. Inno Setup -- wrap the frozen bundle into VoisrSetup.exe
+# 5. Inno Setup -- wrap the frozen bundle into VoisrSetup.exe
 # ---------------------------------------------------------------------------
 $isccCandidates = @(
     "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
