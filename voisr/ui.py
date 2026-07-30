@@ -5,14 +5,8 @@ Ported from the macOS `voisr/ui.py`. Everything that already lives in a
 dedicated Windows module is imported rather than re-implemented:
 `voisr.keys` (hotkey table), `voisr.keytap` (the WH_KEYBOARD_LL listener),
 `voisr.overlay` (the floating pill), `voisr.permissions` (microphone probe),
-`voisr.window_chrome` (DWM dark titlebar), and `voisr.launch_agent`
-(per-user Run key).
-
-Not ported: the macOS menu-bar status item / "busy glyph". There is no tray
-icon in this phase (see the dashboard plan's "Next: Phase 4 — tray icon and
-installer"), so the glyph bookkeeping (`_mark_session`, `_sessions_in_flight`,
-`attach_status_item`) has no consumer here and is left out rather than
-carried along unused.
+`voisr.window_chrome` (DWM dark titlebar), `voisr.launch_agent` (per-user Run
+key), and `voisr.status_item` (the tray icon).
 """
 import json
 import threading
@@ -36,6 +30,7 @@ from voisr.recording_queue import (
     RecordingSession,
     SessionResult,
 )
+from voisr.status_item import StatusItem
 from voisr.stream_recorder import StreamRecorder
 from voisr.window_chrome import apply_chrome
 
@@ -316,6 +311,17 @@ class HotkeyService:
         self.stop()
         self.start(key_name)
 
+    def toggle(self) -> None:
+        """press()/release() pair for a single-action trigger (the tray
+        menu's "Dictate now"), reusing the same path the hotkey itself
+        drives so the pill shows the same feedback either way."""
+        with self._state_lock:
+            pressed = self._pressed
+        if pressed:
+            self.release()
+        else:
+            self.press()
+
 
 class Api:
     """JS<->Python bridge exposed to the dashboard via pywebview."""
@@ -347,11 +353,16 @@ class Api:
         self._last_paste_typing_generation = 0
         self._paste_state_lock = threading.Lock()
         self._window = None
+        self._status_item = None
         self._is_recording = False
+        self._sessions_in_flight = set()
+        self._glyph_busy = False
+        self._active_sequence = None
+        self._session_lock = threading.Lock()
         self._recordings = RecordingQueue(
             recorder_factory=recorder_factory,
             fallback_recorder_factory=fallback_recorder_factory,
-            processor=self._run_session,
+            processor=self._process_session,
             clock=clock,
         )
 
@@ -380,10 +391,45 @@ class Api:
         """Dashboard window handle, used to push live-refresh events to JS."""
         self._window = window
 
+    def attach_status_item(self, status):
+        self._status_item = status
+
     def is_recording(self) -> bool:
         """True while the microphone is open -- not the whole dictation
-        (transcription can still be running after this goes False)."""
+        (transcription can still be running after this goes False). The
+        tray glyph tracks the longer "session in flight" state instead;
+        see _mark_session."""
         return self._is_recording
+
+    def _mark_session(self, sequence, in_flight: bool) -> None:
+        """Track dictations that are still in flight and mirror the
+        aggregate to the tray glyph.
+
+        A dictation is in flight from a successful start until its
+        transcription completes -- releasing the key only closes the mic,
+        and whisper is the slow part. Sessions are tracked by sequence
+        rather than a single flag because the queue admits a new dictation
+        while an earlier one is still transcribing: retiring the old one
+        must not clear the glyph out from under the new one, and a
+        repeated retire (belt and braces on the failure paths) must be a
+        no-op.
+
+        Only pushes on a change, so the tray call is not repeated
+        needlessly. Never lets a status-item failure break recording."""
+        with self._session_lock:
+            if in_flight:
+                self._sessions_in_flight.add(sequence)
+            else:
+                self._sessions_in_flight.discard(sequence)
+            busy = bool(self._sessions_in_flight)
+            status = self._status_item
+            if status is None or busy == self._glyph_busy:
+                return
+            self._glyph_busy = busy
+            try:
+                status.set_recording(busy)
+            except Exception:
+                pass
 
     def _notify_dictation(self):
         """Tell the dashboard a dictation landed (hotkey dictations must show
@@ -422,6 +468,15 @@ class Api:
         finally:
             if svc is not None:
                 svc.start()
+
+    def _process_session(self, session: RecordingSession) -> SessionResult:
+        """Queue processor. The dictation ends here -- not when the mic
+        closed -- so this is where the session is retired from the
+        in-flight set and the tray glyph is allowed to go idle."""
+        try:
+            return self._run_session(session)
+        finally:
+            self._mark_session(session.sequence, False)
 
     def _run_session(self, session: RecordingSession) -> SessionResult:
         wav = session.wav_path
@@ -516,19 +571,32 @@ class Api:
             session = self._recordings.start()
         except RecordingQueueError as error:
             return {"error": str(error)}
+        self._active_sequence = session.sequence
         self._is_recording = True
+        self._mark_session(session.sequence, True)
         return {"recording": True, "session_id": session.sequence}
 
     def _release_recording(self, paste=False):
+        sequence, self._active_sequence = self._active_sequence, None
         self._is_recording = False
-        return self._recordings.release(
+        future = self._recordings.release(
             paste_requested=paste, context=self.get_config())
+        if sequence is not None:
+            # Safety net for the path that never reaches _process_session --
+            # a recorder whose stop() throws is completed straight from the
+            # queue worker. Retiring twice (the normal path's finally also
+            # calls this) is a no-op, guarded by _mark_session itself.
+            future.add_done_callback(
+                lambda _f, s=sequence: self._mark_session(s, False))
+        return future
 
     def stop_recording(self, paste=False):
         return self._release_recording(paste).result().to_api_dict()
 
     def close(self):
         self._recordings.close()
+        if self._status_item is not None:
+            self._status_item.release()
 
     def get_history(self):
         return self._history.list()
@@ -716,6 +784,57 @@ def main():
             WINDOW_TITLE, str(WEB_DIR / "index.html"),
             js_api=api, width=1060, height=700, min_size=(900, 620))
         api.attach_window(window)
+
+        # Closing the dashboard window is not quitting the app -- that is
+        # the whole point of the tray icon. pywebview's winforms backend
+        # calls WinForms.Application.Exit() (ending the *entire* message
+        # loop, both windows) once a Form actually closes, so an
+        # unhandled X-button click would silently kill the process. The
+        # `closing` event fires first and lets a handler cancel it: hide
+        # the window instead, and only let the close through once the
+        # tray's Quit has set `quitting`.
+        quitting = threading.Event()
+
+        def on_closing():
+            if quitting.is_set():
+                return True  # let the real close proceed
+            try:
+                window.hide()
+            except Exception:
+                pass
+            return False  # cancel: keep running in the tray
+
+        window.events.closing += on_closing
+
+        def menu_dictate():
+            # Routed through HotkeyService, not Api directly: Api.
+            # stop_recording() blocks on the whole transcription, which
+            # would freeze the tray's own event loop for the duration.
+            # HotkeyService.toggle() hands the wait off to its own worker
+            # thread and drives the pill, so a tray-started dictation
+            # shows the same feedback as a hotkey-started one.
+            service.toggle()
+
+        def menu_open():
+            try:
+                window.show()
+            except Exception:
+                pass
+
+        def menu_quit():
+            quitting.set()
+            try:
+                window.destroy()
+            except Exception:
+                pass
+
+        status = StatusItem(
+            on_dictate=menu_dictate,
+            on_open=menu_open,
+            on_quit=menu_quit,
+            hotkey_label_fn=lambda: api.hotkey_display()["display"])
+        api.attach_status_item(status)
+        status.create()
 
         def on_started():
             # Runs on a worker thread after the GUI loop is up. Mic opens

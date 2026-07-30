@@ -823,3 +823,106 @@ def test_epoch_guard_drops_a_stale_finish(hotkey_service_with_widget):
     ran2 = []
     service._run_widget_action(service._epoch, lambda: ran2.append("current"))
     assert ran2 == ["current"]
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (Phase 4): _mark_session tray bookkeeping
+# ---------------------------------------------------------------------------
+
+class FakeStatus:
+    def __init__(self):
+        self.states = []
+
+    def set_recording(self, value):
+        self.states.append(bool(value))
+
+    def release(self):
+        self.states.append("released")
+
+
+class ExplodingStatus:
+    def set_recording(self, value):
+        raise RuntimeError("status item boom")
+
+    def release(self):
+        raise RuntimeError("status item boom")
+
+
+@pytest.fixture
+def api(tmp_path):
+    return make_api(tmp_path)
+
+
+@pytest.fixture
+def api_with_status(tmp_path):
+    api = make_api(tmp_path)
+    status = FakeStatus()
+    api.attach_status_item(status)
+    return api, status
+
+
+@pytest.fixture
+def api_with_status_failing(tmp_path):
+    api = make_api(tmp_path)
+    api.attach_status_item(ExplodingStatus())
+    return api, None
+
+
+def test_status_lights_while_a_dictation_is_in_flight(api_with_status):
+    api, status = api_with_status
+    api._mark_session(1, in_flight=True)
+    assert status.states == [True]
+
+
+def test_status_clears_when_the_last_session_finishes(api_with_status):
+    api, status = api_with_status
+    api._mark_session(1, in_flight=True)
+    api._mark_session(1, in_flight=False)
+    assert status.states == [True, False]
+
+
+def test_overlapping_dictations_keep_the_status_lit(api_with_status):
+    """Two queued dictations must not clear the icon when the first ends."""
+    api, status = api_with_status
+    api._mark_session(1, in_flight=True)
+    api._mark_session(2, in_flight=True)
+    api._mark_session(1, in_flight=False)
+    assert status.states == [True]
+    api._mark_session(2, in_flight=False)
+    assert status.states == [True, False]
+
+
+def test_status_is_only_pushed_on_change(api_with_status):
+    api, status = api_with_status
+    api._mark_session(1, in_flight=True)
+    api._mark_session(2, in_flight=True)
+    assert status.states == [True]
+
+
+def test_status_failure_never_breaks_a_dictation(api_with_status_failing):
+    api, _ = api_with_status_failing
+    api._mark_session(1, in_flight=True)  # must not raise
+
+
+def test_api_without_a_status_item_works(api):
+    api._mark_session(1, in_flight=True)  # must not raise
+
+
+def test_record_cycle_lights_and_clears_the_status_item(tmp_path):
+    """End-to-end through start_recording/stop_recording, not just the
+    bookkeeping helper directly."""
+    api = make_api(tmp_path)
+    status = FakeStatus()
+    api.attach_status_item(status)
+    api.start_recording()
+    assert status.states == [True]
+    api.stop_recording()
+    assert status.states == [True, False]
+
+
+def test_close_releases_the_status_item(tmp_path):
+    api = make_api(tmp_path)
+    status = FakeStatus()
+    api.attach_status_item(status)
+    api.close()
+    assert status.states == ["released"]
