@@ -1,3 +1,5 @@
+import sys
+
 from voisr.launch_agent import RUN_KEY, VALUE_NAME, disable, enable, is_enabled
 
 
@@ -67,3 +69,20 @@ def test_enable_launches_the_dashboard_not_the_cli():
     reg = FakeRegistry()
     enable(registry=reg)
     assert "-m voisr.ui" in reg.values[VALUE_NAME]
+
+
+def test_enable_command_when_frozen_launches_the_exe_directly(monkeypatch):
+    """A frozen build's sys.executable IS Voisr.exe -- there's no python.exe
+    to substitute pythonw.exe for, and no voisr.ui module to -m into. The
+    installer's Run value must match this exactly, or the Settings toggle
+    and the installer will overwrite each other's entry."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        sys, "executable", r"C:\Users\x\AppData\Local\Programs\Voisr\Voisr.exe"
+    )
+    reg = FakeRegistry()
+    enable(registry=reg)
+    assert (
+        reg.values[VALUE_NAME]
+        == r'"C:\Users\x\AppData\Local\Programs\Voisr\Voisr.exe"'
+    )

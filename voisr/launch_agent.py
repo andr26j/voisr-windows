@@ -41,6 +41,12 @@ def _default_registry():
 
 
 def _launch_command() -> str:
+    # A frozen build's sys.executable IS Voisr.exe -- there is no python.exe
+    # to substitute pythonw.exe for, and no voisr.ui module to -m into. This
+    # must match what build/voisr.iss writes to the same Run value, or the
+    # Settings toggle and the installer's login task fight each other.
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
     # voisr.ui, not voisr.app: launching at login should bring up the
     # dashboard (which starts the hotkey service itself), not the bare CLI.
     pythonw = sys.executable.replace("python.exe", "pythonw.exe")
