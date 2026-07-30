@@ -25,22 +25,6 @@ from voisr.overlay import RecordingWidget, sanitize_pill_color, sanitize_pill_th
 from voisr.pasteboard import PasteDeliveryError
 from voisr.paths import app_icon
 from voisr.paths import web_dir as _web_dir
-
-# Taskbar identity. Without an explicit AppUserModelID, Windows attributes
-# our window to the host process (pythonw.exe) -- so it groups with any
-# other Python app and shows their icon and name rather than ours.
-APP_USER_MODEL_ID = "Voisr.Voisr"
-
-
-def set_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> bool:
-    """Claim a distinct taskbar identity. Cosmetic: never raises."""
-    try:
-        import ctypes
-
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
-        return True
-    except Exception:
-        return False
 from voisr.recording_queue import (
     RecordingQueue,
     RecordingQueueError,
@@ -53,6 +37,22 @@ from voisr.window_chrome import apply_chrome
 
 WEB_DIR = _web_dir()
 WINDOW_TITLE = "Voisr"
+
+# Taskbar identity. Without an explicit AppUserModelID, Windows attributes
+# our window to the host process (pythonw.exe) -- so it groups with any
+# other Python app and carries their icon and name rather than ours.
+APP_USER_MODEL_ID = "Voisr.Voisr"
+
+
+def set_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> bool:
+    """Claim a distinct taskbar identity. Cosmetic: never raises."""
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        return True
+    except Exception:
+        return False
 
 # Adding a theme? Also update: widget.html (theme CSS + THEME_VALUES),
 # style.css (mini-pill rule + keyframes), api.js's dev-mock get_pill_themes,
