@@ -854,7 +854,18 @@ def test_write_text_returns_new_sequence_and_sets_unicode():
     snap = clip.snapshot()
     count = clip.write_text_if_unchanged("bye", snap)
     assert count == win32.sequence
-    assert win32.formats[CF_UNICODETEXT] == "bye".encode("utf-16-le")
+    assert win32.formats[CF_UNICODETEXT] == "bye".encode("utf-16-le") + b"\x00\x00"
+
+
+def test_written_text_is_null_terminated():
+    """CF_UNICODETEXT must be null-terminated or readers drop the last
+    character — observed truncating 'TEMPORARY-VOISR' to 'TEMPORARY-VOIS'."""
+    win32 = FakeWin32()
+    clip = make(win32)
+    snap = clip.snapshot()
+    clip.write_text_if_unchanged("hello", snap)
+    assert win32.formats[CF_UNICODETEXT].endswith(b"\x00\x00")
+    assert win32.formats[CF_UNICODETEXT].decode("utf-16-le").rstrip("\x00") == "hello"
 
 
 def test_write_text_refuses_when_clipboard_changed():
@@ -1087,11 +1098,18 @@ class WindowsClipboard:
         self._open()
         try:
             self._w.empty()
-            if not self._w.set_data(CF_UNICODETEXT, text.encode("utf-16-le")):
+            # The null terminator is mandatory. Without it readers drop the
+            # last character — observed truncating "TEMPORARY-VOISR" to
+            # "TEMPORARY-VOIS", which would corrupt every dictation.
+            if not self._w.set_data(CF_UNICODETEXT,
+                                    text.encode("utf-16-le") + b"\x00\x00"):
                 raise ClipboardPreservationError("temporary clipboard write failed")
-            return self._w.get_sequence()
         finally:
             self._w.close()
+        # Read the sequence AFTER close: CloseClipboard itself bumps the
+        # counter (the clipboard-history service reacts to WM_CLIPBOARDUPDATE),
+        # so a value read before closing is stale and restore would refuse.
+        return self._w.get_sequence()
 
     def restore_if_unchanged(self, snapshot, expected_change_count) -> bool:
         if self._w.get_sequence() != expected_change_count:
@@ -1112,7 +1130,7 @@ class WindowsClipboard:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `./venv/Scripts/python -m pytest tests/test_pasteboard.py -v`
-Expected: 14 passed
+Expected: 15 passed
 
 - [ ] **Step 5: Verify against the real clipboard**
 
@@ -1297,7 +1315,12 @@ class KEYBDINPUT(ctypes.Structure):
 
 
 class _INPUTUNION(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("padding", ctypes.c_byte * 24)]
+    # The padding MUST be 32, not sizeof(KEYBDINPUT). The real Win32 INPUT
+    # union is sized by its largest member, MOUSEINPUT — so sizeof(INPUT) is
+    # 40 on x64, not 32. Get this wrong and SendInput rejects every call with
+    # ERROR_INVALID_PARAMETER (87) while unit tests that mock the send still
+    # pass. Nothing is injected and nothing complains.
+    _fields_ = [("ki", KEYBDINPUT), ("padding", ctypes.c_byte * 32)]
 
 
 class INPUT(ctypes.Structure):
@@ -1415,7 +1438,9 @@ def _write_text(text: str) -> None:
     clip._open()
     try:
         win32.empty()
-        if not win32.set_data(CF_UNICODETEXT, text.encode("utf-16-le")):
+        # Null terminator is mandatory — without it readers drop the last
+        # character. Same requirement as pasteboard.write_text_if_unchanged.
+        if not win32.set_data(CF_UNICODETEXT, text.encode("utf-16-le") + b"\x00\x00"):
             raise ClipboardPreservationError("clipboard write failed")
     finally:
         win32.close()
@@ -1554,7 +1579,11 @@ def paste_at_cursor(text: str, restore_clipboard: bool = True) -> bool:
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `./venv/Scripts/python -m pytest tests/test_inject_unit.py -v`
-Expected: all pass — roughly 19 tests (14 ported + 5 new).
+Expected: all pass — 21 tests (16 ported + 5 new).
+
+Note these tests mock `_send_ctrl_v`, so they pass even if the `INPUT` struct
+layout is wrong and `SendInput` never fires. Step 6's real paste is the only
+thing that proves injection actually works. Do not skip it.
 
 - [ ] **Step 6: Verify a real paste**
 
@@ -1855,6 +1884,20 @@ _UP_MESSAGES = (WM_KEYUP, WM_SYSKEYUP)
 
 HOOKPROC = ctypes.WINFUNCTYPE(
     ctypes.c_longlong, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+# These argtypes are MANDATORY. Without them ctypes defaults integer
+# arguments to 32-bit c_int, and lparam is pointer-sized — so every real
+# keystroke raises "OverflowError: int too long to convert" inside the
+# callback, where ctypes silently swallows it. Unit tests mock
+# CallNextHookEx and pass anyway; only a real hook exposes this.
+user32.SetWindowsHookExW.restype = wintypes.HHOOK
+user32.SetWindowsHookExW.argtypes = [
+    ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+user32.CallNextHookEx.restype = ctypes.c_longlong
+user32.CallNextHookEx.argtypes = [
+    wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -2175,22 +2218,22 @@ class RecordingWidget:
 Run: `./venv/Scripts/python -m pytest tests/test_overlay.py -v`
 Expected: 7 passed
 
-- [ ] **Step 6: Check widget.html exposes the state hook**
+- [ ] **Step 6: Confirm the real widget.html JS contract**
 
-Run: `grep -n "voisrSetState" voisr/web/widget.html`
+`widget.html` needs no modification. It already exports three globals:
 
-If absent, the macOS version is driven differently. Add this before `</body>`, adapting the class names to the ones already in the file:
+| Function | Contract |
+|---|---|
+| `setState(state)` | `"recording"` \| `"processing"` \| `"done"` \| `"error"`. No `"hidden"` — hiding is a window operation, not a DOM state. |
+| `setTheme(theme)` | One of `classic, ember, aurora, ocean, neon, breathe, scanner`. Unknown falls back to classic. |
+| `setColor(hex)` | `#RRGGBB`, or `null` to use the theme's designed colour. |
 
-```html
-<script>
-  window.voisrSetState = ({state, theme, color}) => {
-    const pill = document.querySelector(".pill");
-    pill.dataset.state = state;
-    if (theme) pill.dataset.theme = theme;
-    if (color) pill.style.setProperty("--pill-color", color);
-  };
-</script>
-```
+Verify with: `grep -n "window.setState\|window.setTheme\|window.setColor" voisr/web/widget.html`
+
+Python sanitizes both values before interpolating them into JS, mirroring
+`sanitize_pill_theme` / `sanitize_pill_color` in the macOS `ui.py`. The JS
+validates too, but config-file content must never reach an `evaluate_js`
+string unchecked.
 
 - [ ] **Step 7: Delete the spike**
 
@@ -2472,7 +2515,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `./venv/Scripts/python -m pytest tests/test_app.py -v`
-Expected: 9 passed
+Expected: 8 passed
 
 - [ ] **Step 5: Run the whole suite**
 

@@ -1,0 +1,7 @@
+pytest
+pywebview
+sounddevice
+pywin32
+pystray
+Pillow
+pythonnet
