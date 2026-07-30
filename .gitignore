@@ -8,3 +8,8 @@ data/
 node_modules/
 *.wav
 *.aiff
+
+# PyInstaller build output and CPU-whisper staging (see scripts/fetch_whisper.ps1)
+build/dist/
+build/work/
+build/_whisper_cpu/
