@@ -15,49 +15,43 @@ import threading
 
 from PIL import Image, ImageDraw
 
+from voisr import logo
 
-def _dark_taskbar_from_registry() -> bool:
-    """Read the Windows taskbar theme. Defaults to light-on-dark (the
-    Windows default taskbar) if the value can't be read."""
-    try:
-        import winreg
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-        value, _ = winreg.QueryValueEx(key, "SystemUsesLightTheme")
-        return value == 0
-    except Exception:
-        return True
+# Recording badge, drawn over the mark's lower-right corner. A colour
+# logo cannot signal state by changing its own bars -- at 16px that
+# difference is invisible -- so the state is carried by a badge instead,
+# the same convention Teams and Zoom use in the notification area.
+BADGE_FILL = (0xE5, 0x1C, 0x23, 255)
+BADGE_RING = (255, 255, 255, 255)
 
 
 def glyph_image(recording: bool, size: int = 32, dark_taskbar=None) -> Image.Image:
-    """Three-bar waveform glyph, drawn programmatically so there is no asset
-    to lose. macOS template images auto-invert to match the menu bar;
-    Windows tray icons do not, so the bar colour is picked from the taskbar
-    theme instead.
+    """The Voisr mark for the notification area, with a red badge while a
+    dictation is in flight.
 
-    `dark_taskbar=None` means "detect it"; the explicit argument exists so
-    tests are deterministic."""
-    if dark_taskbar is None:
-        dark_taskbar = _dark_taskbar_from_registry()
-    # A dark taskbar needs a light glyph to read against it, and vice versa.
-    color = (255, 255, 255, 255) if dark_taskbar else (0, 0, 0, 255)
+    Shares voisr.logo's geometry with the taskbar and Start Menu icon, so
+    the app presents one mark everywhere rather than a bespoke tray glyph.
 
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    `dark_taskbar` is accepted and ignored: it exists because macOS template
+    images auto-invert against the menu bar, and the previous monochrome
+    glyph had to emulate that. A full-colour mark carries its own rounded
+    background and reads on a light or dark taskbar alike -- inverting it
+    would corrupt the brand colour. The parameter is kept so callers and
+    tests that pass it keep working.
+    """
+    img = logo.render(size)
+
+    if not recording:
+        return img
+
     draw = ImageDraw.Draw(img)
-
-    bar_w = max(1, round(size * 4 / 22))
-    gap = max(1, round(size * 7 / 22)) - bar_w
-    heights = (size * 10 / 14, size * 6 / 14, size * 10 / 14) if recording \
-        else (size * 4 / 14,) * 3
-    total_w = bar_w * 3 + gap * 2
-    x = (size - total_w) / 2
-    for bh in heights:
-        y0 = (size - bh) / 2
-        y1 = y0 + bh
-        radius = min(bar_w, bh) / 2
-        draw.rounded_rectangle([x, y0, x + bar_w, y1], radius=radius, fill=color)
-        x += bar_w + gap
+    # Sized off the frame so it stays visible at 16px without swamping 48px.
+    d = max(5, round(size * 0.42))
+    x1, y1 = size - 1, size - 1
+    x0, y0 = x1 - d, y1 - d
+    ring = max(1, round(size * 0.055))
+    draw.ellipse((x0 - ring, y0 - ring, x1, y1), fill=BADGE_RING)
+    draw.ellipse((x0, y0, x1 - ring, y1 - ring), fill=BADGE_FILL)
     return img
 
 

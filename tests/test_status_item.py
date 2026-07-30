@@ -25,10 +25,37 @@ def test_recording_glyph_differs_from_idle():
     assert idle != rec
 
 
-def test_glyph_adapts_to_taskbar_theme():
+def test_glyph_ignores_taskbar_theme():
+    """The tray now shows the full-colour Voisr mark, which carries its own
+    rounded background and reads on a light or dark taskbar alike. The old
+    monochrome glyph had to invert (emulating macOS template images);
+    inverting a brand mark would corrupt its colour, so the theme argument
+    is deliberately accepted and ignored."""
     light = glyph_image(recording=False, size=32, dark_taskbar=False).tobytes()
     dark = glyph_image(recording=False, size=32, dark_taskbar=True).tobytes()
-    assert light != dark
+    assert light == dark
+
+
+def test_glyph_is_the_brand_mark_not_a_bespoke_glyph():
+    """Guards against the tray drifting away from the taskbar icon: the
+    idle tray image must be exactly what voisr.logo renders."""
+    from voisr import logo
+    assert glyph_image(recording=False, size=32).tobytes() == logo.render(32).tobytes()
+
+
+def test_glyph_is_opaque_where_the_mark_sits():
+    """A tray icon that renders as a transparent hole is a real failure
+    mode and an easy one to miss -- the centre pixel must be painted."""
+    img = glyph_image(recording=False, size=32)
+    assert img.getpixel((16, 16))[3] == 255
+
+
+def test_recording_badge_survives_small_sizes():
+    """16px is what the notification area actually asks for; the state has
+    to still be distinguishable there."""
+    idle = glyph_image(recording=False, size=16).tobytes()
+    rec = glyph_image(recording=True, size=16).tobytes()
+    assert idle != rec
 
 
 def test_dispatch_routes_each_action():
