@@ -23,7 +23,23 @@ from voisr.keys import DEFAULT_HOTKEY, hotkey_options, key_label, resolve_key
 from voisr.keytap import WindowsKeyListener, capture_next_vk
 from voisr.overlay import RecordingWidget, sanitize_pill_color, sanitize_pill_theme
 from voisr.pasteboard import PasteDeliveryError
-from voisr.paths import REPO_ROOT
+from voisr.paths import REPO_ROOT, app_icon
+
+# Taskbar identity. Without an explicit AppUserModelID, Windows attributes
+# our window to the host process (pythonw.exe) -- so it groups with any
+# other Python app and shows their icon and name rather than ours.
+APP_USER_MODEL_ID = "Voisr.Voisr"
+
+
+def set_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> bool:
+    """Claim a distinct taskbar identity. Cosmetic: never raises."""
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        return True
+    except Exception:
+        return False
 from voisr.recording_queue import (
     RecordingQueue,
     RecordingQueueError,
@@ -769,6 +785,7 @@ def main():
     api = None
     service = None
     try:
+        set_app_user_model_id()
         api = Api()
         widget = RecordingWidget()
         service = HotkeyService(api, widget=widget)
@@ -850,7 +867,7 @@ def main():
             except Exception:
                 pass  # chrome is cosmetic
 
-        webview.start(on_started, gui="edgechromium")
+        webview.start(on_started, gui="edgechromium", icon=app_icon())
     finally:
         try:
             if service is not None:

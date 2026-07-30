@@ -44,3 +44,21 @@ def test_app_data_dir_falls_back_without_env(monkeypatch):
     result = paths.app_data_dir()
     assert result.name == "Voisr"
     assert "AppData" in str(result)
+
+
+def test_app_icon_returns_path_when_present(tmp_path, monkeypatch):
+    icon = tmp_path / "voisr.ico"
+    icon.write_bytes(b"")
+    monkeypatch.setattr(paths, "ASSETS_DIR", tmp_path)
+    assert paths.app_icon() == str(icon)
+
+
+def test_app_icon_returns_none_when_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "ASSETS_DIR", tmp_path)
+    assert paths.app_icon() is None
+
+
+def test_real_app_icon_exists():
+    """Guards the actual shipped asset. Without it pywebview falls back to
+    extracting pythonw.exe's icon and the taskbar shows Python's logo."""
+    assert paths.app_icon() is not None
