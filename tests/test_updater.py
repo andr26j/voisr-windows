@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -8,9 +9,11 @@ from voisr.updater import (
     MANIFEST_URL,
     Manifest,
     RELEASE_URL_PREFIX,
+    download_to,
     fetch_manifest,
     is_newer,
     parse_version,
+    verify_sha256,
 )
 
 
@@ -227,3 +230,48 @@ def test_fetch_manifest_tolerates_a_utf8_bom(monkeypatch):
 
     m = fetch_manifest("https://example.test/latest.json")
     assert m.version == "1.1.0"
+
+
+def test_download_writes_the_payload_and_leaves_no_part_file(tmp_path):
+    dest = tmp_path / "VoisrSetup-1.1.0.exe"
+    download_to("https://example.test/x.exe", dest, opener=lambda url: b"payload")
+    assert dest.read_bytes() == b"payload"
+    assert list(tmp_path.iterdir()) == [dest]
+
+
+def test_interrupted_download_leaves_no_partial_file_behind(tmp_path):
+    # A half-written installer that looked complete would be executed.
+    dest = tmp_path / "VoisrSetup-1.1.0.exe"
+
+    def opener(url):
+        raise OSError("connection reset")
+
+    with pytest.raises(OSError):
+        download_to("https://example.test/x.exe", dest, opener=opener)
+    assert not dest.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_creates_the_destination_directory(tmp_path):
+    dest = tmp_path / "updates" / "VoisrSetup-1.1.0.exe"
+    download_to("https://example.test/x.exe", dest, opener=lambda url: b"x")
+    assert dest.is_file()
+
+
+def test_verify_sha256_accepts_a_matching_digest(tmp_path):
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"payload")
+    assert verify_sha256(f, hashlib.sha256(b"payload").hexdigest())
+
+
+def test_verify_sha256_rejects_a_mismatch(tmp_path):
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"payload")
+    assert not verify_sha256(f, "b" * 64)
+
+
+def test_verify_sha256_ignores_digest_case_and_whitespace(tmp_path):
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"payload")
+    digest = hashlib.sha256(b"payload").hexdigest()
+    assert verify_sha256(f, f"  {digest.upper()}  ")

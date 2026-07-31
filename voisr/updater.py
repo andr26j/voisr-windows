@@ -5,9 +5,11 @@ downloader, the process spawner -- so the whole module is testable without
 network access and without ever executing an installer.
 """
 
+import hashlib
 import json
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 
@@ -46,6 +48,14 @@ _HEX = frozenset("0123456789abcdef")
 # `"[" * 200000` before it reaches json.loads and blows the decoder's
 # recursion limit -- RecursionError is not a ValueError, and callers only
 # catch ValueError to treat a bad manifest as "no update".
+#
+# Enforced in two different units at two different layers: bytes at the
+# network read in `_default_text_opener` (`response.read(_MAX_MANIFEST_BYTES
+# + 1)`), and characters at the length check in `Manifest.from_json`. That
+# mismatch is harmless -- UTF-8 decoding never produces more characters than
+# input bytes, so the byte ceiling is the one that actually bites on the real
+# fetch path -- but keep it in mind if you ever feed from_json non-UTF-8-sourced
+# text directly.
 _MAX_MANIFEST_BYTES = 8192
 
 
@@ -174,3 +184,47 @@ def fetch_manifest(url: str = MANIFEST_URL, opener=None) -> "Manifest | None":
         # not merely by the happenstance of what today's opener returns.
         print(f"voisr: ignoring malformed update manifest: {e}", flush=True)
         return None
+
+
+_CHUNK = 1024 * 1024
+
+
+def _default_bytes_opener(url: str) -> bytes:
+    with urllib.request.urlopen(url, timeout=_TIMEOUT_S) as response:
+        return response.read()
+
+
+def download_to(url: str, dest, opener=None) -> Path:
+    """Download to `dest`, writing a .part file first.
+
+    The rename is the commit point: `dest` either does not exist or is a
+    complete download. A truncated file at `dest` would later be executed.
+    """
+    opener = opener or _default_bytes_opener
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    try:
+        part.write_bytes(opener(url))
+    except BaseException:
+        # Best-effort cleanup: if unlink itself fails (e.g. the .part file
+        # is transiently locked by antivirus scanning it, per the Windows
+        # flake in history.py), that secondary failure must not replace the
+        # exception the caller actually needs to see.
+        try:
+            part.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    part.replace(dest)
+    return dest
+
+
+def verify_sha256(path, expected: str) -> bool:
+    """Whether `path` hashes to `expected`. The build is unsigned, so this is
+    the only integrity check between downloading and executing an .exe."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest() == str(expected).strip().lower()
