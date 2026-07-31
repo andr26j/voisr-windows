@@ -9,6 +9,7 @@ dedicated Windows module is imported rather than re-implemented:
 key), and `voisr.status_item` (the tray icon).
 """
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -342,6 +343,9 @@ class HotkeyService:
             self.press()
 
 
+_UPDATES_UNAVAILABLE = "Updates are unavailable in this build."
+
+
 class Api:
     """JS<->Python bridge exposed to the dashboard via pywebview."""
 
@@ -354,6 +358,9 @@ class Api:
     # Grace period between answering install_update() and tearing the app
     # down, so the awaiting JS caller gets its response first.
     SHUTDOWN_DELAY_S = 0.75
+    # How long the clean shutdown gets before the hard exit. See
+    # _shutdown_soon for why an app still alive by then must not stay up.
+    SHUTDOWN_HARD_S = 5.0
 
     def __init__(self, config_path=None,
                  history=None, recorder_factory=StreamRecorder,
@@ -364,7 +371,8 @@ class Api:
                  paste_fn=paste_at_cursor,
                  clipboard_fn=set_clipboard,
                  save_dialog_fn=None,
-                 timer_factory=threading.Timer):
+                 timer_factory=threading.Timer,
+                 exit_fn=None):
         self._config_path = Path(config_path) if config_path else default_config_path()
         self._history = history or HistoryStore(self._config_path.parent / "history.jsonl")
         self._transcribe_fn = transcribe_fn
@@ -375,6 +383,7 @@ class Api:
         self._clipboard_fn = clipboard_fn
         self._save_dialog_fn = save_dialog_fn or _run_save_dialog
         self._timer_factory = timer_factory
+        self._exit_fn = exit_fn or (lambda: os._exit(0))
         # Both None until the matching attach_*(): a headless or test Api has
         # no updater and no window, and every method below tolerates that.
         self._updates = None
@@ -675,9 +684,15 @@ class Api:
         dropped. The racing reader still returns its own view, which is a
         fair answer to a call that began before the write.
 
-        Hands back a shallow copy so a caller assigning a key cannot rewrite
-        what the next caller sees -- get_config()'s result is treated as
-        owned by its caller elsewhere in this class (see capture_hotkey).
+        Hands back a *top-level* copy, so a caller assigning a key cannot
+        rewrite what the next caller sees -- get_config()'s result is treated
+        as owned by its caller elsewhere in this class (see capture_hotkey).
+        Nested values are shared, both with the cache and, for any key the
+        file omits, with app.DEFAULT_CONFIG itself: load_config seeds from a
+        shallow dict() of it, so a config.json without "dictionary" yields
+        the module-level dict. Mutating a nested value therefore poisons the
+        cache and possibly a process global. Read-only by contract; today the
+        only caller is UpdateChecker._enabled(), which reads one scalar.
         """
         now = self._clock()
         with self._config_cache_lock:
@@ -792,6 +807,9 @@ class Api:
 
     # -- updates ---------------------------------------------------------
     def attach_update_checker(self, checker):
+        """The UpdateChecker whose state the dashboard renders and whose
+        install() the Install button drives. Absent in a headless Api, which
+        every method below reports as "unavailable" rather than failing."""
         self._updates = checker
 
     def attach_quit(self, quit_fn):
@@ -803,7 +821,7 @@ class Api:
         """Same keys as UpdateChecker.status() even with no checker attached:
         the dashboard renders one shape and never has to guess which fields
         exist."""
-        if not self._updates:
+        if self._updates is None:
             return {"state": "idle", "current_version": voisr.__version__,
                     "version": None, "notes": None, "error": None,
                     "enabled": False}
@@ -812,8 +830,8 @@ class Api:
     def check_for_updates_now(self):
         """Settings' "Check now". Forced, so it works with auto-check off,
         and it reports failures inline because the user is waiting."""
-        if not self._updates:
-            return {"error": "Updates are unavailable in this build."}
+        if self._updates is None:
+            return {"error": _UPDATES_UNAVAILABLE}
         return self._updates.check_now(force=True)
 
     def install_update(self):
@@ -824,40 +842,62 @@ class Api:
         state is terminal by design, so an app that stayed up would sit in it
         with no way for the user to retry.
         """
-        if not self._updates:
-            return {"error": "Updates are unavailable in this build."}
+        if self._updates is None:
+            return {"error": _UPDATES_UNAVAILABLE}
         result = self._updates.install()
         if "error" not in result:
             self._shutdown_soon()
         return result
 
+    def _arm(self, delay, fn):
+        timer = self._timer_factory(delay, fn)
+        timer.daemon = True
+        timer.start()
+        return timer
+
     def _shutdown_soon(self):
-        """Quit after a short delay, off this thread.
+        """Quit after a short delay, off this thread, and make sure we
+        actually go.
 
         Deferred on purpose: install_update() is a bridge call the dashboard
         is awaiting, and destroying the window from inside the handler can
         leave that promise unresolved -- the UI would hang instead of showing
-        "Installing update". Running the quit from a timer thread is the same
-        thing the tray icon already does from pystray's thread.
+        "Installing update". A timer thread is safe for the quit itself:
+        pywebview marshals destroy() onto the GUI thread via Control.Invoke,
+        so the caller's thread does not matter.
+
+        The hard exit is not paranoia. `installing` is terminal -- nothing in
+        UpdateChecker leaves it -- so a quit that silently does nothing
+        strands the user with a dashboard stuck on "Installing", an Inno
+        /SILENT install already running underneath, and no route back. It
+        also keeps {app} open against the very installer that is replacing
+        it. os._exit skips atexit and buffer flushing, which is the right
+        trade here: history and config are both written synchronously well
+        before this point, and the alternative is a live process whose files
+        are being swapped out from under it.
+
+        Note this is a *local* guarantee on purpose. voisr.iss gains
+        CloseApplications in task 8, but that is an unlanded external
+        dependency and this invariant should not rest on it.
         """
         quit_fn = self._quit_fn
         if quit_fn is None:
+            # A headless Api (tests, a future CLI) has no window to tear
+            # down, and must certainly not take the process with it.
             print("voisr: update installing, but no quit hook is attached",
                   flush=True)
             return
 
         def go():
+            # Armed before quit_fn, not after: a quit that blocks rather than
+            # returning would never reach a backstop armed below it.
+            self._arm(self.SHUTDOWN_HARD_S, self._exit_fn)
             try:
                 quit_fn()
             except Exception as e:
-                # Nothing left to report this to, and the installer's
-                # CloseApplications is the backstop for a window that will
-                # not go quietly.
                 print(f"voisr: shutdown after install failed: {e}", flush=True)
 
-        timer = self._timer_factory(self.SHUTDOWN_DELAY_S, go)
-        timer.daemon = True
-        timer.start()
+        self._arm(self.SHUTDOWN_DELAY_S, go)
 
     def set_check_for_updates(self, enabled):
         """Persist the toggle only. UpdateChecker._enabled() consults the

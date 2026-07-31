@@ -804,15 +804,26 @@ def _close_apis():
 
 
 def _api(tmp_path, **overrides):
+    """An Api that can never arm a real timer or really exit.
+
+    Both defaults matter: the shutdown path's real collaborators are a live
+    threading.Timer and os._exit(0), so a test that reached them would take
+    the pytest process down 5s later, from a background thread, with nothing
+    pointing at the cause. Pass timers=[] to inspect what was armed.
+    """
     timers = overrides.pop("timers", None)
+    if timers is None:
+        timers = []  # captured and discarded rather than left to fire
+
+    def factory(delay, fn):
+        timer = _FakeTimer(delay, fn)
+        timers.append(timer)
+        return timer
+
     kwargs = dict(config_path=tmp_path / "config.json",
-                  history=HistoryStore(tmp_path / "h.jsonl"))
-    if timers is not None:
-        def factory(delay, fn):
-            timer = _FakeTimer(delay, fn)
-            timers.append(timer)
-            return timer
-        kwargs["timer_factory"] = factory
+                  history=HistoryStore(tmp_path / "h.jsonl"),
+                  timer_factory=factory,
+                  exit_fn=lambda: pytest.fail("the hard exit fired"))
     kwargs.update(overrides)
     api = Api(**kwargs)
     _OPEN_APIS.append(api)
@@ -829,12 +840,15 @@ def _ready_checker(tmp_path, spawned=None):
 
 def test_the_bridge_reports_a_full_status_with_no_checker_attached(tmp_path):
     # Same keys as UpdateChecker.status(): the dashboard renders one shape.
-    status = _api(tmp_path).get_update_status()
-    assert set(status) == {"state", "current_version", "version", "notes",
-                           "error", "enabled"}
-    assert status["state"] == "idle"
-    assert status["enabled"] is False
-    assert status["current_version"] == voisr.__version__
+    # Compared against the real thing rather than a literal, so a field added
+    # to status() cannot quietly break that promise with a green suite.
+    api = _api(tmp_path)
+    without = api.get_update_status()
+    api.attach_update_checker(_ready_checker(tmp_path))
+    assert set(without) == set(api.get_update_status())
+    assert without["state"] == "idle"
+    assert without["enabled"] is False
+    assert without["current_version"] == voisr.__version__
 
 
 def test_the_bridge_forwards_the_checkers_status(tmp_path):
@@ -897,8 +911,8 @@ def test_a_successful_install_returns_before_the_app_shuts_down(tmp_path):
 
 
 def test_a_failed_install_leaves_the_app_running(tmp_path):
-    timers, quits = [], []
-    api = _api(tmp_path, timers=timers)
+    timers, quits, exits = [], [], []
+    api = _api(tmp_path, timers=timers, exit_fn=lambda: exits.append(True))
     api.attach_quit(lambda: quits.append(True))
     checker = _ready_checker(tmp_path)
 
@@ -909,7 +923,66 @@ def test_a_failed_install_leaves_the_app_running(tmp_path):
     api.attach_update_checker(checker)
 
     assert "error" in api.install_update()
-    assert timers == [] and quits == []
+    # Neither the deferred quit nor the hard exit behind it.
+    assert timers == [] and quits == [] and exits == []
+
+
+def test_a_quit_that_does_nothing_is_backstopped_by_a_hard_exit(tmp_path):
+    # `installing` is terminal, so an app that survives its own quit strands
+    # the user: a dashboard stuck on "Installing", a silent install already
+    # running underneath, and {app} still held open against it. Not
+    # hypothetical -- main() creates the pill before the dashboard, so the
+    # pill is pywebview's 'master' and destroying the dashboard alone leaves
+    # BrowserView.instances non-empty, which is what gates Application.Exit.
+    timers, exits = [], []
+    api = _api(tmp_path, timers=timers, exit_fn=lambda: exits.append(True))
+    api.attach_quit(lambda: None)  # returns, having done nothing
+    api.attach_update_checker(_ready_checker(tmp_path))
+
+    api.install_update()
+    assert len(timers) == 1
+    timers[0].fn()  # the deferred quit runs and quietly achieves nothing
+
+    assert len(timers) == 2 and timers[1].started
+    assert timers[1].delay == Api.SHUTDOWN_HARD_S
+    assert exits == []  # the clean exit still has its window
+    timers[1].fn()
+    assert exits == [True]
+
+
+def test_a_quit_that_blocks_still_reaches_the_hard_exit(tmp_path):
+    # The backstop is armed before quit_fn is called, not after it returns:
+    # a quit that never returns must not take the guarantee down with it.
+    timers, exits = [], []
+    api = _api(tmp_path, timers=timers, exit_fn=lambda: exits.append(True))
+    armed_before_quit = []
+
+    def hangs():
+        armed_before_quit.append(len(timers))
+        raise RuntimeError("stands in for a quit that never returns")
+
+    api.attach_quit(hangs)
+    api.attach_update_checker(_ready_checker(tmp_path))
+    api.install_update()
+    timers[0].fn()
+
+    assert armed_before_quit == [2]  # the hard exit was already armed
+    timers[1].fn()
+    assert exits == [True]
+
+
+def test_a_second_install_is_refused_and_arms_no_second_shutdown(tmp_path):
+    # UpdateChecker's compare-and-set is the only thing stopping two Inno
+    # installs writing into {app} at once. Pin install_update to it, so a
+    # refactor that armed the timer before calling install() cannot pass.
+    timers, quits = [], []
+    api = _api(tmp_path, timers=timers)
+    api.attach_quit(lambda: quits.append(True))
+    api.attach_update_checker(_ready_checker(tmp_path))
+
+    assert api.install_update()["ok"] is True
+    assert "error" in api.install_update()
+    assert len(timers) == 1
 
 
 def test_an_install_with_no_quit_hook_still_reports_success(tmp_path):
