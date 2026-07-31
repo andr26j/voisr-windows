@@ -7,6 +7,7 @@ network access and without ever executing an installer.
 
 import json
 from dataclasses import dataclass
+from urllib.parse import unquote, urlsplit
 
 
 def parse_version(text) -> tuple[int, ...]:
@@ -38,7 +39,13 @@ MANIFEST_URL = (
 RELEASE_URL_PREFIX = (
     "https://github.com/andr26j/voisr-releases/releases/download/"
 )
-_HEX = set("0123456789abcdef")
+_HEX = frozenset("0123456789abcdef")
+
+# A real manifest is ~200 bytes. Capping the raw payload rejects things like
+# `"[" * 200000` before it reaches json.loads and blows the decoder's
+# recursion limit -- RecursionError is not a ValueError, and callers only
+# catch ValueError to treat a bad manifest as "no update".
+_MAX_MANIFEST_BYTES = 8192
 
 
 @dataclass(frozen=True)
@@ -52,25 +59,53 @@ class Manifest:
     def from_json(cls, raw) -> "Manifest":
         """Parse and fully validate a manifest. Raises ValueError on anything
         suspect -- callers turn that into "no update", never a partial one."""
-        data = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+        if isinstance(raw, (str, bytes)) and len(raw) > _MAX_MANIFEST_BYTES:
+            raise ValueError("manifest exceeds maximum size")
+        try:
+            data = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+        except RecursionError:
+            raise ValueError("manifest is too deeply nested to parse")
         if not isinstance(data, dict):
             raise ValueError("manifest must be a JSON object")
 
-        for field in ("version", "url", "sha256", "notes"):
+        for field in ("version", "url", "notes"):
             if not data.get(field):
                 raise ValueError(f"manifest missing {field}")
 
-        parse_version(data["version"])  # raises if unparseable
-
-        url = str(data["url"])
-        # Pinning the prefix also rejects http:// and any host swap, so a
-        # tampered manifest cannot redirect the download elsewhere.
-        if not url.startswith(RELEASE_URL_PREFIX) or ".." in url:
-            raise ValueError(f"url is outside the release channel: {url}")
-
-        sha = str(data["sha256"]).strip().lower()
+        # sha256 gets its own presence check below (via the length test) so
+        # that an absent or empty digest reports the specific hex-format
+        # rule instead of a generic "missing" message.
+        sha = str(data.get("sha256") or "").strip().lower()
         if len(sha) != 64 or not set(sha) <= _HEX:
             raise ValueError("sha256 must be 64 hex characters")
 
-        return cls(version=str(data["version"]), url=url, sha256=sha,
+        # Canonicalise rather than store the raw text: a later task derives
+        # a filename and a cache key from this string, so "v1.1.0" and
+        # " 1.1.0 " must collapse to the same value as "1.1.0".
+        version = ".".join(str(n) for n in parse_version(data["version"]))
+
+        url = str(data["url"])
+        if not url.isascii() or any(c.isspace() or ord(c) < 0x20 for c in url):
+            # Caught early: http.client raises InvalidURL (not ValueError,
+            # not OSError) for embedded CRLF/whitespace, which would escape
+            # the "treat any bad manifest as ValueError" contract below.
+            raise ValueError(f"url has invalid characters: {url!r}")
+
+        # Structural allow-list on scheme/host/path, not a raw substring
+        # check: percent-encoding (e.g. "%2e%2e") survives a plain ".." in
+        # url test and would otherwise reach the traversal check unnoticed.
+        # Note what this does and doesn't buy us: it pins the *first* hop
+        # only -- urlopen follows redirects without re-validating the host,
+        # so a response from this URL could still redirect elsewhere. And
+        # the sha256 check is integrity (the download matches this
+        # document), not authenticity (this document is the real one):
+        # url and sha256 both come from the same manifest, so whoever can
+        # tamper with one can tamper with the other to match.
+        parts = urlsplit(url)
+        if (parts.scheme != "https" or parts.netloc != "github.com"
+                or not url.startswith(RELEASE_URL_PREFIX)
+                or ".." in unquote(parts.path)):
+            raise ValueError(f"url is outside the release channel: {url}")
+
+        return cls(version=version, url=url, sha256=sha,
                    notes=str(data["notes"]))

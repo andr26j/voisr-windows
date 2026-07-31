@@ -50,8 +50,25 @@ def _manifest_dict(**overrides):
 def test_manifest_parses_a_good_payload():
     m = Manifest.from_json(json.dumps(_manifest_dict()))
     assert m.version == "1.1.0"
+    assert m.url == RELEASE_URL_PREFIX + "v1.1.0/VoisrSetup.exe"
     assert m.sha256 == GOOD_SHA
     assert m.notes == "Adds auto-update."
+
+
+def test_manifest_normalises_sha256_to_lowercase():
+    # The download step later compares this against hexdigest(), which is
+    # always lowercase -- an uppercase manifest digest must still match.
+    m = Manifest.from_json(json.dumps(_manifest_dict(sha256=GOOD_SHA.upper())))
+    assert m.sha256 == GOOD_SHA
+
+
+def test_manifest_canonicalises_the_version_string():
+    # "v1.1.0" and " 1.1.0 " must collapse to the same stored value as
+    # "1.1.0" -- later tasks use this string as both a filename fragment
+    # and a cache key, so two spellings of one release must not diverge.
+    for raw in ("v1.1.0", " 1.1.0 "):
+        m = Manifest.from_json(json.dumps(_manifest_dict(version=raw)))
+        assert m.version == "1.1.0"
 
 
 def test_manifest_requires_every_field():
@@ -74,9 +91,32 @@ def test_manifest_rejects_a_url_outside_the_release_channel():
             Manifest.from_json(json.dumps(_manifest_dict(url=bad)))
 
 
+def test_manifest_rejects_a_percent_encoded_traversal_in_the_url():
+    # A plain ".." substring check is blind to percent-encoding -- both of
+    # these decode to a path that escapes the release-download prefix.
+    for bad in [
+        RELEASE_URL_PREFIX + "%2e%2e/%2e%2e/evil/x.exe",
+        RELEASE_URL_PREFIX + "%2e%2e%2f%2e%2e%2fevil/x.exe",
+    ]:
+        with pytest.raises(ValueError, match="release channel"):
+            Manifest.from_json(json.dumps(_manifest_dict(url=bad)))
+
+
+def test_manifest_rejects_control_characters_and_whitespace_in_the_url():
+    # http.client raises InvalidURL (not ValueError) for embedded CRLF or
+    # whitespace -- these must be rejected here, before that call ever
+    # happens, or a bad manifest would escape the ValueError contract.
+    for bad in [
+        RELEASE_URL_PREFIX + "v1/x.exe https://evil.com/y.exe",
+        RELEASE_URL_PREFIX + "v1/x.exe\r\nHost: evil.com",
+    ]:
+        with pytest.raises(ValueError):
+            Manifest.from_json(json.dumps(_manifest_dict(url=bad)))
+
+
 def test_manifest_rejects_a_malformed_sha256():
     for bad in ["", "abc", "z" * 64, GOOD_SHA[:-1]]:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="64 hex"):
             Manifest.from_json(json.dumps(_manifest_dict(sha256=bad)))
 
 
@@ -88,3 +128,11 @@ def test_manifest_rejects_an_unparseable_version():
 def test_manifest_rejects_a_non_object_payload():
     with pytest.raises(ValueError):
         Manifest.from_json("[]")
+
+
+def test_manifest_rejects_a_deeply_nested_payload():
+    # A JSON decoder recurses on nested structures; enough nesting raises
+    # RecursionError, which is neither ValueError nor OSError and would
+    # escape the "bad manifest raises ValueError" contract.
+    with pytest.raises(ValueError):
+        Manifest.from_json("[" * 200000)
