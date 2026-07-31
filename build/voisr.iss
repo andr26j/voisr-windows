@@ -16,7 +16,11 @@
   #define SourceDir "dist\Voisr"
 #endif
 #define MyAppName "Voisr"
-#define MyAppVersion "1.0.0"
+; Version comes from voisr/__init__.py via scripts\build_release.ps1
+; (/DMyAppVersion=...). The fallback only applies to a manual ISCC run.
+#ifndef MyAppVersion
+  #define MyAppVersion "0.0.0"
+#endif
 #define MyAppPublisher "Voisr"
 #define MyAppExeName "Voisr.exe"
 #define MyAppId "Voisr.Voisr"

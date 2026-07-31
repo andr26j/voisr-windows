@@ -7,6 +7,13 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $buildDir = Join-Path $root "build"
 
+# Single source of truth: voisr/__init__.py. Passed to ISCC below so the
+# installer's version can never drift from the app's.
+$versionLine = Select-String -Path (Join-Path $root "voisr\__init__.py") -Pattern '^__version__\s*=\s*"([^"]+)"'
+if (-not $versionLine) { throw "__version__ not found in voisr\__init__.py" }
+$appVersion = $versionLine.Matches[0].Groups[1].Value
+Write-Host "==> Version $appVersion"
+
 # ---------------------------------------------------------------------------
 # 1. whisper build, staged under build\ rather than reused from the repo's
 #    bin\ so a release never depends on setup.ps1 having been run first.
@@ -65,7 +72,7 @@ $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $iscc) { throw "ISCC.exe not found -- install Inno Setup 6 (winget install JRSoftware.InnoSetup)" }
 
 Write-Host "==> Compiling installer with $iscc"
-& $iscc (Join-Path $buildDir "voisr.iss")
+& $iscc "/DMyAppVersion=$appVersion" (Join-Path $buildDir "voisr.iss")
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit $LASTEXITCODE)" }
 
 $installer = Join-Path $buildDir "Output\VoisrSetup.exe"
