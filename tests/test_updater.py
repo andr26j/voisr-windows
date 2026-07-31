@@ -137,11 +137,21 @@ def test_manifest_rejects_a_non_object_payload():
 
 
 def test_manifest_rejects_a_deeply_nested_payload():
-    # A JSON decoder recurses on nested structures; enough nesting raises
-    # RecursionError, which is neither ValueError nor OSError and would
-    # escape the "bad manifest raises ValueError" contract.
-    with pytest.raises(ValueError):
+    # This is caught by the size cap, not by the RecursionError handler --
+    # "[" * 200000 is well over _MAX_MANIFEST_BYTES before json.loads ever
+    # runs. Pinning the message keeps the test honest about which guard it
+    # actually exercises.
+    with pytest.raises(ValueError, match="exceeds maximum size"):
         Manifest.from_json("[" * 200000)
+
+
+def test_manifest_rejects_a_pre_parsed_payload():
+    # from_json's contract is "JSON text in, ValueError on anything bad" --
+    # a pre-parsed dict must be rejected up front, not passed through to the
+    # str(...) coercions further down, where a hostile or buggy __str__
+    # could raise something other than ValueError.
+    with pytest.raises(ValueError, match="JSON text"):
+        Manifest.from_json({"version": "1.0.0"})
 
 
 def test_fetch_manifest_returns_a_parsed_manifest():

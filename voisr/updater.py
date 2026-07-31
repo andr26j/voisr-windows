@@ -58,15 +58,29 @@ class Manifest:
 
     @classmethod
     def from_json(cls, raw) -> "Manifest":
-        """Parse and fully validate a manifest. Raises ValueError on anything
-        suspect -- callers turn that into "no update", never a partial one."""
-        if isinstance(raw, (str, bytes)) and len(raw) > _MAX_MANIFEST_BYTES:
+        """Parse and fully validate a manifest. `raw` must be JSON text
+        (str or bytes) -- anything else, and anything suspect once parsed,
+        raises ValueError. Callers rely on that being the *only* exception
+        type this can raise, so they can turn it into "no update", never a
+        partial one, without a second net to catch something else."""
+        if not isinstance(raw, (str, bytes)):
+            # Reject non-text up front rather than passing it through to the
+            # field coercions below: str(x) on an attacker- or bug-supplied
+            # object can run arbitrary __str__ and raise something other
+            # than ValueError, breaking the contract this docstring makes.
+            raise ValueError(f"manifest must be JSON text, got {type(raw).__name__}")
+        if len(raw) > _MAX_MANIFEST_BYTES:
             raise ValueError("manifest exceeds maximum size")
         try:
-            data = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+            data = json.loads(raw)
         except RecursionError:
+            # Belt-and-braces: the size cap above already rejects payloads
+            # deep enough to matter today, so this path isn't reachable at
+            # the current cap. Kept in case that cap is ever raised.
             raise ValueError("manifest is too deeply nested to parse")
         if not isinstance(data, dict):
+            # Still needed even though raw is now guaranteed text: "[]" is
+            # valid JSON text that decodes to a non-dict.
             raise ValueError("manifest must be a JSON object")
 
         for field in ("version", "url", "notes"):
@@ -142,9 +156,8 @@ def fetch_manifest(url: str = MANIFEST_URL, opener=None) -> "Manifest | None":
     try:
         return Manifest.from_json(raw)
     except ValueError as e:
-        # json.JSONDecodeError is already a ValueError subclass, and
-        # from_json converts every other failure path (oversized payload,
-        # missing fields, bad url, RecursionError) into ValueError too --
-        # so ValueError is the only thing a malformed manifest can raise.
+        # ValueError is the only thing from_json can raise, by construction
+        # (it rejects non-str/bytes input before any field coercion runs),
+        # not merely by the happenstance of what today's opener returns.
         print(f"voisr: ignoring malformed update manifest: {e}", flush=True)
         return None
