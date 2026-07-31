@@ -237,11 +237,11 @@ def _replace_with_retry(part: Path, dest: Path) -> None:
     the freshly written file before the rename can complete.
 
     Same 20 attempts as history.py's read path, but escalating rather than a
-    flat 10ms, which totals ~1.1s of waiting instead of 200ms. That budget is
+    flat 10ms, which totals 2.39s of waiting instead of 200ms. That budget is
     deliberately far wider than history.py's: measured against deny-all Win32
     handles, a flat 200ms succeeds at 100ms and 190ms of contention and fails
-    from 250ms on, and a 155 MB .exe being scanned on write is not reliably a
-    sub-200ms event the way a small JSONL is. Waiting costs nothing here (a
+    from 250ms on, and an on-write scan of a 155 MB .exe is not reliably even
+    a sub-second event the way a small JSONL is. Waiting costs nothing here (a
     background thread that just spent minutes downloading), while losing the
     race costs a permanently non-updating install that re-fetches 155 MB every
     24h forever, with the completed download sitting unused in a .part file.
@@ -253,7 +253,7 @@ def _replace_with_retry(part: Path, dest: Path) -> None:
         except PermissionError:
             if attempt == 19:
                 raise
-            time.sleep(min(0.01 * 2 ** (attempt // 4), 0.5))
+            time.sleep(min(0.01 * 2 ** (attempt // 3), 0.5))
 
 
 def download_to(url: str, dest: Path | str, opener=None,
@@ -314,9 +314,24 @@ def verify_sha256(path: Path | str, expected: str) -> bool:
 
 
 def _default_spawn(argv) -> None:
-    """Start the installer detached, so it outlives the app that spawns it."""
+    """Start the installer with no console of its own and in its own process
+    group, so a Ctrl+C aimed at Voisr cannot reach it.
+
+    Neither flag is what makes it outlive us -- on Windows a child always
+    survives its parent -- so do not read survival into them, and do not add
+    CREATE_BREAKAWAY_FROM_JOB chasing it.
+
+    cwd is the installer's own directory (%LOCALAPPDATA%\\Voisr\\updates), not
+    Voisr's: an inherited working directory of {app} would be an open handle
+    on the very tree the installer is about to replace.
+
+    Unelevated by design -- this relies on voisr.iss keeping
+    PrivilegesRequired=lowest, or the silent install would stall on a UAC
+    prompt nobody is watching.
+    """
     subprocess.Popen(
         argv,
+        cwd=str(Path(argv[0]).parent),
         creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
         close_fds=True,
     )
@@ -328,6 +343,10 @@ class UpdateChecker:
 
     States: idle -> checking -> downloading -> ready -> installing. Any
     failure returns to idle with `error` set.
+
+    stop() cancels the schedule, not a check already running: one that was
+    in flight still finishes and can land in `ready`, so the UI may raise an
+    update banner moments after the user switched auto-update off.
     """
 
     INTERVAL_S = 24 * 60 * 60
@@ -410,11 +429,19 @@ class UpdateChecker:
                 # the flag under, so a stop() racing an _arm either loses (and
                 # cancels the timer this just stored) or wins (and this bails).
                 return
+            # Any timer already armed is replaced, never merely dropped:
+            # start() called twice would otherwise orphan the first one --
+            # untracked, so a later stop() cannot cancel it, and it would go
+            # on to run a full check and download after the user switched
+            # auto-update off.
+            old, self._timer = self._timer, None
             # Constructing a Timer starts nothing; the thread begins at
             # start(), which is deliberately outside the lock.
             timer = threading.Timer(delay, self._tick)
             timer.daemon = True
             self._timer = timer
+        if old is not None:
+            old.cancel()  # a no-op on one that has already fired
         timer.start()
 
     def _tick(self) -> None:
@@ -434,10 +461,22 @@ class UpdateChecker:
     # -- the check ------------------------------------------------------
     def check_now(self, force: bool = False) -> dict:
         """Run a full check now. Returns the same shape as `status()`; the
-        no-update path adds `up_to_date: True`. `force` is the Settings
-        "Check now" button, which must work with auto-check switched off.
+        no-update path adds `up_to_date: True` and a call that found another
+        check already running adds `already_checking: True`. `force` is the
+        Settings "Check now" button, which must work with auto-check off.
         """
         if not force and not self._enabled():
+            return self.status()
+
+        # Never restart the machine out from under an install. _check's first
+        # act is _set("checking"), which would overwrite "installing" and
+        # re-open install() for a second spawn of the same installer -- two
+        # concurrent silent Inno installs writing into {app}, with no
+        # SetupMutex to stop them. Read the field, then return outside the
+        # lock: status() takes the same non-reentrant lock and would deadlock.
+        with self._lock:
+            installing = self._state == "installing"
+        if installing:
             return self.status()
 
         # Single-flight. The interval timer and the Settings button can both
@@ -447,7 +486,7 @@ class UpdateChecker:
         # already running gets the current state and lets it finish rather
         # than blocking a UI thread for the length of a download.
         if not self._check_lock.acquire(blocking=False):
-            return self.status()
+            return {**self.status(), "already_checking": True}
         try:
             return self._check()
         except Exception as e:
@@ -468,6 +507,15 @@ class UpdateChecker:
         # update that never fires.
         if manifest is None or not is_newer(remote=manifest.version,
                                            local=self._current):
+            if manifest is not None:
+                # There is nothing to offer, so nothing on disk is worth
+                # keeping. This is the path a freshly updated app takes on its
+                # first check, and without it the ~155 MB installer that was
+                # just applied would sit in %LOCALAPPDATA% forever. Skipped
+                # when the fetch itself failed (manifest is None): a moment
+                # offline must not throw away a good download and make the
+                # next check re-burn 155 MB.
+                self._prune(keep=None)
             self._set("idle")
             return {**self.status(), "up_to_date": True}
 
@@ -475,6 +523,10 @@ class UpdateChecker:
         with self._lock:
             self._manifest = manifest
         dest = self._dir / f"VoisrSetup-{manifest.version}.exe"
+        # Before the download, not after it: pruning only on success leaves
+        # ~155 MB of superseded installer behind on every failure path, and
+        # this way the disk space is freed before we need 155 MB of it.
+        self._prune(keep=dest)
 
         # Both _verify calls must sit inside this try. verify_sha256 opens the
         # file, so it raises OSError on a missing or locked one -- and an
@@ -498,17 +550,26 @@ class UpdateChecker:
             self._set("idle", error=f"Could not fetch the update: {e}")
             return self.status()
 
-        self._prune(keep=dest)
         with self._lock:
             self._installer = dest
         self._set("ready")
         return self.status()
 
-    def _prune(self, keep: Path) -> None:
-        """Drop every installer but `keep`, including leftover .part files
-        from a crashed download (hence the trailing wildcard). Safe to sweep
-        that broadly because check_now is single-flight: no other download can
-        be in progress, so the only .part files here are abandoned ones."""
+    def _prune(self, keep: Path | None) -> None:
+        """Drop every installer but `keep` (pass None to drop all of them),
+        including leftover .part files from a crashed download -- hence the
+        trailing wildcard.
+
+        Sweeping .part files that broadly is safe, but not because of
+        single-flight: that lock is per-process, and two Voisr copies can
+        share %LOCALAPPDATA%\\Voisr\\updates (the README describes running an
+        installed copy alongside a dev one). What actually protects a live
+        download is Windows: CPython opens the .part without
+        FILE_SHARE_DELETE, so unlinking one that another process is still
+        writing raises PermissionError, which the handler below swallows. Anyone
+        adding a retry around that unlink, or widening the glob, removes the
+        only thing standing between this and deleting a download in flight.
+        """
         for path in self._dir.glob("VoisrSetup-*.exe*"):
             if path != keep:
                 try:
@@ -518,17 +579,25 @@ class UpdateChecker:
 
     # -- applying -------------------------------------------------------
     def install(self) -> dict:
-        # One acquisition for all three: the state is what makes the installer
-        # path trustworthy, so they must be read together.
+        # Check and claim in one acquisition. Spawning first and recording
+        # "installing" afterwards leaves a window in which a second install()
+        # still reads "ready" and spawns the same installer again -- and
+        # voisr.iss has no SetupMutex, so two silent Inno installs would write
+        # into {app} at once. The state is also what makes the installer path
+        # trustworthy, so both must be read together regardless.
         with self._lock:
-            installer, state = self._installer, self._state
+            installer = self._installer
             version = self._manifest.version if self._manifest else None
-        if state != "ready" or installer is None:
-            return {"error": "No verified update is ready to install."}
+            if self._state != "ready" or installer is None:
+                return {"error": "No verified update is ready to install."}
+            self._state, self._error = "installing", None
         try:
             self._spawn([str(installer), "/SILENT", "/NORESTART", "/RELAUNCH=1"])
         except Exception as e:
-            self._set("ready", error=f"Could not start the installer: {e}")
+            with self._lock:
+                # Only hand the state back if it is still ours to hand back.
+                if self._state == "installing":
+                    self._state = "ready"
+                    self._error = f"Could not start the installer: {e}"
             return {"error": str(e)}
-        self._set("installing")
         return {"ok": True, "version": version}

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import threading
 
 import pytest
 
@@ -512,12 +513,9 @@ def test_a_failed_spawn_is_reported_and_leaves_the_app_running(tmp_path):
     assert checker.status()["state"] == "ready"
 
 
-def test_stop_is_not_undone_by_a_check_that_was_already_running(tmp_path,
-                                                               monkeypatch):
-    # _tick re-arms after every check, so a stop() landing while a check is
-    # in flight would otherwise resurrect the schedule -- a leaked timer
-    # thread every time Settings toggles auto-check off and on again.
-    # The Timer is faked so nothing here waits out STARTUP_DELAY_S.
+def _fake_timers(monkeypatch):
+    """Record every armed timer instead of starting one. Scheduling tests must
+    never wait out STARTUP_DELAY_S or leave a live thread behind."""
     armed = []
 
     class FakeTimer:
@@ -532,6 +530,15 @@ def test_stop_is_not_undone_by_a_check_that_was_already_running(tmp_path,
             self.cancelled = True
 
     monkeypatch.setattr(updater.threading, "Timer", FakeTimer)
+    return armed
+
+
+def test_stop_is_not_undone_by_a_check_that_was_already_running(tmp_path,
+                                                                monkeypatch):
+    # _tick re-arms after every check, so a stop() landing while a check is
+    # in flight would otherwise resurrect the schedule -- a leaked timer
+    # thread every time Settings toggles auto-check off and on again.
+    armed = _fake_timers(monkeypatch)
 
     checker, _ = _checker(tmp_path)
     checker.start()
@@ -542,3 +549,143 @@ def test_stop_is_not_undone_by_a_check_that_was_already_running(tmp_path,
 
     checker._tick()  # the in-flight check finishing after stop()
     assert len(armed) == 1
+
+
+def test_arming_a_second_time_cancels_the_timer_it_replaces(tmp_path,
+                                                            monkeypatch):
+    # An orphaned timer is worse than a leaked thread: untracked, so stop()
+    # cannot cancel it, it would go on to run a real check and download after
+    # the user switched auto-update off.
+    armed = _fake_timers(monkeypatch)
+
+    checker, _ = _checker(tmp_path)
+    checker.start()
+    checker.start()
+    checker.stop()
+
+    assert len(armed) == 2
+    assert all(t.cancelled for t in armed)
+
+
+def test_a_second_check_will_not_start_while_one_is_already_running(tmp_path):
+    # Single-flight. Two checks would stream into the same .part file, and the
+    # loser's failed rename would report a spurious error over the winner's
+    # freshly ready update. Gated on Events, so there is nothing to wait for
+    # and no sleep: the second call must return while the first is parked.
+    started, release = threading.Event(), threading.Event()
+    checker, calls = _checker(tmp_path)
+    counted_fetch = checker._fetch
+
+    def gated_fetch(url, opener=None):
+        manifest = counted_fetch(url)
+        started.set()
+        release.wait(10)
+        return manifest
+
+    checker._fetch = gated_fetch
+    worker = threading.Thread(target=checker.check_now)
+    worker.start()
+    try:
+        assert started.wait(10)
+        result = checker.check_now(force=True)
+        assert result["already_checking"] is True
+        assert result["state"] == "checking"
+        assert calls["fetch"] == 1  # the second call never reached the network
+    finally:
+        release.set()
+        worker.join(10)
+    assert not worker.is_alive()
+    assert calls["fetch"] == 1
+    assert checker.status()["state"] == "ready"
+
+
+def test_a_check_cannot_restart_the_machine_during_an_install(tmp_path):
+    # _check's first act is _set("checking"), which would overwrite
+    # "installing" -- and a state back at "ready" lets install() spawn the
+    # same installer a second time, two silent Inno installs writing into
+    # {app} at once.
+    spawned = []
+    checker, calls = _checker(tmp_path, spawned=spawned)
+    checker.check_now()
+    checker.install()
+
+    result = checker.check_now(force=True)
+    assert result["state"] == "installing"
+    assert calls["fetch"] == 1  # the check was refused, not merely ignored
+    assert checker.status()["state"] == "installing"
+
+    assert "error" in checker.install()
+    assert len(spawned) == 1
+
+
+def test_an_unexpected_failure_mid_check_still_lands_in_idle(tmp_path):
+    # _check guards the download itself; this pins the outer net. Without it a
+    # collaborator raising before that point parks the machine in "checking"
+    # with no error until the next 24h tick.
+    checker, _ = _checker(tmp_path)
+
+    def boom(url, opener=None):
+        raise RuntimeError("collaborator exploded")
+
+    checker._fetch = boom
+    result = checker.check_now()
+    assert result["state"] == "idle"
+    assert "collaborator exploded" in result["error"]
+
+
+def test_the_installer_is_spawned_detached_and_outside_the_app_directory(
+        tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"], captured["kwargs"] = argv, kwargs
+        return None
+
+    monkeypatch.setattr(updater.subprocess, "Popen", fake_popen)
+
+    exe = tmp_path / "VoisrSetup-1.1.0.exe"
+    updater._default_spawn([str(exe), "/SILENT"])
+
+    assert captured["argv"] == [str(exe), "/SILENT"]
+    flags = captured["kwargs"]["creationflags"]
+    assert flags & updater.subprocess.DETACHED_PROCESS
+    assert flags & updater.subprocess.CREATE_NEW_PROCESS_GROUP
+    # Not Voisr's own directory: an inherited cwd of {app} would be an open
+    # handle on the tree the installer is about to replace.
+    assert captured["kwargs"]["cwd"] == str(tmp_path)
+
+
+def test_a_stale_installer_is_dropped_once_there_is_nothing_to_offer(tmp_path):
+    # The path a freshly updated app takes on its first check. Without the
+    # prune the ~155 MB installer that was just applied sits there forever.
+    (tmp_path / "VoisrSetup-1.1.0.exe").write_bytes(b"already applied")
+    checker, _ = _checker(tmp_path, current="1.1.0")
+    checker.check_now()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_download_that_cannot_be_reached_still_clears_the_old_installer(
+        tmp_path):
+    # Pruning only on success leaves ~155 MB of superseded installer behind on
+    # every failure path.
+    (tmp_path / "VoisrSetup-0.9.0.exe").write_bytes(b"superseded")
+    checker, _ = _checker(tmp_path)
+
+    def boom(url, dest, opener=None):
+        raise OSError("connection reset")
+
+    checker._download = boom
+    result = checker.check_now()
+    assert result["state"] == "idle"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_offline_check_keeps_a_download_that_is_already_on_disk(tmp_path):
+    # The counterpart to the prune above: a moment offline must not throw away
+    # a good installer and make the next check re-burn 155 MB.
+    stale = tmp_path / "VoisrSetup-1.1.0.exe"
+    stale.write_bytes(b"installer")
+    checker, _ = _checker(tmp_path)
+    checker._fetch = lambda url, opener=None: None
+    checker.check_now()
+    assert stale.is_file()
