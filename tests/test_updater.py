@@ -3,7 +3,9 @@ import json
 import pytest
 
 import voisr
+import voisr.updater as updater
 from voisr.updater import (
+    MANIFEST_URL,
     Manifest,
     RELEASE_URL_PREFIX,
     fetch_manifest,
@@ -185,3 +187,43 @@ def test_fetch_manifest_returns_none_on_malformed_payload():
     for payload in ["not json", "{}", json.dumps(_manifest_dict(url="https://evil.test/x.exe"))]:
         assert fetch_manifest("https://example.test/latest.json",
                               opener=lambda url, p=payload: p) is None
+
+
+def test_fetch_manifest_defaults_to_manifest_url():
+    # Cheap protection against a future refactor defaulting the wrong
+    # constant in (e.g. RELEASE_URL_PREFIX) by copy-paste.
+    captured = {}
+
+    def opener(url):
+        captured["url"] = url
+        return json.dumps(_manifest_dict())
+
+    fetch_manifest(opener=opener)
+    assert captured["url"] == MANIFEST_URL
+
+
+def test_fetch_manifest_tolerates_a_utf8_bom(monkeypatch):
+    # PowerShell 5.1's Set-Content -Encoding utf8 writes a BOM, so a real
+    # latest.json arrives with one. Without utf-8-sig every published
+    # release is silently ignored as malformed. This exercises the real
+    # _default_text_opener decode path, not an injected opener, since that
+    # is exactly where the bug lived.
+    payload = b"\xef\xbb\xbf" + json.dumps(_manifest_dict()).encode("utf-8")
+
+    class FakeResponse:
+        def read(self, *args):
+            return payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(
+        updater.urllib.request, "urlopen",
+        lambda url, timeout=None: FakeResponse(),
+    )
+
+    m = fetch_manifest("https://example.test/latest.json")
+    assert m.version == "1.1.0"

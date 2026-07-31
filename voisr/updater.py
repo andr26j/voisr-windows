@@ -131,7 +131,18 @@ _TIMEOUT_S = 10
 
 def _default_text_opener(url: str) -> str:
     with urllib.request.urlopen(url, timeout=_TIMEOUT_S) as response:
-        return response.read().decode("utf-8")
+        # Bounded read: an oversized body is truncated at the network layer
+        # rather than fully buffered first, so the +1 keeps from_json's own
+        # over-cap rejection reachable instead of silently parsing a body
+        # truncated to exactly the limit.
+        raw = response.read(_MAX_MANIFEST_BYTES + 1)
+        # utf-8-sig strips a leading UTF-8 BOM when present and is
+        # byte-identical to utf-8 when absent. PowerShell 5.1's
+        # `Set-Content -Encoding utf8` (used to publish latest.json) writes
+        # a BOM, and plain utf-8 leaves it in place, which makes json.loads
+        # raise on every real release -- fetch_manifest would then log and
+        # silently treat every published update as "nothing to see".
+        return raw.decode("utf-8-sig")
 
 
 def fetch_manifest(url: str = MANIFEST_URL, opener=None) -> "Manifest | None":
@@ -151,7 +162,9 @@ def fetch_manifest(url: str = MANIFEST_URL, opener=None) -> "Manifest | None":
         # for a malformed response and which are not OSError subclasses.
         # KeyboardInterrupt/SystemExit are BaseException, not Exception, so
         # they still propagate -- this only swallows failures, not shutdown.
-        print(f"voisr: update check failed: {e}", flush=True)
+        # Tag the exception type: a TypeError from a broken custom opener
+        # otherwise looks identical in the log to a real network failure.
+        print(f"voisr: update check failed: {type(e).__name__}: {e}", flush=True)
         return None
     try:
         return Manifest.from_json(raw)
