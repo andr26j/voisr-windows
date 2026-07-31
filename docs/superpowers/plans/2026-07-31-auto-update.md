@@ -1671,9 +1671,11 @@ Expected: the JSON, with `version` `1.0.0`. A 404 here means the asset name is w
 
 - [ ] **Step 2b: Confirm tray Quit actually exits the process**
 
-Do this before anything else, because the whole update flow depends on it and it is **pre-existing behaviour nobody has verified**.
+Do this before anything else, because the whole update flow depends on it and it is **pre-existing behaviour nobody has verified at runtime**.
 
-A code review of `voisr/ui.py` could not confirm from source that `menu_quit` fully exits. `main()` calls `widget.create()` *before* `webview.create_window(dashboard)`, so the pill window holds pywebview's `uid == 'master'`, and winforms' `on_close` calls `Application.Exit()` only when `len(BrowserView.instances) == 0`. The pill is never destroyed anywhere in `voisr/`. If that reading is right, `webview.start()` never returns and the process survives.
+**Two independent reviews have confirmed from source that `menu_quit` does not exit.** `main()` calls `widget.create()` *before* `webview.create_window(dashboard)`, so the pill window holds pywebview's `uid == 'master'` (`webview/__init__.py:377`); `app.Run()` runs on that window's thread (`winforms.py:793-812`); and `on_close` calls `Application.Exit()` only when `len(BrowserView.instances) == 0` (`winforms.py:397`). Nothing in `voisr/` ever destroys the pill — `overlay.py` only ever calls `hide`. So `webview.start()` never returns, and the `finally` that stops the hotkey service and releases the tray icon never runs.
+
+This is tracked as its own task. Until it is fixed, the post-install `os._exit(0)` backstop is **load-bearing on every install**, not the fallback it was designed as. This step is the runtime confirmation.
 
 Launch Voisr, then choose **Quit Voisr** from the tray menu.
 
