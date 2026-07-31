@@ -879,19 +879,27 @@ class UpdateChecker:
             self._manifest = manifest
         dest = self._dir / f"VoisrSetup-{manifest.version}.exe"
 
-        if not dest.is_file() or not self._verify(dest, manifest.sha256):
-            dest.unlink(missing_ok=True)
-            try:
-                self._download(manifest.url, dest)
-            except Exception as e:
-                self._set("idle", error=f"Download failed: {e}")
-                return self.status()
-            if not self._verify(dest, manifest.sha256):
-                # Never execute an installer we cannot vouch for.
+        # Both _verify calls must sit inside this try. verify_sha256 opens the
+        # file, so it raises OSError on a missing or locked one -- and an
+        # OSError escaping here would leave the state machine stuck at
+        # "downloading" with error=None until the next 24h tick, with the
+        # mismatch branch below never running. A file we cannot hash is
+        # unverified, which is not the same as a mismatch: only a real
+        # mismatch should delete the file and log loudly.
+        try:
+            if not dest.is_file() or not self._verify(dest, manifest.sha256):
                 dest.unlink(missing_ok=True)
-                print("voisr: update checksum mismatch, discarded", flush=True)
-                self._set("idle", error="Update checksum did not match; discarded.")
-                return self.status()
+                self._download(manifest.url, dest)
+                if not self._verify(dest, manifest.sha256):
+                    # Never execute an installer we cannot vouch for.
+                    dest.unlink(missing_ok=True)
+                    print("voisr: update checksum mismatch, discarded", flush=True)
+                    self._set("idle",
+                              error="Update checksum did not match; discarded.")
+                    return self.status()
+        except Exception as e:
+            self._set("idle", error=f"Could not fetch the update: {e}")
+            return self.status()
 
         self._prune(keep=dest)
         with self._lock:
