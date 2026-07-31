@@ -1092,6 +1092,12 @@ In `build/voisr.iss`'s `[Setup]` section, after `WizardStyle=modern`, add:
 CloseApplications=yes
 CloseApplicationsFilter=*.exe,*.dll
 RestartApplications=no
+; Refuse to run two copies of Setup at once. Without this, two concurrent
+; silent installs can write into {app} simultaneously and corrupt the install.
+; UpdateChecker.install() is guarded against double-spawning, but that guard
+; is per-process: an installed copy and a dev copy share %LOCALAPPDATA%\Voisr
+; (see the README), so the mutex is the only cross-process protection.
+SetupMutex=VoisrSetupMutex
 ```
 
 Replace the `[Run]` section with:
@@ -1333,6 +1339,12 @@ Then insert two rows before the closing `</div>` of that section (after the `cle
 ```
 
 - [ ] **Step 4: Wire the controls**
+
+Three constraints from the Task 6 review that this wiring must respect:
+
+- **Render the banner from `state`, not `version`.** `UpdateChecker` never clears `_manifest`, so `status()` can report a `version` for a release that is no longer offered. Only `state === "ready"` means installable.
+- **If you ever toggle the checker on and off, use `stop()` then `start()` — never `start()` twice.** A second `start()` without an intervening `stop()` arms an untracked timer.
+- **`check_now` may return `already_checking: true`** when a background check is mid-flight. That is not a completed check; render the in-progress state rather than reporting "up to date".
 
 In `voisr/web/js/views/settings.js`, inside `render()` next to the existing `$("#launch-toggle").checked = ...` line, add:
 
