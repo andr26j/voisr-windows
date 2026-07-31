@@ -1157,12 +1157,22 @@ In `scripts/build_release.ps1`, replace the final `Write-Host "==> Done: ..."` l
 ```powershell
 $sha = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
 $manifestPath = Join-Path $buildDir "Output\latest.json"
-@{
+$manifestJson = @{
     version = $appVersion
     url     = "https://github.com/andr26j/voisr-releases/releases/download/v$appVersion/VoisrSetup.exe"
     sha256  = $sha
     notes   = $env:VOISR_RELEASE_NOTES
-} | ConvertTo-Json | Set-Content -Path $manifestPath -Encoding utf8
+} | ConvertTo-Json
+
+# Write UTF-8 WITHOUT a BOM. Do not use Set-Content -Encoding utf8: on
+# Windows PowerShell 5.1 that emits a BOM, and a BOM makes Python's
+# json.loads reject the manifest ("Unexpected UTF-8 BOM"). The client
+# decodes with utf-8-sig so it survives one either way, but emitting a BOM
+# here would leave every published release silently invisible to any client
+# that did not. -Encoding utf8NoBOM would do it on PowerShell 6+, which is
+# not what this machine runs.
+[System.IO.File]::WriteAllText(
+    $manifestPath, $manifestJson, (New-Object System.Text.UTF8Encoding($false)))
 
 $sizeMb = [math]::Round((Get-Item $installer).Length / 1MB, 1)
 Write-Host "==> Done: $installer ($sizeMb MB)"
@@ -1238,11 +1248,12 @@ powershell -NoProfile -Command "$env:VOISR_RELEASE_NOTES='Adds auto-update.'; po
 Then feed the real file through the real validator — the round trip is the point:
 
 ```bash
-venv\Scripts\python -c "from voisr.updater import Manifest; m=Manifest.from_json(open('build/Output/latest.json',encoding='utf-8-sig').read()); print('accepted:', m.version, m.sha256[:12])"
+venv\Scripts\python -c "from voisr.updater import Manifest; m=Manifest.from_json(open('build/Output/latest.json',encoding='utf-8').read()); print('accepted:', m.version, m.sha256[:12])"
 ```
 
 Expected: `accepted: 1.0.0 <12 hex chars>`
-If this raises, `Set-Content -Encoding utf8` wrote a BOM the parser tripped on — that is why `utf-8-sig` is used here; keep it.
+
+Note this reads with plain `utf-8`, not `utf-8-sig`, deliberately: it is the check that the writer above really produced a BOM-free file. If it raises `Unexpected UTF-8 BOM`, the `WriteAllText` call was changed back to `Set-Content -Encoding utf8` — fix the writer rather than this command. (`_default_text_opener` decodes with `utf-8-sig`, so a BOM would not break a real client; it would just mean the two ends disagree, and this is the only place that catches that.)
 
 - [ ] **Step 5: Commit**
 
