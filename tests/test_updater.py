@@ -275,3 +275,108 @@ def test_verify_sha256_ignores_digest_case_and_whitespace(tmp_path):
     f.write_bytes(b"payload")
     digest = hashlib.sha256(b"payload").hexdigest()
     assert verify_sha256(f, f"  {digest.upper()}  ")
+
+
+def test_verify_sha256_streams_a_file_larger_than_one_chunk(tmp_path):
+    # _CHUNK exists so verify_sha256 streams the file rather than holding it
+    # in memory whole -- this pins that the digest covers every chunk, not
+    # just the first, since a loop that only hashed the first _CHUNK would
+    # otherwise pass every other test in this file undetected.
+    data = b"x" * (3 * 1024 * 1024) + b"y" * 12345
+    f = tmp_path / "a.bin"
+    f.write_bytes(data)
+    assert verify_sha256(f, hashlib.sha256(data).hexdigest())
+
+
+def test_download_accepts_an_opener_that_streams_chunks(tmp_path):
+    # The real opener yields pieces instead of returning one bytes object
+    # (see _default_bytes_opener); download_to must produce the same file
+    # either way.
+    dest = tmp_path / "VoisrSetup-1.1.0.exe"
+
+    def opener(url):
+        yield b"pay"
+        yield b"load"
+
+    download_to("https://example.test/x.exe", dest, opener=opener)
+    assert dest.read_bytes() == b"payload"
+
+
+def test_download_overwrites_an_existing_destination(tmp_path):
+    dest = tmp_path / "VoisrSetup-1.1.0.exe"
+    dest.write_bytes(b"stale installer from a previous version")
+    download_to("https://example.test/x.exe", dest, opener=lambda url: b"new payload")
+    assert dest.read_bytes() == b"new payload"
+
+
+def test_download_succeeds_despite_a_stale_part_file_from_a_crashed_run(tmp_path):
+    dest = tmp_path / "VoisrSetup-1.1.0.exe"
+    part = dest.with_name(dest.name + ".part")
+    part.write_bytes(b"leftover from a process that crashed mid-download")
+    download_to("https://example.test/x.exe", dest, opener=lambda url: b"payload")
+    assert dest.read_bytes() == b"payload"
+    assert list(tmp_path.iterdir()) == [dest]
+
+
+def test_keyboard_interrupt_during_download_still_cleans_up_the_part_file(tmp_path):
+    dest = tmp_path / "VoisrSetup-1.1.0.exe"
+
+    def opener(url):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        download_to("https://example.test/x.exe", dest, opener=opener)
+    assert not dest.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_rejects_a_body_over_the_size_ceiling(tmp_path):
+    # Small injected ceiling stands in for _MAX_INSTALLER_BYTES so the test
+    # doesn't need to write hundreds of megabytes to exercise the check.
+    dest = tmp_path / "VoisrSetup-1.1.0.exe"
+
+    def opener(url):
+        yield b"x" * 10
+
+    with pytest.raises(OSError):
+        download_to("https://example.test/x.exe", dest, opener=opener, max_bytes=5)
+    assert not dest.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_default_opener_reports_a_content_length_mismatch_as_incomplete(monkeypatch, tmp_path):
+    # A dropped connection truncates the body without raising. Unchecked,
+    # that would surface later only as a sha256 mismatch -- which tells the
+    # user their download may have been tampered with, when their
+    # connection merely dropped. This exercises the real
+    # _default_bytes_opener, not an injected opener, since only it sees the
+    # Content-Length header.
+    remaining = [b"short"]
+
+    class FakeHeaders:
+        def get(self, name, default=None):
+            return "100" if name == "Content-Length" else default
+
+    class FakeResponse:
+        headers = FakeHeaders()
+
+        def read(self, size=None):
+            chunk, remaining[0] = remaining[0][:size], remaining[0][size:]
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(
+        updater.urllib.request, "urlopen",
+        lambda url, timeout=None: FakeResponse(),
+    )
+
+    dest = tmp_path / "VoisrSetup-1.1.0.exe"
+    with pytest.raises(OSError, match="incomplete"):
+        download_to("https://example.test/x.exe", dest)
+    assert not dest.exists()
+    assert list(tmp_path.iterdir()) == []

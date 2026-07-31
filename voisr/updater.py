@@ -7,6 +7,7 @@ network access and without ever executing an installer.
 
 import hashlib
 import json
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,15 +48,10 @@ _HEX = frozenset("0123456789abcdef")
 # A real manifest is ~200 bytes. Capping the raw payload rejects things like
 # `"[" * 200000` before it reaches json.loads and blows the decoder's
 # recursion limit -- RecursionError is not a ValueError, and callers only
-# catch ValueError to treat a bad manifest as "no update".
-#
-# Enforced in two different units at two different layers: bytes at the
-# network read in `_default_text_opener` (`response.read(_MAX_MANIFEST_BYTES
-# + 1)`), and characters at the length check in `Manifest.from_json`. That
-# mismatch is harmless -- UTF-8 decoding never produces more characters than
-# input bytes, so the byte ceiling is the one that actually bites on the real
-# fetch path -- but keep it in mind if you ever feed from_json non-UTF-8-sourced
-# text directly.
+# catch ValueError to treat a bad manifest as "no update". Checked in bytes
+# at the network read and via len(raw) in from_json -- for str, len() counts
+# characters, never more than the underlying UTF-8 byte count, so the cap is
+# never looser there than at the network layer.
 _MAX_MANIFEST_BYTES = 8192
 
 
@@ -188,24 +184,98 @@ def fetch_manifest(url: str = MANIFEST_URL, opener=None) -> "Manifest | None":
 
 _CHUNK = 1024 * 1024
 
+# A generous ceiling on the installer itself, not a precise one: once the
+# download streams (see _default_bytes_opener below), a runaway body fills
+# the system drive under %LOCALAPPDATA% rather than exhausting RAM, so this
+# exists to bound that blast radius cheaply rather than to pin an exact size.
+_MAX_INSTALLER_BYTES = 512 * 1024 * 1024
 
-def _default_bytes_opener(url: str) -> bytes:
+
+def _default_bytes_opener(url: str):
+    """Yield the body in _CHUNK pieces, then check the byte count against
+    any advertised Content-Length.
+
+    A generator, not one big bytes: response.read() with a known
+    Content-Length runs through http.client._safe_read, which accumulates
+    into a BytesIO and then calls .getvalue() -- a second full copy. For a
+    ~155 MB installer that peaks at roughly 2x the payload size in memory
+    for no benefit, while this app is doing the check in the background of
+    a live session. Streaming keeps memory near _CHUNK regardless of
+    installer size.
+
+    The Content-Length check exists because a dropped connection truncates
+    the body without raising: unchecked, that surfaces later only as a
+    sha256 mismatch, which reads to the user as "this may have been
+    tampered with" when their connection merely dropped.
+    """
     with urllib.request.urlopen(url, timeout=_TIMEOUT_S) as response:
-        return response.read()
+        expected = response.headers.get("Content-Length")
+        expected = int(expected) if expected is not None else None
+        received = 0
+        while chunk := response.read(_CHUNK):
+            received += len(chunk)
+            yield chunk
+        if expected is not None and received != expected:
+            raise OSError(
+                f"incomplete download: got {received} of {expected} bytes"
+            )
 
 
-def download_to(url: str, dest, opener=None) -> Path:
+def _chunks(payload):
+    """An opener may return the whole body at once (what every test here
+    injects) or an iterable of pieces (what the real one yields, to avoid
+    holding a ~155 MB installer in memory twice). Normalise to pieces."""
+    if isinstance(payload, (bytes, bytearray, memoryview)):
+        return (payload,)
+    return payload
+
+
+def _replace_with_retry(part: Path, dest: Path) -> None:
+    """Same transient-lock retry budget as history.py's read path (20
+    attempts, 10ms apart) -- Defender or the search indexer opening the
+    freshly written file before the rename can complete. A 155 MB .exe
+    landing in %LOCALAPPDATA% is a likelier on-write-scan target than a
+    small JSONL, and there is no resume here: silently losing this race
+    would mean re-fetching 155 MB on every future 24h check cycle, forever,
+    while the completed download sits unused in a .part file.
+    """
+    for attempt in range(20):
+        try:
+            part.replace(dest)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.01)
+
+
+def download_to(url: str, dest: Path | str, opener=None,
+                 max_bytes: int = _MAX_INSTALLER_BYTES) -> Path:
     """Download to `dest`, writing a .part file first.
 
-    The rename is the commit point: `dest` either does not exist or is a
-    complete download. A truncated file at `dest` would later be executed.
+    The rename is the commit point: `dest` either does not exist or holds
+    everything the opener produced -- complete as far as the opener
+    reported, not a guarantee about the remote artifact itself. (A single
+    unbounded response.read() incidentally caught a truncated body via
+    stdlib's IncompleteRead; chunked reads at _CHUNK don't get that for
+    free, which is why _default_bytes_opener carries its own
+    Content-Length check instead.) verify_sha256 is what actually vouches
+    for the bytes on disk.
     """
     opener = opener or _default_bytes_opener
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
     try:
-        part.write_bytes(opener(url))
+        with open(part, "wb") as f:
+            total = 0
+            for chunk in _chunks(opener(url)):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise OSError(
+                        f"download exceeds maximum size of {max_bytes} bytes"
+                    )
+                f.write(chunk)
     except BaseException:
         # Best-effort cleanup: if unlink itself fails (e.g. the .part file
         # is transiently locked by antivirus scanning it, per the Windows
@@ -216,13 +286,19 @@ def download_to(url: str, dest, opener=None) -> Path:
         except OSError:
             pass
         raise
-    part.replace(dest)
+    _replace_with_retry(part, dest)
     return dest
 
 
-def verify_sha256(path, expected: str) -> bool:
+def verify_sha256(path: Path | str, expected: str) -> bool:
     """Whether `path` hashes to `expected`. The build is unsigned, so this is
-    the only integrity check between downloading and executing an .exe."""
+    the only integrity check between downloading and executing an .exe.
+
+    Raises OSError if `path` cannot be read; a caller that cannot hash a
+    file must treat it as unverified, not as a mismatch -- returning False
+    would make a transient lock indistinguishable from a real hash failure,
+    and the mismatch branch is expected to delete the file and log loudly.
+    """
     digest = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(_CHUNK), b""):
