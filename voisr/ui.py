@@ -13,6 +13,7 @@ import threading
 import time
 from pathlib import Path
 
+import voisr
 from voisr import launch_agent, permissions
 from voisr.app import config_path as default_config_path
 from voisr.app import load_config
@@ -23,7 +24,7 @@ from voisr.keys import DEFAULT_HOTKEY, hotkey_options, key_label, resolve_key
 from voisr.keytap import WindowsKeyListener, capture_next_vk
 from voisr.overlay import RecordingWidget, sanitize_pill_color, sanitize_pill_theme
 from voisr.pasteboard import PasteDeliveryError
-from voisr.paths import app_icon
+from voisr.paths import app_data_dir, app_icon
 from voisr.paths import web_dir as _web_dir
 from voisr.recording_queue import (
     RecordingQueue,
@@ -33,6 +34,7 @@ from voisr.recording_queue import (
 )
 from voisr.status_item import StatusItem
 from voisr.stream_recorder import StreamRecorder
+from voisr.updater import UpdateChecker
 from voisr.window_chrome import apply_chrome
 
 WEB_DIR = _web_dir()
@@ -345,6 +347,13 @@ class Api:
 
     SPACE_JOIN_WINDOW_S = 300  # only join dictations this close together
     APPEARANCES = ("system", "light", "dark")
+    # How long read_config_cached() may serve a parsed config without going
+    # back to disk. Short enough that a hand-edit of config.json lands almost
+    # at once, long enough that polling status() is free. See that method.
+    CONFIG_CACHE_TTL_S = 5.0
+    # Grace period between answering install_update() and tearing the app
+    # down, so the awaiting JS caller gets its response first.
+    SHUTDOWN_DELAY_S = 0.75
 
     def __init__(self, config_path=None,
                  history=None, recorder_factory=StreamRecorder,
@@ -354,7 +363,8 @@ class Api:
                  capture_fn=capture_next_key,
                  paste_fn=paste_at_cursor,
                  clipboard_fn=set_clipboard,
-                 save_dialog_fn=None):
+                 save_dialog_fn=None,
+                 timer_factory=threading.Timer):
         self._config_path = Path(config_path) if config_path else default_config_path()
         self._history = history or HistoryStore(self._config_path.parent / "history.jsonl")
         self._transcribe_fn = transcribe_fn
@@ -364,6 +374,14 @@ class Api:
         self._paste_fn = paste_fn
         self._clipboard_fn = clipboard_fn
         self._save_dialog_fn = save_dialog_fn or _run_save_dialog
+        self._timer_factory = timer_factory
+        # Both None until the matching attach_*(): a headless or test Api has
+        # no updater and no window, and every method below tolerates that.
+        self._updates = None
+        self._quit_fn = None
+        # (timestamp, config) for read_config_cached; see it for the rules.
+        self._config_cache = None
+        self._config_cache_lock = threading.Lock()
         self._last_paste_text = None
         self._last_paste_ts = None
         self._typing_generation = 0
@@ -481,6 +499,7 @@ class Api:
             cfg["hotkey_vk"] = vk
             cfg["hotkey_label"] = label
             self._config_path.write_text(json.dumps(cfg, indent=2))
+            self._invalidate_config_cache()  # this path bypasses set_config
             return {"vk": vk, "label": label}
         finally:
             if svc is not None:
@@ -628,11 +647,47 @@ class Api:
     def get_config(self):
         return load_config(self._config_path)
 
+    def read_config_cached(self):
+        """get_config() with a short TTL, for callers that ask repeatedly.
+
+        This is what the update checker is given. UpdateChecker.status()
+        calls its config reader, the dashboard polls status(), and
+        load_config() re-reads and re-parses config.json every time -- so an
+        uncached reader means a file read per poll, forever.
+
+        A TTL rather than an unbounded cache because config.json is
+        documented in the README and can be hand-edited while the app runs;
+        set_config() invalidates outright so the Settings toggle is never
+        subject to the delay. The disk read deliberately happens outside the
+        lock: two callers racing may both read, which costs one redundant
+        parse and no correctness.
+
+        Hands back a shallow copy so a caller assigning a key cannot rewrite
+        what the next caller sees -- get_config()'s result is treated as
+        owned by its caller elsewhere in this class (see capture_hotkey).
+        """
+        now = self._clock()
+        with self._config_cache_lock:
+            cached = self._config_cache
+        if cached is not None and 0 <= now - cached[0] < self.CONFIG_CACHE_TTL_S:
+            return dict(cached[1])
+        cfg = self.get_config()
+        with self._config_cache_lock:
+            self._config_cache = (now, cfg)
+        return dict(cfg)
+
+    def _invalidate_config_cache(self):
+        with self._config_cache_lock:
+            self._config_cache = None
+
     def set_config(self, updates):
         old_hotkey = self.get_config().get("hotkey")
         cfg = self.get_config()
         cfg.update(updates)
         self._config_path.write_text(json.dumps(cfg, indent=2))
+        # Before anything else can read it back: a stale "check_for_updates"
+        # would make the Settings toggle look like it did nothing.
+        self._invalidate_config_cache()
         new_hotkey = cfg.get("hotkey")
         if self._hotkey_service and new_hotkey != old_hotkey:
             self._hotkey_service.restart(new_hotkey)
@@ -719,6 +774,84 @@ class Api:
         self.set_config({"launch_at_login": bool(enabled)})
         return {"ok": True, "enabled": bool(enabled)}
 
+    # -- updates ---------------------------------------------------------
+    def attach_update_checker(self, checker):
+        self._updates = checker
+
+    def attach_quit(self, quit_fn):
+        """The app's one shutdown route (main()'s tray Quit handler), so a
+        finished install can end the process the same way the user would."""
+        self._quit_fn = quit_fn
+
+    def get_update_status(self):
+        """Same keys as UpdateChecker.status() even with no checker attached:
+        the dashboard renders one shape and never has to guess which fields
+        exist."""
+        if not self._updates:
+            return {"state": "idle", "current_version": voisr.__version__,
+                    "version": None, "notes": None, "error": None,
+                    "enabled": False}
+        return self._updates.status()
+
+    def check_for_updates_now(self):
+        """Settings' "Check now". Forced, so it works with auto-check off,
+        and it reports failures inline because the user is waiting."""
+        if not self._updates:
+            return {"error": "Updates are unavailable in this build."}
+        return self._updates.check_now(force=True)
+
+    def install_update(self):
+        """Spawn the installer, then quit -- Inno cannot replace files under
+        {app} while we hold them open.
+
+        The exit is not optional bookkeeping: UpdateChecker's `installing`
+        state is terminal by design, so an app that stayed up would sit in it
+        with no way for the user to retry.
+        """
+        if not self._updates:
+            return {"error": "Updates are unavailable in this build."}
+        result = self._updates.install()
+        if "error" not in result:
+            self._shutdown_soon()
+        return result
+
+    def _shutdown_soon(self):
+        """Quit after a short delay, off this thread.
+
+        Deferred on purpose: install_update() is a bridge call the dashboard
+        is awaiting, and destroying the window from inside the handler can
+        leave that promise unresolved -- the UI would hang instead of showing
+        "Installing update". Running the quit from a timer thread is the same
+        thing the tray icon already does from pystray's thread.
+        """
+        quit_fn = self._quit_fn
+        if quit_fn is None:
+            print("voisr: update installing, but no quit hook is attached",
+                  flush=True)
+            return
+
+        def go():
+            try:
+                quit_fn()
+            except Exception as e:
+                # Nothing left to report this to, and the installer's
+                # CloseApplications is the backstop for a window that will
+                # not go quietly.
+                print(f"voisr: shutdown after install failed: {e}", flush=True)
+
+        timer = self._timer_factory(self.SHUTDOWN_DELAY_S, go)
+        timer.daemon = True
+        timer.start()
+
+    def set_check_for_updates(self, enabled):
+        """Persist the toggle only. UpdateChecker._enabled() consults the
+        config at the start of every check, so an off switch takes effect on
+        the next tick without stopping the schedule -- and re-arming the
+        schedule on each toggle would buy nothing but a second way to get the
+        timer wrong."""
+        self.set_config({"check_for_updates": bool(enabled)})
+        return {"ok": True, "enabled": bool(enabled)}
+
     def set_appearance(self, mode):
         if mode not in self.APPEARANCES:
             return {"error": f"unknown appearance: {mode}"}
@@ -785,6 +918,7 @@ def main():
 
     api = None
     service = None
+    updates = None
     try:
         set_app_user_model_id()
         api = Api()
@@ -846,6 +980,13 @@ def main():
             except Exception:
                 pass
 
+        # The one shutdown route: destroying the window ends the message
+        # loop, and the finally below stops the hotkey listener and releases
+        # the tray icon. Handed to Api so a finished install exits the same
+        # way -- a half-shutdown would keep handles open under {app} and the
+        # installer could not replace our files.
+        api.attach_quit(menu_quit)
+
         status = StatusItem(
             on_dictate=menu_dictate,
             on_open=menu_open,
@@ -868,14 +1009,29 @@ def main():
             except Exception:
                 pass  # chrome is cosmetic
 
+        # read_config_cached, not get_config: UpdateChecker.status() calls
+        # this on every dashboard poll, and get_config() re-reads and
+        # re-parses config.json each time.
+        updates = UpdateChecker(
+            current_version=voisr.__version__,
+            updates_dir=app_data_dir() / "updates",
+            config_reader=api.read_config_cached,
+        )
+        api.attach_update_checker(updates)
+        updates.start()
+
         webview.start(on_started, gui="edgechromium", icon=app_icon())
     finally:
         try:
-            if service is not None:
-                service.stop()
+            if updates is not None:
+                updates.stop()
         finally:
-            if api is not None:
-                api.close()
+            try:
+                if service is not None:
+                    service.stop()
+            finally:
+                if api is not None:
+                    api.close()
 
 
 if __name__ == "__main__":

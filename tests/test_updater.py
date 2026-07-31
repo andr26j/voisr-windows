@@ -5,7 +5,11 @@ import threading
 import pytest
 
 import voisr
+import voisr.ui as ui
 import voisr.updater as updater
+from voisr.app import DEFAULT_CONFIG, load_config
+from voisr.history import HistoryStore
+from voisr.ui import Api
 from voisr.updater import (
     MANIFEST_URL,
     Manifest,
@@ -745,3 +749,226 @@ def test_an_offline_check_keeps_a_download_that_is_already_on_disk(tmp_path):
     checker._fetch = lambda url, opener=None: None
     checker.check_now()
     assert stale.is_file()
+
+
+# --- the config default ---------------------------------------------------
+
+
+def test_update_checking_is_on_by_default():
+    assert DEFAULT_CONFIG["check_for_updates"] is True
+
+
+def test_an_existing_config_without_the_key_still_checks(tmp_path):
+    # Upgrading users have a config.json predating this feature.
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"hotkey": "ctrl_r"}), encoding="utf-8")
+    assert load_config(p)["check_for_updates"] is True
+
+
+def test_a_disabled_config_is_respected(tmp_path):
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"check_for_updates": False}), encoding="utf-8")
+    assert load_config(p)["check_for_updates"] is False
+
+
+# --- the dashboard bridge -------------------------------------------------
+
+
+class _FakeTimer:
+    """Captures the deferred shutdown instead of running it, so a test can
+    prove the bridge call returned before the app started going away."""
+
+    def __init__(self, delay, fn):
+        self.delay = delay
+        self.fn = fn
+        self.started = False
+        self.daemon = False
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        pass
+
+
+_OPEN_APIS = []
+
+
+@pytest.fixture(autouse=True)
+def _close_apis():
+    """Every Api starts a RecordingQueue worker thread; close them rather
+    than leaving one per test alive for the run."""
+    yield
+    while _OPEN_APIS:
+        _OPEN_APIS.pop().close()
+
+
+def _api(tmp_path, **overrides):
+    timers = overrides.pop("timers", None)
+    kwargs = dict(config_path=tmp_path / "config.json",
+                  history=HistoryStore(tmp_path / "h.jsonl"))
+    if timers is not None:
+        def factory(delay, fn):
+            timer = _FakeTimer(delay, fn)
+            timers.append(timer)
+            return timer
+        kwargs["timer_factory"] = factory
+    kwargs.update(overrides)
+    api = Api(**kwargs)
+    _OPEN_APIS.append(api)
+    return api
+
+
+def _ready_checker(tmp_path, spawned=None):
+    """A real UpdateChecker parked in `ready`, so the bridge tests exercise
+    the shapes install()/status() actually return."""
+    checker, _ = _checker(tmp_path / "updates", spawned=spawned)
+    assert checker.check_now()["state"] == "ready"
+    return checker
+
+
+def test_the_bridge_reports_a_full_status_with_no_checker_attached(tmp_path):
+    # Same keys as UpdateChecker.status(): the dashboard renders one shape.
+    status = _api(tmp_path).get_update_status()
+    assert set(status) == {"state", "current_version", "version", "notes",
+                           "error", "enabled"}
+    assert status["state"] == "idle"
+    assert status["enabled"] is False
+    assert status["current_version"] == voisr.__version__
+
+
+def test_the_bridge_forwards_the_checkers_status(tmp_path):
+    api = _api(tmp_path)
+    api.attach_update_checker(_ready_checker(tmp_path))
+    status = api.get_update_status()
+    assert status["state"] == "ready"
+    assert status["version"] == "1.1.0"
+    assert status["notes"] == "Adds auto-update."
+
+
+def test_check_now_and_install_report_unavailable_with_no_checker(tmp_path):
+    api = _api(tmp_path)
+    assert "error" in api.check_for_updates_now()
+    assert "error" in api.install_update()
+
+
+def test_check_now_is_forced_so_it_works_with_auto_check_off(tmp_path):
+    # The user is standing at the Settings button; the toggle must not
+    # silently turn it into a no-op.
+    checker, calls = _checker(tmp_path / "updates", enabled=False)
+    api = _api(tmp_path)
+    api.attach_update_checker(checker)
+    assert api.check_for_updates_now()["state"] == "ready"
+    assert calls["fetch"] == 1
+
+
+def test_disabling_through_the_bridge_stops_the_next_scheduled_check(tmp_path):
+    # End to end over the reader main() actually injects: the toggle must
+    # reach a check that runs straight afterwards, not a cached True.
+    api = _api(tmp_path)
+    checker, calls = _checker(tmp_path / "updates")
+    checker._config_reader = api.read_config_cached
+    api.attach_update_checker(checker)
+    assert api.read_config_cached()["check_for_updates"] is True
+
+    api.set_check_for_updates(False)
+
+    assert checker.check_now()["state"] == "idle"  # what the 24h tick does
+    assert calls["fetch"] == 0
+    # ...while the Settings button still works, because it forces.
+    assert api.check_for_updates_now()["state"] == "ready"
+
+
+def test_a_successful_install_returns_before_the_app_shuts_down(tmp_path):
+    # UpdateChecker's `installing` state is terminal, so the app must go
+    # away -- but not before the awaiting JS caller has its answer.
+    timers, quits = [], []
+    api = _api(tmp_path, timers=timers)
+    api.attach_quit(lambda: quits.append(True))
+    api.attach_update_checker(_ready_checker(tmp_path))
+
+    result = api.install_update()
+
+    assert result == {"ok": True, "version": "1.1.0"}
+    assert quits == []  # deferred, not run inside the bridge call
+    assert len(timers) == 1 and timers[0].started and timers[0].delay > 0
+    timers[0].fn()
+    assert quits == [True]
+
+
+def test_a_failed_install_leaves_the_app_running(tmp_path):
+    timers, quits = [], []
+    api = _api(tmp_path, timers=timers)
+    api.attach_quit(lambda: quits.append(True))
+    checker = _ready_checker(tmp_path)
+
+    def boom(argv):
+        raise OSError("installer blocked")
+
+    checker._spawn = boom
+    api.attach_update_checker(checker)
+
+    assert "error" in api.install_update()
+    assert timers == [] and quits == []
+
+
+def test_an_install_with_no_quit_hook_still_reports_success(tmp_path):
+    # A headless Api (tests, a future CLI) has no window to tear down.
+    timers = []
+    api = _api(tmp_path, timers=timers)
+    api.attach_update_checker(_ready_checker(tmp_path))
+    assert api.install_update()["ok"] is True
+    assert timers == []
+
+
+def test_a_quit_hook_that_throws_does_not_escape_the_timer(tmp_path):
+    timers = []
+    api = _api(tmp_path, timers=timers)
+
+    def boom():
+        raise RuntimeError("window already gone")
+
+    api.attach_quit(boom)
+    api.attach_update_checker(_ready_checker(tmp_path))
+    api.install_update()
+    timers[0].fn()  # must not raise
+
+
+# --- the config reader handed to the checker ------------------------------
+
+
+def test_the_update_config_reader_does_not_read_the_disk_every_call(
+        tmp_path, monkeypatch):
+    # UpdateChecker.status() calls this, and the dashboard polls status().
+    api = _api(tmp_path)
+    reads = []
+    real = ui.load_config
+    monkeypatch.setattr(ui, "load_config",
+                        lambda p: (reads.append(p), real(p))[1])
+    for _ in range(5):
+        api.read_config_cached()
+    assert len(reads) == 1
+
+
+def test_turning_the_toggle_off_invalidates_the_cache_at_once(tmp_path):
+    # The failure this guards: the Settings toggle appearing to do nothing
+    # until the cache expires (or, with an unbounded cache, until restart).
+    api = _api(tmp_path)
+    assert api.read_config_cached()["check_for_updates"] is True
+    assert api.set_check_for_updates(False) == {"ok": True, "enabled": False}
+    assert api.read_config_cached()["check_for_updates"] is False
+    assert api.get_config()["check_for_updates"] is False
+
+
+def test_a_hand_edit_of_config_json_is_picked_up_once_the_cache_expires(
+        tmp_path):
+    # config.json is documented in the README, so an indefinite cache would
+    # make a hand-edit invisible for the life of the process.
+    now = [1000.0]
+    api = _api(tmp_path, clock=lambda: now[0])
+    assert api.read_config_cached()["check_for_updates"] is True
+    (tmp_path / "config.json").write_text(
+        json.dumps({"check_for_updates": False}), encoding="utf-8")
+    assert api.read_config_cached()["check_for_updates"] is True
+    now[0] += Api.CONFIG_CACHE_TTL_S + 0.1
+    assert api.read_config_cached()["check_for_updates"] is False
