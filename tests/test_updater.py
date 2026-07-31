@@ -9,6 +9,7 @@ from voisr.updater import (
     MANIFEST_URL,
     Manifest,
     RELEASE_URL_PREFIX,
+    UpdateChecker,
     download_to,
     fetch_manifest,
     is_newer,
@@ -380,3 +381,164 @@ def test_default_opener_reports_a_content_length_mismatch_as_incomplete(monkeypa
         download_to("https://example.test/x.exe", dest)
     assert not dest.exists()
     assert list(tmp_path.iterdir()) == []
+
+
+def _checker(tmp_path, *, manifest=None, enabled=True, payload=b"installer",
+             sha=None, spawned=None, current="1.0.0"):
+    """An UpdateChecker with every collaborator faked: no network, no spawn."""
+    if manifest is None:
+        manifest = Manifest.from_json(json.dumps(_manifest_dict(
+            sha256=hashlib.sha256(payload).hexdigest())))
+    if sha is not None:
+        manifest = Manifest(manifest.version, manifest.url, sha, manifest.notes)
+    calls = {"fetch": 0, "download": 0}
+
+    def fake_fetch(url, opener=None):
+        calls["fetch"] += 1
+        return manifest
+
+    def fake_download(url, dest, opener=None):
+        calls["download"] += 1
+        return download_to(url, dest, opener=lambda _u: payload)
+
+    checker = UpdateChecker(
+        current_version=current,
+        updates_dir=tmp_path,
+        config_reader=lambda: {"check_for_updates": enabled},
+        fetch=fake_fetch,
+        download=fake_download,
+        spawn=(spawned.append if spawned is not None else (lambda argv: None)),
+    )
+    return checker, calls
+
+
+def test_a_newer_release_ends_in_ready_with_the_installer_on_disk(tmp_path):
+    checker, calls = _checker(tmp_path)
+    result = checker.check_now()
+    assert result["state"] == "ready"
+    assert result["version"] == "1.1.0"
+    assert checker.status()["notes"] == "Adds auto-update."
+    assert (tmp_path / "VoisrSetup-1.1.0.exe").is_file()
+    assert calls["download"] == 1
+
+
+def test_the_same_version_is_not_an_update(tmp_path):
+    checker, calls = _checker(tmp_path, current="1.1.0")
+    result = checker.check_now()
+    assert result["state"] == "idle"
+    assert result["up_to_date"] is True
+    assert calls["download"] == 0
+
+
+def test_no_releases_yet_is_not_an_error(tmp_path):
+    checker, _ = _checker(tmp_path)
+    checker._fetch = lambda url, opener=None: None
+    result = checker.check_now()
+    assert result["state"] == "idle"
+    assert result["up_to_date"] is True
+
+
+def test_a_hash_mismatch_deletes_the_download_and_never_offers_it(tmp_path):
+    checker, _ = _checker(tmp_path, sha="b" * 64)
+    result = checker.check_now()
+    assert result["state"] == "idle"
+    assert "checksum" in result["error"].lower()
+    assert list(tmp_path.iterdir()) == []
+    assert checker.status()["state"] == "idle"
+
+
+def test_the_toggle_being_off_means_no_network_call_at_all(tmp_path):
+    checker, calls = _checker(tmp_path, enabled=False)
+    result = checker.check_now()
+    assert result["state"] == "idle"
+    assert calls["fetch"] == 0
+
+
+def test_check_now_forced_ignores_the_toggle(tmp_path):
+    # The Settings "Check now" button must work even with auto-check off.
+    checker, calls = _checker(tmp_path, enabled=False)
+    result = checker.check_now(force=True)
+    assert result["state"] == "ready"
+    assert calls["fetch"] == 1
+
+
+def test_an_already_downloaded_installer_is_not_fetched_twice(tmp_path):
+    checker, calls = _checker(tmp_path)
+    checker.check_now()
+    checker.check_now()
+    assert calls["download"] == 1
+
+
+def test_stale_installers_for_other_versions_are_pruned(tmp_path):
+    (tmp_path / "VoisrSetup-0.9.0.exe").write_bytes(b"old")
+    checker, _ = _checker(tmp_path)
+    checker.check_now()
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names == ["VoisrSetup-1.1.0.exe"]
+
+
+def test_install_spawns_the_installer_silently_and_relaunches(tmp_path):
+    spawned = []
+    checker, _ = _checker(tmp_path, spawned=spawned)
+    checker.check_now()
+    result = checker.install()
+    assert result["ok"] is True
+    assert checker.status()["state"] == "installing"
+    assert len(spawned) == 1
+    argv = spawned[0]
+    assert argv[0].endswith("VoisrSetup-1.1.0.exe")
+    # /RELAUNCH=1 is required: the installer's [Run] entry is skipifsilent,
+    # so without it a silent update would leave Voisr closed.
+    assert argv[1:] == ["/SILENT", "/NORESTART", "/RELAUNCH=1"]
+
+
+def test_install_before_an_update_is_ready_is_refused(tmp_path):
+    spawned = []
+    checker, _ = _checker(tmp_path, spawned=spawned)
+    result = checker.install()
+    assert "error" in result
+    assert spawned == []
+
+
+def test_a_failed_spawn_is_reported_and_leaves_the_app_running(tmp_path):
+    def boom(argv):
+        raise OSError("access denied")
+
+    checker, _ = _checker(tmp_path)
+    checker._spawn = boom
+    checker.check_now()
+    result = checker.install()
+    assert "error" in result
+    assert checker.status()["state"] == "ready"
+
+
+def test_stop_is_not_undone_by_a_check_that_was_already_running(tmp_path,
+                                                               monkeypatch):
+    # _tick re-arms after every check, so a stop() landing while a check is
+    # in flight would otherwise resurrect the schedule -- a leaked timer
+    # thread every time Settings toggles auto-check off and on again.
+    # The Timer is faked so nothing here waits out STARTUP_DELAY_S.
+    armed = []
+
+    class FakeTimer:
+        def __init__(self, delay, fn):
+            self.delay, self.fn, self.cancelled = delay, fn, False
+            armed.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    monkeypatch.setattr(updater.threading, "Timer", FakeTimer)
+
+    checker, _ = _checker(tmp_path)
+    checker.start()
+    assert [t.delay for t in armed] == [UpdateChecker.STARTUP_DELAY_S]
+
+    checker.stop()
+    assert armed[0].cancelled
+
+    checker._tick()  # the in-flight check finishing after stop()
+    assert len(armed) == 1

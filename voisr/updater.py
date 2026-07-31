@@ -7,6 +7,8 @@ network access and without ever executing an installer.
 
 import hashlib
 import json
+import subprocess
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -231,13 +233,18 @@ def _chunks(payload):
 
 
 def _replace_with_retry(part: Path, dest: Path) -> None:
-    """Same transient-lock retry budget as history.py's read path (20
-    attempts, 10ms apart) -- Defender or the search indexer opening the
-    freshly written file before the rename can complete. A 155 MB .exe
-    landing in %LOCALAPPDATA% is a likelier on-write-scan target than a
-    small JSONL, and there is no resume here: silently losing this race
-    would mean re-fetching 155 MB on every future 24h check cycle, forever,
-    while the completed download sits unused in a .part file.
+    """Retry past a transient lock -- Defender or the search indexer opening
+    the freshly written file before the rename can complete.
+
+    Same 20 attempts as history.py's read path, but escalating rather than a
+    flat 10ms, which totals ~1.1s of waiting instead of 200ms. That budget is
+    deliberately far wider than history.py's: measured against deny-all Win32
+    handles, a flat 200ms succeeds at 100ms and 190ms of contention and fails
+    from 250ms on, and a 155 MB .exe being scanned on write is not reliably a
+    sub-200ms event the way a small JSONL is. Waiting costs nothing here (a
+    background thread that just spent minutes downloading), while losing the
+    race costs a permanently non-updating install that re-fetches 155 MB every
+    24h forever, with the completed download sitting unused in a .part file.
     """
     for attempt in range(20):
         try:
@@ -246,11 +253,11 @@ def _replace_with_retry(part: Path, dest: Path) -> None:
         except PermissionError:
             if attempt == 19:
                 raise
-            time.sleep(0.01)
+            time.sleep(min(0.01 * 2 ** (attempt // 4), 0.5))
 
 
 def download_to(url: str, dest: Path | str, opener=None,
-                 max_bytes: int = _MAX_INSTALLER_BYTES) -> Path:
+                max_bytes: int = _MAX_INSTALLER_BYTES) -> Path:
     """Download to `dest`, writing a .part file first.
 
     The rename is the commit point: `dest` either does not exist or holds
@@ -304,3 +311,224 @@ def verify_sha256(path: Path | str, expected: str) -> bool:
         for chunk in iter(lambda: f.read(_CHUNK), b""):
             digest.update(chunk)
     return digest.hexdigest() == str(expected).strip().lower()
+
+
+def _default_spawn(argv) -> None:
+    """Start the installer detached, so it outlives the app that spawns it."""
+    subprocess.Popen(
+        argv,
+        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+        close_fds=True,
+    )
+
+
+class UpdateChecker:
+    """Owns the update schedule and state. The UI reads `status()` and calls
+    `check_now()` / `install()`; it never sequences the steps itself.
+
+    States: idle -> checking -> downloading -> ready -> installing. Any
+    failure returns to idle with `error` set.
+    """
+
+    INTERVAL_S = 24 * 60 * 60
+    STARTUP_DELAY_S = 10
+
+    def __init__(self, current_version, updates_dir, config_reader,
+                 fetch=fetch_manifest, download=download_to,
+                 verify=verify_sha256, spawn=None, manifest_url=MANIFEST_URL):
+        self._current = current_version
+        self._dir = Path(updates_dir)
+        self._config_reader = config_reader
+        self._fetch = fetch
+        self._download = download
+        self._verify = verify
+        self._spawn = spawn or _default_spawn
+        self._manifest_url = manifest_url
+        # Two locks with different jobs. _lock is only ever held for field
+        # access, never across I/O, so status() is always instant. _check_lock
+        # serialises whole check sequences and is therefore held for as long
+        # as a download takes -- which is exactly why it cannot be _lock.
+        self._lock = threading.Lock()
+        self._check_lock = threading.Lock()
+        self._timer = None
+        self._stopped = False
+        self._state = "idle"
+        self._manifest = None
+        self._installer = None
+        self._error = None
+
+    # -- state ----------------------------------------------------------
+    def status(self) -> dict:
+        """A snapshot the UI can render. `version`/`notes` describe the latest
+        release this checker has seen, whatever state it is in -- only `state`
+        says whether an update is actually installable."""
+        # _enabled() reads the config from disk; never hold the lock across
+        # I/O. threading.Lock is not reentrant, so anything that reached back
+        # into this checker from the config reader would deadlock, and the
+        # dashboard polls status(), which would queue behind every file read.
+        enabled = self._enabled()
+        with self._lock:
+            state, manifest, error = self._state, self._manifest, self._error
+        # self._current never changes, and Manifest is frozen, so reading
+        # their fields outside the lock cannot tear.
+        return {
+            "state": state,
+            "current_version": self._current,
+            "version": manifest.version if manifest else None,
+            "notes": manifest.notes if manifest else None,
+            "error": error,
+            "enabled": enabled,
+        }
+
+    def _enabled(self) -> bool:
+        try:
+            return bool(self._config_reader().get("check_for_updates", True))
+        except Exception:
+            return True
+
+    def _set(self, state, *, error=None) -> None:
+        with self._lock:
+            self._state = state
+            self._error = error
+
+    # -- scheduling -----------------------------------------------------
+    def start(self) -> None:
+        """First check after STARTUP_DELAY_S, then every INTERVAL_S of uptime.
+        An interval timer, not a wall clock, so there is no missed-check
+        catch-up to reason about -- a nightly shutdown gets the launch check."""
+        with self._lock:
+            self._stopped = False
+        self._arm(self.STARTUP_DELAY_S)
+
+    def _arm(self, delay) -> None:
+        with self._lock:
+            if self._stopped:
+                # _tick re-arms unconditionally, so a stop() that lands while
+                # a check is in flight would otherwise bring the cancelled
+                # schedule back to life -- one leaked timer thread per off/on
+                # cycle of the setting. Checked under the same lock stop() sets
+                # the flag under, so a stop() racing an _arm either loses (and
+                # cancels the timer this just stored) or wins (and this bails).
+                return
+            # Constructing a Timer starts nothing; the thread begins at
+            # start(), which is deliberately outside the lock.
+            timer = threading.Timer(delay, self._tick)
+            timer.daemon = True
+            self._timer = timer
+        timer.start()
+
+    def _tick(self) -> None:
+        try:
+            self.check_now()
+        except Exception as e:  # a background check must never kill its thread
+            print(f"voisr: update check crashed: {e}", flush=True)
+        self._arm(self.INTERVAL_S)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopped = True
+            timer, self._timer = self._timer, None
+        if timer:
+            timer.cancel()
+
+    # -- the check ------------------------------------------------------
+    def check_now(self, force: bool = False) -> dict:
+        """Run a full check now. Returns the same shape as `status()`; the
+        no-update path adds `up_to_date: True`. `force` is the Settings
+        "Check now" button, which must work with auto-check switched off.
+        """
+        if not force and not self._enabled():
+            return self.status()
+
+        # Single-flight. The interval timer and the Settings button can both
+        # arrive here: two checks would stream into the same .part file, and
+        # the loser's rename would then fail and report a spurious error over
+        # the winner's freshly ready update. A caller that finds a check
+        # already running gets the current state and lets it finish rather
+        # than blocking a UI thread for the length of a download.
+        if not self._check_lock.acquire(blocking=False):
+            return self.status()
+        try:
+            return self._check()
+        except Exception as e:
+            # Belt-and-braces around the handling inside _check: anything
+            # unexpected escaping it (a broken injected collaborator, an
+            # unparseable current version) must still land in idle with an
+            # error, or the machine parks in "checking" until the next tick.
+            self._set("idle", error=f"Update check failed: {e}")
+            return self.status()
+        finally:
+            self._check_lock.release()
+
+    def _check(self) -> dict:
+        self._set("checking")
+        manifest = self._fetch(self._manifest_url)
+        # Keyword arguments on purpose: both sides are plain version strings,
+        # so swapping them would silently invert the test and produce an
+        # update that never fires.
+        if manifest is None or not is_newer(remote=manifest.version,
+                                           local=self._current):
+            self._set("idle")
+            return {**self.status(), "up_to_date": True}
+
+        self._set("downloading")
+        with self._lock:
+            self._manifest = manifest
+        dest = self._dir / f"VoisrSetup-{manifest.version}.exe"
+
+        # Both _verify calls must sit inside this try. verify_sha256 opens the
+        # file, so it raises OSError on a missing or locked one -- and an
+        # OSError escaping here would leave the state machine stuck at
+        # "downloading" with error=None until the next 24h tick, with the
+        # mismatch branch below never running. A file we cannot hash is
+        # unverified, which is not the same as a mismatch: only a real
+        # mismatch should delete the file and log loudly.
+        try:
+            if not dest.is_file() or not self._verify(dest, manifest.sha256):
+                dest.unlink(missing_ok=True)
+                self._download(manifest.url, dest)
+                if not self._verify(dest, manifest.sha256):
+                    # Never execute an installer we cannot vouch for.
+                    dest.unlink(missing_ok=True)
+                    print("voisr: update checksum mismatch, discarded", flush=True)
+                    self._set("idle",
+                              error="Update checksum did not match; discarded.")
+                    return self.status()
+        except Exception as e:
+            self._set("idle", error=f"Could not fetch the update: {e}")
+            return self.status()
+
+        self._prune(keep=dest)
+        with self._lock:
+            self._installer = dest
+        self._set("ready")
+        return self.status()
+
+    def _prune(self, keep: Path) -> None:
+        """Drop every installer but `keep`, including leftover .part files
+        from a crashed download (hence the trailing wildcard). Safe to sweep
+        that broadly because check_now is single-flight: no other download can
+        be in progress, so the only .part files here are abandoned ones."""
+        for path in self._dir.glob("VoisrSetup-*.exe*"):
+            if path != keep:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass  # a locked leftover is not worth failing the update
+
+    # -- applying -------------------------------------------------------
+    def install(self) -> dict:
+        # One acquisition for all three: the state is what makes the installer
+        # path trustworthy, so they must be read together.
+        with self._lock:
+            installer, state = self._installer, self._state
+            version = self._manifest.version if self._manifest else None
+        if state != "ready" or installer is None:
+            return {"error": "No verified update is ready to install."}
+        try:
+            self._spawn([str(installer), "/SILENT", "/NORESTART", "/RELAUNCH=1"])
+        except Exception as e:
+            self._set("ready", error=f"Could not start the installer: {e}")
+            return {"error": str(e)}
+        self._set("installing")
+        return {"ok": True, "version": version}
