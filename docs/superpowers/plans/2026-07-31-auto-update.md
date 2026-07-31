@@ -1540,9 +1540,15 @@ Inside `home.js`'s `init()`, add:
 
 ```javascript
     document.getElementById("update-install").addEventListener("click", async () => {
-      const res = await V.ui.tryApi(V.api().install_update(), "Install update");
-      if (!res || res.error) return;
+      // Say "Installing" BEFORE the call, never after it. A successful
+      // install_update() kills the app ~0.75s later, and pywebview's
+      // evaluate_js blocks on a semaphore that destroy_window does not
+      // release -- so if Application.Exit() wins the race, this promise
+      // never settles and anything in a .then() never runs. Only the error
+      // path can rely on code after the await.
       V.ui.toast("Installing update — Voisr will restart");
+      const res = await V.ui.tryApi(V.api().install_update(), "Install update");
+      if (res && res.error) V.ui.toast(`Update failed: ${res.error}`);
     });
     document.getElementById("update-dismiss")
       .addEventListener("click", dismissUpdateBanner);
@@ -1662,6 +1668,22 @@ powershell -NoProfile -Command "(Invoke-WebRequest 'https://github.com/andr26j/v
 ```
 
 Expected: the JSON, with `version` `1.0.0`. A 404 here means the asset name is wrong or the release is a draft.
+
+- [ ] **Step 2b: Confirm tray Quit actually exits the process**
+
+Do this before anything else, because the whole update flow depends on it and it is **pre-existing behaviour nobody has verified**.
+
+A code review of `voisr/ui.py` could not confirm from source that `menu_quit` fully exits. `main()` calls `widget.create()` *before* `webview.create_window(dashboard)`, so the pill window holds pywebview's `uid == 'master'`, and winforms' `on_close` calls `Application.Exit()` only when `len(BrowserView.instances) == 0`. The pill is never destroyed anywhere in `voisr/`. If that reading is right, `webview.start()` never returns and the process survives.
+
+Launch Voisr, then choose **Quit Voisr** from the tray menu.
+
+```bash
+powershell -NoProfile -Command "Start-Sleep -Seconds 5; Get-Process Voisr -ErrorAction SilentlyContinue | Select-Object Id, MainWindowTitle"
+```
+
+Expected: no output — the process is gone.
+
+If a process remains, tray Quit is broken independently of auto-update, and the post-install shutdown is relying on its hard-exit backstop every time rather than as a fallback. Fix `menu_quit` to destroy the pill window as well, and re-run.
 
 - [ ] **Step 3: Install 1.0.0 and confirm no update is offered**
 
