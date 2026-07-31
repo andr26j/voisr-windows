@@ -618,6 +618,62 @@ def test_a_check_cannot_restart_the_machine_during_an_install(tmp_path):
     assert len(spawned) == 1
 
 
+def test_an_install_landing_mid_check_is_not_overwritten_by_that_check(tmp_path):
+    # check_now's installing guard is only a fast path -- it releases _lock
+    # before _check runs. An install() landing in that gap sets "installing"
+    # just for _check's own transition to overwrite it, and a state back at
+    # "ready" lets install() spawn a second copy of the same installer.
+    # Gated on Events in exactly that window, so the race is reproduced
+    # deterministically rather than waited for.
+    in_gap, resume = threading.Event(), threading.Event()
+    spawned = []
+    checker, _ = _checker(tmp_path, spawned=spawned)
+    checker.check_now()  # reach ready, with an installer on disk
+    real_check = checker._check
+
+    def gated_check():
+        in_gap.set()
+        resume.wait(10)
+        return real_check()
+
+    checker._check = gated_check
+    worker = threading.Thread(target=checker.check_now, kwargs={"force": True})
+    worker.start()
+    try:
+        assert in_gap.wait(10)
+        assert checker.install()["ok"] is True
+        assert checker.status()["state"] == "installing"
+    finally:
+        resume.set()
+        worker.join(10)
+    assert not worker.is_alive()
+
+    # The check must have bailed on finding the install, not reset the machine.
+    assert checker.status()["state"] == "installing"
+    assert "error" in checker.install()
+    assert len(spawned) == 1
+
+
+def test_an_installer_that_has_vanished_drops_back_to_idle(tmp_path):
+    # Another instance sharing the updates dir can prune a completed
+    # installer this one is still offering. That is definitively gone, not
+    # transiently unusable: holding "ready" would leave the user clicking
+    # Install on a dangling path until the next 24h tick.
+    checker, _ = _checker(tmp_path)
+    checker.check_now()
+
+    def vanished(argv):
+        raise FileNotFoundError(2, "The system cannot find the file specified")
+
+    checker._spawn = vanished
+    assert "error" in checker.install()
+
+    status = checker.status()
+    assert status["state"] == "idle"
+    assert "no longer available" in status["error"]
+    assert "error" in checker.install()  # and it stays refused
+
+
 def test_an_unexpected_failure_mid_check_still_lands_in_idle(tmp_path):
     # _check guards the download itself; this pins the outer net. Without it a
     # collaborator raising before that point parks the machine in "checking"

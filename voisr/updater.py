@@ -347,6 +347,12 @@ class UpdateChecker:
     stop() cancels the schedule, not a check already running: one that was
     in flight still finishes and can land in `ready`, so the UI may raise an
     update banner moments after the user switched auto-update off.
+
+    `installing` is terminal on purpose and nothing here leaves it. What ends
+    the process is the installer: voisr.iss must set CloseApplications=yes
+    (task 8) so Inno shuts Voisr down to unlock {app}, with /RELAUNCH=1
+    bringing it back. Not the UI layer, and deliberately not a watchdog here
+    -- but if that directive is dropped, this state becomes a dead end.
     """
 
     INTERVAL_S = 24 * 60 * 60
@@ -500,7 +506,22 @@ class UpdateChecker:
             self._check_lock.release()
 
     def _check(self) -> dict:
-        self._set("checking")
+        # Check and claim in one acquisition, exactly as install() does.
+        # check_now's guard is only a fast path: it releases _lock before this
+        # runs, so an install() landing in that gap would set "installing"
+        # just for this transition to overwrite it -- and a state back at
+        # "ready" re-opens the very second spawn install()'s own claim closes.
+        # With both transitions compare-and-set on the same lock, neither can
+        # start on top of the other.
+        with self._lock:
+            claimed = self._state != "installing"
+            if claimed:
+                self._state, self._error = "checking", None
+        if not claimed:
+            # Outside the with block: status() takes this same non-reentrant
+            # lock and would deadlock inside it.
+            return self.status()
+
         manifest = self._fetch(self._manifest_url)
         # Keyword arguments on purpose: both sides are plain version strings,
         # so swapping them would silently invert the test and produce an
@@ -569,6 +590,12 @@ class UpdateChecker:
         writing raises PermissionError, which the handler below swallows. Anyone
         adding a retry around that unlink, or widening the glob, removes the
         only thing standing between this and deleting a download in flight.
+
+        That protection covers .part files only. A *completed* installer is
+        held open by nobody, so this will happily delete one that another
+        instance is currently offering as `ready` -- that instance's install()
+        then fails with FileNotFoundError, which it handles by dropping back to
+        idle and re-downloading. Wasted bytes, never a corrupt install.
         """
         for path in self._dir.glob("VoisrSetup-*.exe*"):
             if path != keep:
@@ -597,7 +624,17 @@ class UpdateChecker:
             with self._lock:
                 # Only hand the state back if it is still ours to hand back.
                 if self._state == "installing":
-                    self._state = "ready"
-                    self._error = f"Could not start the installer: {e}"
+                    if isinstance(e, FileNotFoundError):
+                        # Definitively gone rather than transiently unusable:
+                        # another instance sharing the updates dir pruned it.
+                        # Handing back "ready" would leave the user clicking
+                        # Install on a dangling path until the next 24h tick,
+                        # so drop to idle and let the next check re-download.
+                        self._state, self._installer = "idle", None
+                        self._error = ("The downloaded update is no longer "
+                                       "available; it will be fetched again.")
+                    else:
+                        self._state = "ready"
+                        self._error = f"Could not start the installer: {e}"
             return {"error": str(e)}
         return {"ok": True, "version": version}
