@@ -960,6 +960,56 @@ def test_turning_the_toggle_off_invalidates_the_cache_at_once(tmp_path):
     assert api.get_config()["check_for_updates"] is False
 
 
+def test_a_read_racing_an_invalidation_does_not_resurrect_stale_config(
+        tmp_path, monkeypatch):
+    # The disk read sits outside the lock, so a reader can parse the config,
+    # have set_config invalidate underneath it, and then store its own
+    # pre-toggle view back -- serving the stale value for the whole TTL.
+    # That is the exact failure the invalidation exists to prevent, merely
+    # narrowed from "until restart" to "up to 5s".
+    api = _api(tmp_path)
+    reading, release = threading.Event(), threading.Event()
+    real = ui.load_config
+    first = [True]
+
+    def gated_load(p):
+        cfg = real(p)               # the parse completes...
+        if first[0]:
+            first[0] = False
+            reading.set()
+            assert release.wait(5)  # ...then stalls before the store-back
+        return cfg
+
+    monkeypatch.setattr(ui, "load_config", gated_load)
+    seen = {}
+    reader = threading.Thread(target=lambda: seen.update(
+        value=api.read_config_cached()["check_for_updates"]))
+    reader.start()
+    try:
+        assert reading.wait(5)
+        monkeypatch.setattr(ui, "load_config", real)  # don't gate the toggle
+        api.set_check_for_updates(False)
+    finally:
+        release.set()
+        reader.join(5)
+
+    assert not reader.is_alive()
+    # That reader read before the write, so True was a fair answer for it.
+    assert seen["value"] is True
+    # What must not happen is the next caller inheriting it.
+    assert api.read_config_cached()["check_for_updates"] is False
+
+
+def test_capturing_a_hotkey_invalidates_the_cache_too(tmp_path):
+    # capture_hotkey writes config.json directly instead of going through
+    # set_config, so it carries its own invalidation. Without it the cached
+    # reader serves a config with no hotkey_vk for the rest of the TTL.
+    api = _api(tmp_path, capture_fn=lambda timeout: (162, "Left Ctrl"))
+    assert api.read_config_cached().get("hotkey_vk") is None
+    assert api.capture_hotkey() == {"vk": 162, "label": "Left Ctrl"}
+    assert api.read_config_cached()["hotkey_vk"] == 162
+
+
 def test_a_hand_edit_of_config_json_is_picked_up_once_the_cache_expires(
         tmp_path):
     # config.json is documented in the README, so an indefinite cache would

@@ -380,7 +380,10 @@ class Api:
         self._updates = None
         self._quit_fn = None
         # (timestamp, config) for read_config_cached; see it for the rules.
+        # The generation counter is bumped by every invalidation so an
+        # in-flight read can tell that its result is already out of date.
         self._config_cache = None
+        self._config_cache_generation = 0
         self._config_cache_lock = threading.Lock()
         self._last_paste_text = None
         self._last_paste_ts = None
@@ -658,9 +661,19 @@ class Api:
         A TTL rather than an unbounded cache because config.json is
         documented in the README and can be hand-edited while the app runs;
         set_config() invalidates outright so the Settings toggle is never
-        subject to the delay. The disk read deliberately happens outside the
-        lock: two callers racing may both read, which costs one redundant
-        parse and no correctness.
+        subject to the delay.
+
+        The disk read deliberately happens outside the lock, which leaves two
+        races, only one of them harmless. Two *readers* racing may both read:
+        one redundant parse, no correctness cost. A reader racing an
+        *invalidation* is the dangerous one -- it parsed before the write
+        landed, so storing its result would put the pre-toggle config back
+        into a cache that was just cleared and serve it for the full TTL,
+        which is precisely what the invalidation exists to prevent. The
+        generation counter closes that: it is read before the parse and
+        re-checked under the lock, and a store-back whose generation moved is
+        dropped. The racing reader still returns its own view, which is a
+        fair answer to a call that began before the write.
 
         Hands back a shallow copy so a caller assigning a key cannot rewrite
         what the next caller sees -- get_config()'s result is treated as
@@ -669,16 +682,19 @@ class Api:
         now = self._clock()
         with self._config_cache_lock:
             cached = self._config_cache
+            generation = self._config_cache_generation
         if cached is not None and 0 <= now - cached[0] < self.CONFIG_CACHE_TTL_S:
             return dict(cached[1])
         cfg = self.get_config()
         with self._config_cache_lock:
-            self._config_cache = (now, cfg)
+            if generation == self._config_cache_generation:
+                self._config_cache = (now, cfg)
         return dict(cfg)
 
     def _invalidate_config_cache(self):
         with self._config_cache_lock:
             self._config_cache = None
+            self._config_cache_generation += 1
 
     def set_config(self, updates):
         old_hotkey = self.get_config().get("hotkey")
