@@ -3,7 +3,13 @@ import json
 import pytest
 
 import voisr
-from voisr.updater import Manifest, RELEASE_URL_PREFIX, is_newer, parse_version
+from voisr.updater import (
+    Manifest,
+    RELEASE_URL_PREFIX,
+    fetch_manifest,
+    is_newer,
+    parse_version,
+)
 
 
 def test_package_exposes_a_parseable_version():
@@ -136,3 +142,36 @@ def test_manifest_rejects_a_deeply_nested_payload():
     # escape the "bad manifest raises ValueError" contract.
     with pytest.raises(ValueError):
         Manifest.from_json("[" * 200000)
+
+
+def test_fetch_manifest_returns_a_parsed_manifest():
+    captured = {}
+
+    def opener(url):
+        captured["url"] = url
+        return json.dumps(_manifest_dict())
+
+    m = fetch_manifest("https://example.test/latest.json", opener=opener)
+    assert m.version == "1.1.0"
+    assert captured["url"] == "https://example.test/latest.json"
+
+
+def test_fetch_manifest_returns_none_when_there_are_no_releases_yet():
+    # A 404 is the normal "nothing published" state, not an error.
+    def opener(url):
+        raise OSError("HTTP Error 404: Not Found")
+
+    assert fetch_manifest("https://example.test/latest.json", opener=opener) is None
+
+
+def test_fetch_manifest_returns_none_on_network_failure():
+    def opener(url):
+        raise TimeoutError("timed out")
+
+    assert fetch_manifest("https://example.test/latest.json", opener=opener) is None
+
+
+def test_fetch_manifest_returns_none_on_malformed_payload():
+    for payload in ["not json", "{}", json.dumps(_manifest_dict(url="https://evil.test/x.exe"))]:
+        assert fetch_manifest("https://example.test/latest.json",
+                              opener=lambda url, p=payload: p) is None

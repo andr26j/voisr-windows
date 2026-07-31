@@ -6,6 +6,7 @@ network access and without ever executing an installer.
 """
 
 import json
+import urllib.request
 from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
 
@@ -109,3 +110,41 @@ class Manifest:
 
         return cls(version=version, url=url, sha256=sha,
                    notes=str(data["notes"]))
+
+
+_TIMEOUT_S = 10
+
+
+def _default_text_opener(url: str) -> str:
+    with urllib.request.urlopen(url, timeout=_TIMEOUT_S) as response:
+        return response.read().decode("utf-8")
+
+
+def fetch_manifest(url: str = MANIFEST_URL, opener=None) -> "Manifest | None":
+    """The manifest, or None if there isn't a usable one.
+
+    None covers every failure a background check can hit -- no releases yet
+    (404), offline, timeout, malformed JSON, failed validation. None of those
+    is worth interrupting the user for, so they are logged and swallowed.
+    """
+    opener = opener or _default_text_opener
+    try:
+        raw = opener(url)
+    except Exception as e:
+        # Deliberately broad: a background check must never kill its thread.
+        # Narrower (e.g. OSError-only) would miss http.client.HTTPException
+        # subclasses like InvalidURL/BadStatusLine, which urlopen can raise
+        # for a malformed response and which are not OSError subclasses.
+        # KeyboardInterrupt/SystemExit are BaseException, not Exception, so
+        # they still propagate -- this only swallows failures, not shutdown.
+        print(f"voisr: update check failed: {e}", flush=True)
+        return None
+    try:
+        return Manifest.from_json(raw)
+    except ValueError as e:
+        # json.JSONDecodeError is already a ValueError subclass, and
+        # from_json converts every other failure path (oversized payload,
+        # missing fields, bad url, RecursionError) into ValueError too --
+        # so ValueError is the only thing a malformed manifest can raise.
+        print(f"voisr: ignoring malformed update manifest: {e}", flush=True)
+        return None
