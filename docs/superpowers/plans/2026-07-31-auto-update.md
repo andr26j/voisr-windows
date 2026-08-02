@@ -1081,6 +1081,11 @@ git commit -m "feat: expose update state and controls over the dashboard bridge"
 **Files:**
 - Modify: `build/voisr.iss`
 
+**Before starting, note two findings from the Task 7 review that land here:**
+
+- **`CloseApplications=yes` is load-bearing, not defence-in-depth.** `UpdateChecker`'s `installing` state is terminal, and `menu_quit` does not currently exit the process (tracked separately), so this directive plus the app's own `os._exit(0)` backstop are the only things that free `{app}` for the installer. Do not drop it as redundant.
+- **`private_mode` defaults to `True`, so every quit wipes the WebView2 profile.** `main()` never passes `private_mode=False` to `create_window`. Once `menu_quit` is fixed to destroy the pill, pywebview's `clear_user_data()` runs inside the quit path and does `process.WaitForExit(3000)` plus an `rmtree` of that profile — landing a 3 s wait inside the 5 s hard-exit budget, with under 2 s of slack for the rmtree. Consider passing `private_mode=False` (the profile wipe on every quit is almost certainly unintended anyway) and re-check `SHUTDOWN_HARD_S` after.
+
 - [ ] **Step 1: Add `/RELAUNCH` and `CloseApplications`**
 
 In `build/voisr.iss`'s `[Setup]` section, after `WizardStyle=modern`, add:
