@@ -7,6 +7,7 @@ import pytest
 import voisr
 import voisr.ui as ui
 import voisr.updater as updater
+from tests.conftest import FakeTimer
 from voisr.app import DEFAULT_CONFIG, load_config
 from voisr.history import HistoryStore
 from voisr.ui import Api
@@ -774,23 +775,6 @@ def test_a_disabled_config_is_respected(tmp_path):
 # --- the dashboard bridge -------------------------------------------------
 
 
-class _FakeTimer:
-    """Captures the deferred shutdown instead of running it, so a test can
-    prove the bridge call returned before the app started going away."""
-
-    def __init__(self, delay, fn):
-        self.delay = delay
-        self.fn = fn
-        self.started = False
-        self.daemon = False
-
-    def start(self):
-        self.started = True
-
-    def cancel(self):
-        pass
-
-
 _OPEN_APIS = []
 
 
@@ -804,26 +788,21 @@ def _close_apis():
 
 
 def _api(tmp_path, **overrides):
-    """An Api that can never arm a real timer or really exit.
+    """Pass timers=[] to inspect what the shutdown path armed.
 
-    Both defaults matter: the shutdown path's real collaborators are a live
-    threading.Timer and os._exit(0), so a test that reached them would take
-    the pytest process down 5s later, from a background thread, with nothing
-    pointing at the cause. Pass timers=[] to inspect what was armed.
+    Not passing it is safe: conftest's autouse _no_real_shutdown fixture
+    already keeps every Api in the suite off a real threading.Timer and a
+    real os._exit(0).
     """
     timers = overrides.pop("timers", None)
-    if timers is None:
-        timers = []  # captured and discarded rather than left to fire
-
-    def factory(delay, fn):
-        timer = _FakeTimer(delay, fn)
-        timers.append(timer)
-        return timer
-
     kwargs = dict(config_path=tmp_path / "config.json",
-                  history=HistoryStore(tmp_path / "h.jsonl"),
-                  timer_factory=factory,
-                  exit_fn=lambda: pytest.fail("the hard exit fired"))
+                  history=HistoryStore(tmp_path / "h.jsonl"))
+    if timers is not None:
+        def factory(delay, fn):
+            timer = FakeTimer(delay, fn)
+            timers.append(timer)
+            return timer
+        kwargs["timer_factory"] = factory
     kwargs.update(overrides)
     api = Api(**kwargs)
     _OPEN_APIS.append(api)
@@ -945,6 +924,11 @@ def test_a_quit_that_does_nothing_is_backstopped_by_a_hard_exit(tmp_path):
 
     assert len(timers) == 2 and timers[1].started
     assert timers[1].delay == Api.SHUTDOWN_HARD_S
+    # Both daemon: once menu_quit is fixed and the clean exit works, a
+    # non-daemon timer still pending would hold the interpreter open for its
+    # full delay, turning a prompt exit into a guaranteed hang plus a hard
+    # kill on every single install.
+    assert timers[0].daemon and timers[1].daemon
     assert exits == []  # the clean exit still has its window
     timers[1].fn()
     assert exits == [True]
@@ -967,6 +951,7 @@ def test_a_quit_that_blocks_still_reaches_the_hard_exit(tmp_path):
     timers[0].fn()
 
     assert armed_before_quit == [2]  # the hard exit was already armed
+    assert timers[0].daemon and timers[1].daemon
     timers[1].fn()
     assert exits == [True]
 

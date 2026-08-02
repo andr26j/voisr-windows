@@ -360,6 +360,10 @@ class Api:
     SHUTDOWN_DELAY_S = 0.75
     # How long the clean shutdown gets before the hard exit. See
     # _shutdown_soon for why an app still alive by then must not stay up.
+    # Re-check this when task 8 fixes menu_quit to destroy the pill: that
+    # puts pywebview's clear_user_data() inside quit_fn, which does a
+    # process.WaitForExit(3000) plus an rmtree of the WebView2 profile,
+    # leaving under 2s of slack in this budget.
     SHUTDOWN_HARD_S = 5.0
 
     def __init__(self, config_path=None,
@@ -871,10 +875,20 @@ class Api:
         strands the user with a dashboard stuck on "Installing", an Inno
         /SILENT install already running underneath, and no route back. It
         also keeps {app} open against the very installer that is replacing
-        it. os._exit skips atexit and buffer flushing, which is the right
-        trade here: history and config are both written synchronously well
-        before this point, and the alternative is a live process whose files
-        are being swapped out from under it.
+        it.
+
+        os._exit skips atexit and buffer flushing, which is the right trade
+        against a live process whose files are being swapped out from under
+        it -- but the reason history survives is atomicity, not timing.
+        _run_session writes history from the transcription worker, and
+        whisper can still be running well past the deadline; what protects it
+        is history.py committing via os.replace. config.json has no such
+        guarantee: set_config and capture_hotkey use Path.write_text, which
+        truncates then writes, and an exit inside that window leaves a
+        truncated file that load_config silently swaps for DEFAULT_CONFIG,
+        costing the user their hotkey, dictionary, theme and launch-at-login.
+        The window is microseconds wide and only opens on a write the user
+        just triggered, so it is accepted here rather than fixed.
 
         Note this is a *local* guarantee on purpose. voisr.iss gains
         CloseApplications in task 8, but that is an unlanded external
