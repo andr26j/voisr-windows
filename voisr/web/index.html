@@ -301,7 +301,7 @@
         <div class="setting-row">
           <div>
             <h3>Privacy</h3>
-            <p class="setting-desc">Audio is recorded to a temp file, transcribed by whisper.cpp on this PC, then deleted. No network calls, no accounts, no telemetry.</p>
+            <p class="setting-desc">Audio is recorded to a temp file, transcribed by whisper.cpp on this PC, then deleted. No accounts, no telemetry. The only network call is a version check to GitHub, which sends no audio, text, or identifying data.</p>
           </div>
           <span class="pill pill-good">Local only</span>
         </div>
@@ -311,6 +311,23 @@
             <p class="setting-desc">Permanently delete every stored dictation. This cannot be undone.</p>
           </div>
           <button type="button" id="clear-history" class="btn-danger">Clear…</button>
+        </div>
+        <div class="setting-row">
+          <div>
+            <h3>Automatically check for updates</h3>
+            <p class="setting-desc">Once a day, ask GitHub whether a newer Voisr has been released. Downloads happen in the background; nothing installs until you click Install.</p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="update-toggle">
+            <span class="slider" aria-hidden="true"></span>
+          </label>
+        </div>
+        <div class="setting-row">
+          <div>
+            <h3>Version</h3>
+            <p class="setting-desc"><span id="app-version">—</span><span id="update-result"></span></p>
+          </div>
+          <button type="button" id="update-check" class="btn-secondary">Check now</button>
         </div>
       </div>
     </section>

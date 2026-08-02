@@ -13,7 +13,7 @@ window.Voisr = window.Voisr || {};
       { id: "a2", ts: now - 7200, text: "Draft a follow-up about the Brunswick site visit next week.", words: 10, duration_s: 6 },
       { id: "a3", ts: now - 90000, text: "Remember to book the trailer for Saturday morning.", words: 8, duration_s: 4 },
     ];
-    let mockCfg = { hotkey: "ctrl_r", paste: true, show_widget: true, pill_theme: "classic", pill_color: null, dictionary: { trademake: "TradeMate", "trade mate": "TradeMate" }, model: "small.en", launch_at_login: false };
+    let mockCfg = { hotkey: "ctrl_r", paste: true, show_widget: true, pill_theme: "classic", pill_color: null, dictionary: { trademake: "TradeMate", "trade mate": "TradeMate" }, model: "small.en", launch_at_login: false, check_for_updates: true };
     let recording = false;
     // mirrors voisr/keys.py's hotkey_options(), used both for the dropdown
     // mock and to resolve a human label for hotkey_display() below.
@@ -70,6 +70,27 @@ window.Voisr = window.Voisr || {};
       // mirrors Api.set_launch_at_login() in voisr/ui.py.
       set_launch_at_login: async (enabled) => {
         mockCfg.launch_at_login = !!enabled;
+        return { ok: true, enabled: !!enabled };
+      },
+      // mirrors Api.get_update_status()/check_for_updates_now() in
+      // voisr/ui.py, i.e. UpdateChecker.status(): same shape either way, so
+      // the dashboard renders one shape and never has to guess which fields
+      // exist. "ready" here (rather than "idle") previews the state Task 11's
+      // home banner reacts to.
+      get_update_status: async () => ({
+        state: "ready", current_version: "1.0.0", version: "1.1.0",
+        notes: "Adds auto-update.", error: null, enabled: mockCfg.check_for_updates !== false,
+      }),
+      check_for_updates_now: async () => ({
+        state: "ready", current_version: "1.0.0", version: "1.1.0",
+        notes: "Adds auto-update.", error: null, enabled: mockCfg.check_for_updates !== false,
+      }),
+      // mirrors Api.install_update() in voisr/ui.py. Task 11 wires the button
+      // that calls this; nothing in this preview invokes it yet.
+      install_update: async () => ({ ok: true, version: "1.1.0" }),
+      // mirrors Api.set_check_for_updates() in voisr/ui.py.
+      set_check_for_updates: async (enabled) => {
+        mockCfg.check_for_updates = !!enabled;
         return { ok: true, enabled: !!enabled };
       },
       export_history: async (fmt) => {
