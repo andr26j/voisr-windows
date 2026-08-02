@@ -316,3 +316,142 @@ test("render() clears a stale update-result left over from a previous check", as
   assert.equal(h["update-result"].textContent, "",
     "a result from a check made before navigating away must not survive re-render");
 });
+
+/* ---------- home.js: update banner ----------
+
+   Home's counterpart to the Settings row above: a persistent banner for a
+   ready update, for the user who never opens Settings. Rendered from
+   `state`, never from `version` alone -- the updater never clears its
+   manifest, so `version` can still name a withdrawn release.
+
+   homeEnv() monkeypatches document.getElementById directly (a plain object
+   keyed by the three ids these tests touch) rather than going through
+   env.register()'s full byId registry. The patch is applied to whichever
+   document loadVoisr just installed as globalThis.document, and is restored
+   via the returned `restore()` -- otherwise it would leak onto a document a
+   later test in this file loads, exactly the failure mode Task 10's own
+   tests would be exposed to if they run after these in file order. */
+
+function homeEnv(status) {
+  const env = loadVoisr(["js/ui.js", "js/views/home.js"]);
+  const banner = makeNode("div");
+  const nodes = {
+    "update-banner": banner,
+    "update-banner-text": makeNode("span"),
+    "update-install": makeNode("button"),
+  };
+  const realGet = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) =>
+    nodes[id] || realGet.call(globalThis.document, id);
+  const calls = [];
+  globalThis.window.Voisr.api = () => ({
+    get_update_status: async () => status,
+    install_update: async () => { calls.push("install"); return { ok: true }; },
+  });
+  const restore = () => { globalThis.document.getElementById = realGet; };
+  return { env, nodes, calls, restore };
+}
+
+test("a ready update renders the banner with its version and notes", async (t) => {
+  const { env, nodes, restore } = homeEnv({
+    state: "ready", version: "1.1.0", notes: "Adds auto-update.",
+  });
+  t.after(restore);
+  await env.V.views.home.renderUpdateBanner();
+  assert.equal(nodes["update-banner"].hidden, false);
+  assert.match(nodes["update-banner-text"].textContent, /1\.1\.0/);
+  assert.match(nodes["update-banner-text"].textContent, /Adds auto-update/);
+});
+
+test("no update means no banner", async (t) => {
+  const { env, nodes, restore } = homeEnv({ state: "idle", version: null });
+  t.after(restore);
+  await env.V.views.home.renderUpdateBanner();
+  assert.equal(nodes["update-banner"].hidden, true);
+});
+
+test("a failed status check hides the banner instead of throwing", async (t) => {
+  const { env, nodes, restore } = homeEnv(null);
+  t.after(restore);
+  globalThis.window.Voisr.api = () => ({
+    get_update_status: async () => { throw new Error("bridge down"); },
+  });
+  await assert.doesNotReject(() => env.V.views.home.renderUpdateBanner());
+  assert.equal(nodes["update-banner"].hidden, true);
+});
+
+test("dismissing hides the banner and it does not come back this session", async (t) => {
+  const { env, nodes, restore } = homeEnv({
+    state: "ready", version: "1.1.0", notes: "Adds auto-update.",
+  });
+  t.after(restore);
+  await env.V.views.home.renderUpdateBanner();
+  env.V.views.home.dismissUpdateBanner();
+  assert.equal(nodes["update-banner"].hidden, true);
+  await env.V.views.home.renderUpdateBanner();
+  assert.equal(nodes["update-banner"].hidden, true);
+});
+
+/* ---------- home.js: Install button ----------
+
+   Omitted from the plan, but the fix pattern is already established at
+   main.js's #hotkey-capture and settings.js's Check-now: disable the button
+   for the duration of the call. Here it matters more than for Check-now -- a
+   second click could fire a second install_update(). Python refuses it
+   (installing is terminal, guarded by compare-and-set), so it is not
+   catastrophic, but the user would still get a confusing second toast while
+   the app is mid-shutdown.
+
+   Asymmetric on success, unlike Check-now: install_update() succeeding means
+   the app is about to exit, so the button is deliberately left disabled
+   rather than re-enabled -- re-enabling would only invite a pointless second
+   click during shutdown. */
+
+test("the Install button guards against a double-click and stays disabled after a successful install", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { env, nodes, calls, restore } = homeEnv({
+    state: "ready", version: "1.1.0", notes: "Adds auto-update.",
+  });
+  t.after(restore);
+  // The click handler's very first toast ("Installing update…") needs a
+  // #toast host to write into -- the four tests above never trigger a
+  // toast, so homeEnv()'s minimal node set doesn't include one.
+  nodes["toast"] = makeNode("div");
+  await env.V.views.home.renderUpdateBanner();
+
+  nodes["update-install"].dispatch("click");
+  assert.equal(nodes["update-install"].disabled, true,
+    "the button disables itself for the duration of the install");
+  nodes["update-install"].dispatch("click");   // a second click while the first is still pending
+
+  await settle();
+
+  assert.deepEqual(calls, ["install"],
+    "a second click while install is in flight must not start a second install");
+  assert.equal(nodes["update-install"].disabled, true,
+    "a successful install leaves the button disabled -- the app is about to exit");
+  assert.match(nodes.toast.children.map((c) => c.textContent).join(""),
+    /Installing update/);
+});
+
+test("a failed install re-enables the button and toasts the reason", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { env, nodes, restore } = homeEnv({
+    state: "ready", version: "1.1.0", notes: "Adds auto-update.",
+  });
+  t.after(restore);
+  nodes["toast"] = makeNode("div");
+  globalThis.window.Voisr.api = () => ({
+    get_update_status: async () => ({ state: "ready", version: "1.1.0", notes: null }),
+    install_update: async () => ({ error: "disk full" }),
+  });
+  await env.V.views.home.renderUpdateBanner();
+
+  nodes["update-install"].dispatch("click");
+  await settle();
+
+  assert.equal(nodes["update-install"].disabled, false,
+    "a failed install must not leave the button stuck disabled");
+  assert.match(nodes.toast.children.map((c) => c.textContent).join(""),
+    /Install update failed: disk full/);
+});
