@@ -163,6 +163,8 @@ Neither `build\dist\` nor `build\Output\` is committed — see `.gitignore`.
 
 ## Publishing a release
 
+This script does not exist yet — the process below is the designed shape (Task 9), not something exercised end to end. No real release has been published this way, and `build_release.ps1` itself is currently blocked on a Windows Defender false positive (see Known limitations).
+
 1. Bump `__version__` in `voisr/__init__.py`.
 2. Build, with the notes the updater will show in its banner:
 
@@ -180,8 +182,6 @@ powershell -ExecutionPolicy Bypass -File scripts\publish_release.ps1
 Releases live in [andr26j/voisr-releases](https://github.com/andr26j/voisr-releases) — public so installed copies can fetch updates without a token, while this source repo stays private. It holds only `VoisrSetup.exe` and `latest.json`.
 
 `publish_release.ps1` refuses to publish if the tag exists, if `notes` is empty, or if the installer's SHA256 disagrees with `latest.json`. Installed copies verify that hash before running anything, so a mismatch means every client rejects the update.
-
-This script does not exist yet — the process above is the designed shape (Task 9), not something exercised end to end. No real release has been published this way, and `build_release.ps1` itself is currently blocked on a Windows Defender false positive (see Known limitations).
 
 ## Possible future work
 

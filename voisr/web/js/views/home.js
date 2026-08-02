@@ -221,8 +221,16 @@ window.Voisr = window.Voisr || {};
     // while the region is already visible/attached.
     banner.hidden = false;
     const notes = status.notes ? ` — ${status.notes}` : "";
-    document.getElementById("update-banner-text").textContent =
-      `Version ${status.version} is ready${notes}`;
+    const msg = `Version ${status.version} is ready${notes}`;
+    const textEl = document.getElementById("update-banner-text");
+    // render() calls this on every Home render -- view switches, each new
+    // dictation, after recording, after a delete -- so with an undismissed
+    // update sitting there, a naive unconditional write would mutate this
+    // live region's text on every single one of those, even when the
+    // message never actually changed. A screen reader would re-announce
+    // "Version 1.1.0 is ready…" after every dictation. Only write when the
+    // text is actually different.
+    if (textEl.textContent !== msg) textEl.textContent = msg;
   }
 
   function dismissUpdateBanner() {

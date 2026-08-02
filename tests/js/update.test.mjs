@@ -416,6 +416,122 @@ test("dismissing hides the banner and it does not come back this session", async
   assert.equal(nodes["update-banner"].hidden, true);
 });
 
+/* ---------- home.js: dismissal is tracked per-version, not as a flat flag ----
+
+   Dismissing a release must not silently swallow a *newer* one that shows up
+   later -- exactly when the user should be re-prompted -- but must still keep
+   the same dismissed release hidden if it reappears (e.g. after an idle
+   interlude) without the user ever having re-dismissed it. Both directions
+   are pinned so a tidy-up back to a flat boolean fails loudly: a boolean
+   passes the "hides and stays hidden" test above, but not these. */
+
+test("dismissing an update does not suppress a newer one found later", async (t) => {
+  const { env, nodes, restore } = homeEnv(null);
+  t.after(restore);
+  let status = { state: "ready", version: "1.1.0", notes: null };
+  globalThis.window.Voisr.api = () => ({
+    get_update_status: async () => status,
+    install_update: async () => ({ ok: true }),
+  });
+
+  await env.V.views.home.renderUpdateBanner();
+  nodes["update-dismiss"].dispatch("click");
+  assert.equal(nodes["update-banner"].hidden, true);
+
+  status = { state: "ready", version: "1.2.0", notes: null };
+  await env.V.views.home.renderUpdateBanner();
+
+  assert.equal(nodes["update-banner"].hidden, false,
+    "a newer version must re-prompt even though an older one was dismissed");
+  assert.match(nodes["update-banner-text"].textContent, /1\.2\.0/);
+});
+
+test("dismissing an update keeps it hidden if the same version reappears after an idle interlude", async (t) => {
+  const { env, nodes, restore } = homeEnv(null);
+  t.after(restore);
+  let status = { state: "ready", version: "1.1.0", notes: null };
+  globalThis.window.Voisr.api = () => ({
+    get_update_status: async () => status,
+    install_update: async () => ({ ok: true }),
+  });
+
+  await env.V.views.home.renderUpdateBanner();
+  nodes["update-dismiss"].dispatch("click");
+  assert.equal(nodes["update-banner"].hidden, true);
+
+  status = { state: "idle", version: null, notes: null };
+  await env.V.views.home.renderUpdateBanner();
+  assert.equal(nodes["update-banner"].hidden, true);
+
+  status = { state: "ready", version: "1.1.0", notes: null };
+  await env.V.views.home.renderUpdateBanner();
+  assert.equal(nodes["update-banner"].hidden, true,
+    "the same dismissed version must stay hidden even after an idle interlude");
+});
+
+/* ---------- home.js: aria-live discipline ----
+
+   #update-banner is aria-live="polite" (Important 3 of the review), so its
+   mutations matter, not just its final state. Both regressions below pass
+   all the tests above -- neither changes what the banner ends up showing,
+   only how many DOM mutations a screen reader had to sit through to get
+   there. */
+
+test("banner reveal happens before the text write (aria-live ordering regression)", async (t) => {
+  const { env, nodes, restore } = homeEnv({
+    state: "ready", version: "1.1.0", notes: "Adds auto-update.",
+  });
+  t.after(restore);
+  const banner = nodes["update-banner"];
+  const textEl = nodes["update-banner-text"];
+  const order = [];
+  // Property-setter spies: convert the two plain data properties the
+  // production code writes into accessors that record write order, without
+  // changing what reading them back returns.
+  let _hidden = banner.hidden;
+  Object.defineProperty(banner, "hidden", {
+    get() { return _hidden; },
+    set(v) { order.push("hidden"); _hidden = v; },
+  });
+  let _text = textEl.textContent;
+  Object.defineProperty(textEl, "textContent", {
+    get() { return _text; },
+    set(v) { order.push("text"); _text = v; },
+  });
+
+  await env.V.views.home.renderUpdateBanner();
+
+  assert.deepEqual(order, ["hidden", "text"],
+    "the banner must be revealed (hidden = false) before its text is " +
+    "written, or a screen reader can miss the announcement on unhide");
+});
+
+test("re-rendering with an identical status does not rewrite the live region's text again", async (t) => {
+  const { env, nodes, restore } = homeEnv({
+    state: "ready", version: "1.1.0", notes: "Adds auto-update.",
+  });
+  t.after(restore);
+  const textEl = nodes["update-banner-text"];
+  let writes = 0;
+  let _text = textEl.textContent;
+  Object.defineProperty(textEl, "textContent", {
+    get() { return _text; },
+    set(v) { writes += 1; _text = v; },
+  });
+
+  // render() calls this on every Home render -- view switches, each new
+  // dictation, after recording, after a delete -- so an undismissed update
+  // sitting there gets rendered again and again with an unchanged status.
+  await env.V.views.home.renderUpdateBanner();
+  await env.V.views.home.renderUpdateBanner();
+  await env.V.views.home.renderUpdateBanner();
+
+  assert.equal(writes, 1,
+    "identical status across renders must not keep mutating the aria-live " +
+    "region's text -- a screen reader would otherwise re-announce the same " +
+    "message after every dictation");
+});
+
 /* ---------- home.js: Install button ----------
 
    Omitted from the plan, but the fix pattern is already established at
