@@ -50,7 +50,24 @@ WizardStyle=modern
 ; A silent update spawns this installer while Voisr is still exiting. Restart
 ; Manager closes anything still holding files under {app}; it works unelevated
 ; and acts without prompting under /SILENT.
-CloseApplications=yes
+;
+; force, not yes. Plain `yes` asks via WM_CLOSE, and Voisr answers it by
+; closing its window while the process lives on -- tray Quit has the same bug
+; (the pill window holds pywebview's master uid, so Application.Exit() never
+; fires; tracked separately). RM then reports "Some applications could not be
+; shut down" and Setup stops on an Abort/Retry/Ignore box that /SILENT does
+; NOT suppress, so an unattended update hangs forever on an invisible dialog.
+; Measured: Setup probes for holders ~2.4s in, but ui.py's os._exit(0)
+; backstop does not fire until ~5.75s (SHUTDOWN_DELAY_S + SHUTDOWN_HARD_S), so
+; the app is always still there when RM looks. force uses RmForceShutdown and
+; terminates it instead -- verified to complete and relaunch.
+;
+; The cost is that Voisr is killed rather than asked. That is the same trade
+; os._exit(0) already makes: history.jsonl commits via os.replace so it is
+; atomic, but config.json is written with Path.write_text, whose truncate
+; window a kill can land in. Not a new risk, but it is now reachable from the
+; installer side too.
+CloseApplications=force
 CloseApplicationsFilter=*.exe,*.dll
 RestartApplications=no
 ; Refuse to run two copies of Setup at once. Without this, two concurrent
