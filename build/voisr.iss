@@ -47,6 +47,18 @@ SolidCompression=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
+; A silent update spawns this installer while Voisr is still exiting. Restart
+; Manager closes anything still holding files under {app}; it works unelevated
+; and acts without prompting under /SILENT.
+CloseApplications=yes
+CloseApplicationsFilter=*.exe,*.dll
+RestartApplications=no
+; Refuse to run two copies of Setup at once. Without this, two concurrent
+; silent installs can write into {app} simultaneously and corrupt the install.
+; UpdateChecker.install() is guarded against double-spawning, but that guard
+; is per-process: an installed copy and a dev copy share %LOCALAPPDATA%\Voisr
+; (see the README), so the mutex is the only cross-process protection.
+SetupMutex=VoisrSetupMutex
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -74,6 +86,10 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+; The entry above is skipifsilent, so a silent update would finish with Voisr
+; closed. voisr/updater.py passes /RELAUNCH=1 to ask for a restart, and only
+; then does this second entry fire.
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait; Check: IsRelaunchRequested
 
 ; Uninstall must remove only the program directory and the Run value --
 ; {app} is {localappdata}\Programs\Voisr, never {localappdata}\Voisr (the
@@ -85,6 +101,13 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: no
 const
   WebView2ClientGuid = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
   WebView2DownloadUrl = 'https://go.microsoft.com/fwlink/p/?LinkId=2124703';
+
+// True only when started with /RELAUNCH=1, which voisr/updater.py passes for
+// an unattended update. Absent for a normal interactive install.
+function IsRelaunchRequested(): Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
 
 function WebView2RuntimeInstalled(): Boolean;
 var
