@@ -209,6 +209,13 @@ window.Voisr = window.Voisr || {};
       // correct) belongs here. Whether an update is actually installable is
       // Check now's / the home banner's question, not this row's.
       if (upd) $("#app-version").textContent = `Voisr ${upd.current_version || "—"}`;
+      // The Check-now click handler writes #update-result directly, outside
+      // any render() -- so a check left in flight (or a result left over)
+      // when the user navigates away must not go on showing here after they
+      // come back and this runs again. A check still genuinely in flight is
+      // unaffected: its own response repaints this once it lands, guarded by
+      // the same updateCheckSeq token the click handler uses.
+      $("#update-result").textContent = "";
 
       if (models && models.models) {
         const select = $("#model-select");
@@ -306,17 +313,42 @@ window.Voisr = window.Voisr || {};
        required distinctions -- ready vs. already-checking vs. mid-flight vs.
        actually up to date -- all live inside that object. Only a thrown
        rejection (the bridge itself unreachable) gets tryApi's usual
-       "label failed: message" treatment, via the catch below. */
+       "label failed: message" treatment, via the catch below.
+
+       Two guards against overlap, same reasoning as main.js's #hotkey-capture
+       (`if (btn.disabled) return; btn.disabled = true; ... finally`):
+       disabling the button for the duration closes the double-click a user
+       can actually trigger. The updateCheckSeq token is the second, cheaper
+       layer for the case the button's disabled state cannot cover -- a
+       response arriving out of order relative to a newer one already
+       in flight (IPC queuing, or this handler someday being reachable from
+       more than one trigger). Painting only the response whose token still
+       matches the latest click means a slow first reply can never overwrite
+       a second, faster one that superseded it. */
+    let updateCheckSeq = 0;
     document.getElementById("update-check").addEventListener("click", async () => {
+      // Read fresh, like clear-history's own handler above, rather than off
+      // the event: the fake DOM's dispatch() (tests/js/dom.mjs) does not
+      // model currentTarget, and there is exactly one #update-check anyway.
+      const btn = document.getElementById("update-check");
+      if (btn.disabled) return;
       const out = document.getElementById("update-result");
+      const seq = ++updateCheckSeq;
+      btn.disabled = true;
       out.textContent = " — checking…";
-      let res;
+      let res, err;
       try {
         res = await V.api().check_for_updates_now();
-      } catch (e) {
-        out.textContent = ` — Check for updates failed: ${e && e.message ? e.message : e}`;
-        return;
+      } catch (e2) {
+        err = e2;
+      } finally {
+        btn.disabled = false;
       }
+      // A newer click already started (and possibly already finished) since
+      // this one was fired -- its result is the current truth, and this
+      // response is stale by definition. Never let it repaint over that.
+      if (seq !== updateCheckSeq) return;
+      if (err) { out.textContent = ` — Check for updates failed: ${err.message || err}`; return; }
       // `already_checking` means a check already in flight (the daily
       // schedule, or a second click) answered instead of a completed one --
       // and `checking`/`downloading` are just as mid-flight. Neither is

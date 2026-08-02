@@ -206,3 +206,113 @@ test("a stale version left over from a superseded release is not reported as rea
   assert.doesNotMatch(h["update-result"].textContent, /0\.9\.0/);
   assert.match(h["update-result"].textContent, /up to date/);
 });
+
+/* ---------- overlap guards ----------
+
+   Nothing previously stopped a second click while the first check was still
+   in flight, and nothing stamped a response with the click that caused it --
+   so two overlapping calls could resolve out of order and the earlier
+   (stale) one could paint over the later, correct one. Mirrors main.js's
+   #hotkey-capture: disable the button for the duration, plus a token so a
+   response can tell whether it is still the latest thing asked for. */
+
+test("clicking Check now twice while a check is in flight only starts one request", async (t) => {
+  let resolveFirst;
+  let calls = 0;
+  const h = mountUpdateSettings(t, {
+    check_for_updates_now: async () => {
+      calls += 1;
+      return new Promise((r) => { resolveFirst = r; });
+    },
+  });
+  h.V.views.settings.init();
+
+  h["update-check"].dispatch("click");
+  assert.equal(h["update-check"].disabled, true, "the button disables itself for the duration of the check");
+  h["update-check"].dispatch("click");   // a second click while the first is still pending
+  await settle();
+
+  assert.equal(calls, 1, "a second click while a check is in flight must not start a second request");
+
+  resolveFirst({
+    state: "ready", current_version: "1.0.0", version: "1.1.0",
+    notes: null, error: null, enabled: true,
+  });
+  await settle();
+
+  assert.equal(h["update-check"].disabled, false, "re-enabled once the check settles");
+  assert.match(h["update-result"].textContent, /1\.1\.0 ready to install/);
+});
+
+test("a stale response from a superseded click cannot overwrite a newer one", async (t) => {
+  // The button-disable guard is what a real click sequence hits, but this
+  // pins the second, independent guard (the sequence token) that protects
+  // against the same overlap however it might arise -- a response arriving
+  // out of order relative to a newer one already in flight, which disabling
+  // the button for THIS click cannot by itself rule out for a future trigger.
+  // Re-enabling the button between dispatches models that: without the
+  // token, whichever response lands last wins regardless of which click was
+  // actually more recent.
+  const responses = [];
+  const h = mountUpdateSettings(t, {
+    check_for_updates_now: async () => new Promise((r) => { responses.push(r); }),
+  });
+  h.V.views.settings.init();
+
+  h["update-check"].dispatch("click");         // click A: the eventually-stale one
+  h["update-check"].disabled = false;
+  h["update-check"].dispatch("click");         // click B: the newer, superseding one
+  assert.equal(responses.length, 2, "sanity: both clicks actually started a request");
+
+  // B (the newer click) resolves first.
+  responses[1]({
+    state: "ready", current_version: "1.0.0", version: "2.0.0",
+    notes: null, error: null, enabled: true,
+  });
+  await settle();
+  assert.match(h["update-result"].textContent, /2\.0\.0 ready to install/);
+
+  // A (now stale) resolves after -- must not be allowed to overwrite B's result.
+  responses[0]({
+    state: "idle", current_version: "1.0.0", version: null,
+    notes: null, error: null, enabled: true, up_to_date: true,
+  });
+  await settle();
+  assert.match(h["update-result"].textContent, /2\.0\.0 ready to install/,
+    "a stale response landing after a newer one must not repaint over it");
+});
+
+test("Check now surfaces a thrown rejection, not only an {error} response", async (t) => {
+  const h = mountUpdateSettings(t, {
+    check_for_updates_now: async () => { throw new Error("bridge unreachable"); },
+  });
+  h.V.views.settings.init();
+
+  h["update-check"].dispatch("click");
+  await settle();
+
+  assert.match(h["update-result"].textContent, /Check for updates failed: bridge unreachable/);
+  assert.equal(h["update-check"].disabled, false, "re-enabled after a thrown rejection too");
+});
+
+/* ---------- render() ---------- */
+
+test("render() falls back to an em dash when current_version is absent from status", async (t) => {
+  const h = mountUpdateSettings(t, {
+    get_update_status: async () => ({
+      state: "idle", version: null, notes: null, error: null, enabled: true,
+    }),
+  });
+  await h.V.views.settings.render();
+  assert.equal(h["app-version"].textContent, "Voisr —");
+});
+
+test("render() clears a stale update-result left over from a previous check", async (t) => {
+  const h = mountUpdateSettings(t, {});
+  h["update-result"].textContent = " — 1.1.0 ready to install";
+
+  await h.V.views.settings.render();
+
+  assert.equal(h["update-result"].textContent, "",
+    "a result from a check made before navigating away must not survive re-render");
+});
