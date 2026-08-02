@@ -493,9 +493,16 @@ def test_install_spawns_the_installer_silently_and_relaunches(tmp_path):
     assert len(spawned) == 1
     argv = spawned[0]
     assert argv[0].endswith("VoisrSetup-1.1.0.exe")
-    # /RELAUNCH=1 is required: the installer's [Run] entry is skipifsilent,
-    # so without it a silent update would leave Voisr closed.
-    assert argv[1:] == ["/SILENT", "/NORESTART", "/RELAUNCH=1"]
+    # Every flag here is load-bearing; none is decoration to be tidied away.
+    # /SILENT hides the wizard but NOT Setup's modal dialogs, which is why
+    # /SUPPRESSMSGBOXES has to be here too: a SetupMutex collision was
+    # measured hanging on a modal OK/Cancel for over 45s, and no one can
+    # click it once the app has exited. /NORESTART keeps Setup from rebooting
+    # the machine. /RELAUNCH=1 is required because the installer's [Run]
+    # entry is skipifsilent, so without it a silent update leaves Voisr
+    # closed.
+    assert argv[1:] == ["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+                        "/RELAUNCH=1"]
 
 
 def test_install_before_an_update_is_ready_is_refused(tmp_path):

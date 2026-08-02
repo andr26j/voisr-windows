@@ -475,11 +475,12 @@ class UpdateChecker:
             return self.status()
 
         # Never restart the machine out from under an install. _check's first
-        # act is _set("checking"), which would overwrite "installing" and
-        # re-open install() for a second spawn of the same installer -- two
-        # concurrent silent Inno installs writing into {app}, with no
-        # SetupMutex to stop them. Read the field, then return outside the
-        # lock: status() takes the same non-reentrant lock and would deadlock.
+        # act is to claim "checking", which would overwrite "installing" and
+        # re-open install() for a second spawn of the same installer -- which
+        # voisr.iss's SetupMutex then aborts, so the cost is a wasted spawn
+        # rather than a corrupt {app}, but still worth refusing. Read the
+        # field, then return outside the lock: status() takes the same
+        # non-reentrant lock and would deadlock.
         with self._lock:
             installing = self._state == "installing"
         if installing:
@@ -608,9 +609,10 @@ class UpdateChecker:
     def install(self) -> dict:
         # Check and claim in one acquisition. Spawning first and recording
         # "installing" afterwards leaves a window in which a second install()
-        # still reads "ready" and spawns the same installer again -- and
-        # voisr.iss has no SetupMutex, so two silent Inno installs would write
-        # into {app} at once. The state is also what makes the installer path
+        # still reads "ready" and spawns the same installer again. voisr.iss's
+        # SetupMutex keeps that second Setup from writing into {app} alongside
+        # the first, but it still costs a pointless spawn that aborts, so do
+        # not lean on it. The state is also what makes the installer path
         # trustworthy, so both must be read together regardless.
         with self._lock:
             installer = self._installer
@@ -619,7 +621,17 @@ class UpdateChecker:
                 return {"error": "No verified update is ready to install."}
             self._state, self._error = "installing", None
         try:
-            self._spawn([str(installer), "/SILENT", "/NORESTART", "/RELAUNCH=1"])
+            # /SUPPRESSMSGBOXES is not redundant with /SILENT. /SILENT hides
+            # the wizard, not Setup's modal dialogs: a SetupMutex collision
+            # measured as an OK/Cancel box that hung for over 45s until it was
+            # killed by hand, and Restart Manager raises its own box when it
+            # cannot close an app. Nobody can click either -- this app is on
+            # its way out -- so a modal here means the user watches Voisr
+            # vanish and never come back. With this flag the same collision
+            # defaults to Cancel and exits 1 in under two seconds, and the
+            # update simply retries next cycle.
+            self._spawn([str(installer), "/SILENT", "/SUPPRESSMSGBOXES",
+                         "/NORESTART", "/RELAUNCH=1"])
         except Exception as e:
             with self._lock:
                 # Only hand the state back if it is still ours to hand back.
