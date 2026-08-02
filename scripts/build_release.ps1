@@ -85,5 +85,28 @@ if (-not (Test-Path $installer)) { throw "Installer missing: $installer" }
 # & signtool sign /f "$env:VOISR_CERT_PATH" /p "$env:VOISR_CERT_PASSWORD" `
 #     /tr http://timestamp.digicert.com /td sha256 /fd sha256 $installer
 
+$sha = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
+$manifestPath = Join-Path $buildDir "Output\latest.json"
+$manifestJson = @{
+    version = $appVersion
+    url     = "https://github.com/andr26j/voisr-releases/releases/download/v$appVersion/VoisrSetup.exe"
+    sha256  = $sha
+    notes   = $env:VOISR_RELEASE_NOTES
+} | ConvertTo-Json
+
+# Write UTF-8 WITHOUT a BOM. Do not use Set-Content -Encoding utf8: on
+# Windows PowerShell 5.1 that emits a BOM, and a BOM makes Python's
+# json.loads reject the manifest ("Unexpected UTF-8 BOM"). The client
+# decodes with utf-8-sig so it survives one either way, but emitting a BOM
+# here would leave every published release silently invisible to any client
+# that did not.
+[System.IO.File]::WriteAllText(
+    $manifestPath, $manifestJson, (New-Object System.Text.UTF8Encoding($false)))
+
 $sizeMb = [math]::Round((Get-Item $installer).Length / 1MB, 1)
 Write-Host "==> Done: $installer ($sizeMb MB)"
+Write-Host "    sha256:   $sha"
+Write-Host "    manifest: $manifestPath"
+if (-not $env:VOISR_RELEASE_NOTES) {
+    Write-Warning "VOISR_RELEASE_NOTES was not set, so latest.json has empty notes. The updater rejects a manifest with an empty field -- set it and rebuild before publishing."
+}
