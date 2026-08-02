@@ -325,12 +325,15 @@ test("render() clears a stale update-result left over from a previous check", as
    manifest, so `version` can still name a withdrawn release.
 
    homeEnv() monkeypatches document.getElementById directly (a plain object
-   keyed by the three ids these tests touch) rather than going through
+   keyed by the ids these tests touch) rather than going through
    env.register()'s full byId registry. The patch is applied to whichever
    document loadVoisr just installed as globalThis.document, and is restored
-   via the returned `restore()` -- otherwise it would leak onto a document a
-   later test in this file loads, exactly the failure mode Task 10's own
-   tests would be exposed to if they run after these in file order. */
+   via the returned `restore()` -- kept as hygiene / defence in depth against
+   a future test that reuses a document rather than because of any leak
+   reachable today: loadVoisr installs a fresh globalThis.document on every
+   call, so as long as every test here (and in settings.js's tests above)
+   keeps going through loadVoisr for its own env, this patch provably cannot
+   reach them. */
 
 function homeEnv(status) {
   const env = loadVoisr(["js/ui.js", "js/views/home.js"]);
@@ -339,6 +342,7 @@ function homeEnv(status) {
     "update-banner": banner,
     "update-banner-text": makeNode("span"),
     "update-install": makeNode("button"),
+    "update-dismiss": makeNode("button"),
   };
   const realGet = globalThis.document.getElementById;
   globalThis.document.getElementById = (id) =>
@@ -370,6 +374,21 @@ test("no update means no banner", async (t) => {
   assert.equal(nodes["update-banner"].hidden, true);
 });
 
+/* Distinct from the test above: `version` is present here, so a check that
+   only guarded on `!status.version` (rather than on `state !== "ready"`)
+   would pass "no update means no banner" (version is null there) while still
+   failing this one -- exactly the headline requirement the spec forbids
+   ("render from version alone"). Mirrors Task 10's equivalent stale-version
+   coverage for the Settings row. */
+test("a downloaded-but-not-ready update does not render the banner", async (t) => {
+  const { env, nodes, restore } = homeEnv({
+    state: "downloading", version: "1.1.0", notes: "n",
+  });
+  t.after(restore);
+  await env.V.views.home.renderUpdateBanner();
+  assert.equal(nodes["update-banner"].hidden, true);
+});
+
 test("a failed status check hides the banner instead of throwing", async (t) => {
   const { env, nodes, restore } = homeEnv(null);
   t.after(restore);
@@ -380,13 +399,18 @@ test("a failed status check hides the banner instead of throwing", async (t) => 
   assert.equal(nodes["update-banner"].hidden, true);
 });
 
+/* Drives a real click on #update-dismiss rather than calling
+   dismissUpdateBanner() directly -- homeEnv() now registers the button, so
+   this exercises bindUpdateControls()'s wiring, not just the exported
+   function. Without a real click, replacing the click listener's body with a
+   no-op would still pass. */
 test("dismissing hides the banner and it does not come back this session", async (t) => {
   const { env, nodes, restore } = homeEnv({
     state: "ready", version: "1.1.0", notes: "Adds auto-update.",
   });
   t.after(restore);
   await env.V.views.home.renderUpdateBanner();
-  env.V.views.home.dismissUpdateBanner();
+  nodes["update-dismiss"].dispatch("click");
   assert.equal(nodes["update-banner"].hidden, true);
   await env.V.views.home.renderUpdateBanner();
   assert.equal(nodes["update-banner"].hidden, true);
@@ -414,14 +438,16 @@ test("the Install button guards against a double-click and stays disabled after 
   });
   t.after(restore);
   // The click handler's very first toast ("Installing update…") needs a
-  // #toast host to write into -- the four tests above never trigger a
-  // toast, so homeEnv()'s minimal node set doesn't include one.
+  // #toast host to write into -- the tests above never trigger a toast, so
+  // homeEnv()'s minimal node set doesn't include one.
   nodes["toast"] = makeNode("div");
   await env.V.views.home.renderUpdateBanner();
 
   nodes["update-install"].dispatch("click");
   assert.equal(nodes["update-install"].disabled, true,
     "the button disables itself for the duration of the install");
+  assert.match(nodes["update-banner-text"].textContent, /Installing update/,
+    "the banner text switches synchronously, before install_update() is even awaited");
   nodes["update-install"].dispatch("click");   // a second click while the first is still pending
 
   await settle();
@@ -434,7 +460,7 @@ test("the Install button guards against a double-click and stays disabled after 
     /Installing update/);
 });
 
-test("a failed install re-enables the button and toasts the reason", async (t) => {
+test("a failed install re-enables the button, restores the banner text, and toasts the reason", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const { env, nodes, restore } = homeEnv({
     state: "ready", version: "1.1.0", notes: "Adds auto-update.",
@@ -446,12 +472,74 @@ test("a failed install re-enables the button and toasts the reason", async (t) =
     install_update: async () => ({ error: "disk full" }),
   });
   await env.V.views.home.renderUpdateBanner();
+  const priorText = nodes["update-banner-text"].textContent;
 
   nodes["update-install"].dispatch("click");
   await settle();
 
   assert.equal(nodes["update-install"].disabled, false,
     "a failed install must not leave the button stuck disabled");
+  assert.equal(nodes["update-banner-text"].textContent, priorText,
+    "a failed install must not leave the banner stuck on 'Installing update…'");
   assert.match(nodes.toast.children.map((c) => c.textContent).join(""),
     /Install update failed: disk full/);
+});
+
+/* Correction B's ordering ("toast before the call") is only enforced by a
+   comment; nothing failed if a future edit reversed it, since a fast-
+   resolving mock can't tell the difference. install_update() here never
+   settles, so this can only pass if the message is written before the
+   await -- exactly the ordering a real successful install can't afford to
+   get wrong (the process can exit before the awaited call ever returns). */
+test("the banner shows the installing message before install_update() ever resolves (ordering regression)", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { env, nodes, restore } = homeEnv({
+    state: "ready", version: "1.1.0", notes: "Adds auto-update.",
+  });
+  t.after(restore);
+  nodes["toast"] = makeNode("div");
+  let installCalled = false;
+  globalThis.window.Voisr.api = () => ({
+    get_update_status: async () => ({ state: "ready", version: "1.1.0", notes: null }),
+    install_update: () => { installCalled = true; return new Promise(() => {}); },
+  });
+  await env.V.views.home.renderUpdateBanner();
+
+  nodes["update-install"].dispatch("click");
+  await settle();
+
+  assert.equal(installCalled, true, "sanity: install_update() was actually invoked");
+  assert.match(nodes["update-banner-text"].textContent, /Installing update/,
+    "the installing message must already be visible even though install_update() never resolved");
+});
+
+/* The exact failure the review caught empirically: an Undo toast (from
+   deleting a recent dictation, which Home renders directly below this
+   banner) left live means a plain V.ui.toast() call is queued for up to 5s
+   rather than shown (ui.js's toastActionLive gate) -- and a successful
+   install kills the process well inside that window, so a toast-only
+   message would never be seen. The banner text has no such queue. */
+test("the installing message survives even when the toast would be queued behind a live Undo (toast-swallowed regression)", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { env, nodes, restore } = homeEnv({
+    state: "ready", version: "1.1.0", notes: "Adds auto-update.",
+  });
+  t.after(restore);
+  nodes["toast"] = makeNode("div");
+
+  // Put a live Undo toast on screen first, exactly as deleting a dictation
+  // from the recent list right above would.
+  env.V.ui.toast("Dictation deleted", { actionLabel: "Undo", onAction: () => {} });
+
+  await env.V.views.home.renderUpdateBanner();
+  nodes["update-install"].dispatch("click");
+
+  // Confirms the premise: the toast host still shows the live Undo, so
+  // "Installing update" really was queued rather than shown.
+  assert.match(nodes.toast.children.map((c) => c.textContent).join(""),
+    /Dictation deleted/);
+  assert.doesNotMatch(nodes.toast.children.map((c) => c.textContent).join(""),
+    /Installing update/);
+  // The banner itself is unaffected by the toast queue.
+  assert.match(nodes["update-banner-text"].textContent, /Installing update/);
 });

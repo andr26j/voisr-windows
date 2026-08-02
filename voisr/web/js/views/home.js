@@ -108,12 +108,26 @@ window.Voisr = window.Voisr || {};
      app-version row and Check-now button (Task 10), but a banner here is what
      a user who never opens Settings actually sees.
 
-     Session-scoped: a dismissed banner returns on the next launch while the
-     update is still pending, so it can be ignored today without being lost. */
-  let updateDismissed = false;
+     Session-scoped, and tracked by version rather than as a flat yes/no: a
+     dismissed banner stays down for the rest of this session for the release
+     it was dismissed for, but a *newer* one (Check-now finds 1.2.0 after the
+     user dismissed 1.1.0) is exactly when they should be re-prompted, so it
+     is not suppressed by the earlier dismissal. */
+  let dismissedVersion = null;
+  // Whatever version the banner is currently offering (or last offered), so
+  // dismissUpdateBanner() -- which has no status object of its own -- knows
+  // which version it is dismissing.
+  let lastReadyVersion = null;
 
-  /* Bound once, the first time the banner is ever rendered -- mirrors
-     settings.js's wheelDrawn (bind once, not on every render/popover-open).
+  /* Bound once both controls are actually found and wired -- unlike
+     settings.js's wheelDrawn (which sets its flag first, before the work,
+     since drawColorWheel/initColorWheel cannot themselves fail), binding here
+     only claims success after both elements exist, so a render that finds
+     one missing simply retries on the next one rather than being stuck
+     unbound for the rest of the session. Not reachable today (index.html
+     always renders both together), but cheap insurance against ever adding a
+     render path where the banner exists before its own buttons do.
+
      Deferred to here rather than done at module-parse time (the convention
      this file otherwise uses for the focus listener above): several tests
      load this file standalone without ever registering #update-install or
@@ -124,45 +138,58 @@ window.Voisr = window.Voisr || {};
 
   function bindUpdateControls() {
     if (updateControlsBound) return;
+    const installBtn = document.getElementById("update-install");
+    const dismissBtn = document.getElementById("update-dismiss");
+    if (!installBtn || !dismissBtn) return;
     updateControlsBound = true;
 
-    const installBtn = document.getElementById("update-install");
-    if (installBtn) {
-      installBtn.addEventListener("click", async () => {
-        // Same overlap guard as main.js's #hotkey-capture and settings.js's
-        // Check-now: without it, a second click while the first install is
-        // still in flight could fire a second install_update(). The Python
-        // side refuses a second call once installing (compare-and-set, a
-        // terminal state), so this is not catastrophic -- but skipping the
-        // guard would still let the user see a confusing second toast while
-        // the app is in the middle of shutting down.
-        if (installBtn.disabled) return;
-        installBtn.disabled = true;
-        // Emitted BEFORE the call, and that ordering must survive any future
-        // tidy-up. A successful install_update() kills the app roughly 0.75s
-        // later via Application.Exit(), and pywebview's evaluate_js blocks on
-        // a semaphore that destroy_window never releases -- so if Exit() wins
-        // that race, this await's promise never settles and anything written
-        // after it would simply never run.
-        V.ui.toast("Installing update — Voisr will restart");
-        // Routed through V.ui.tryApi, unlike settings.js's Check-now:
-        // install_update() only ever answers success ({ok, version}) or
-        // failure ({error}), so there is nothing tryApi's null-on-error
-        // collapses away that this handler still needs -- unlike Check-now,
-        // which has to tell "ready" apart from "already checking" from the
-        // very same response.
-        if (!await V.ui.tryApi(V.api().install_update(), "Install update")) {
-          installBtn.disabled = false;
-          return;
-        }
-        // Success: the app is about to exit. Leave the button disabled --
-        // re-enabling it would only invite a pointless second click during
-        // shutdown.
-      });
-    }
+    installBtn.addEventListener("click", async () => {
+      // Same overlap guard as main.js's #hotkey-capture and settings.js's
+      // Check-now: without it, a second click while the first install is
+      // still in flight could fire a second install_update(). The Python
+      // side refuses a second call once installing (compare-and-set, a
+      // terminal state), so this is not catastrophic -- but skipping the
+      // guard would still let the user see a confusing second toast while
+      // the app is in the middle of shutting down.
+      if (installBtn.disabled) return;
+      installBtn.disabled = true;
 
-    const dismissBtn = document.getElementById("update-dismiss");
-    if (dismissBtn) dismissBtn.addEventListener("click", dismissUpdateBanner);
+      const textEl = document.getElementById("update-banner-text");
+      const priorText = textEl ? textEl.textContent : "";
+      // The banner's own text is the channel of record for this message, not
+      // the toast below. V.ui.toast() can be silently swallowed: if an Undo
+      // toast is already live -- and Home's own recent-list delete buttons
+      // sit right below this banner, so that is one click away -- ui.js's
+      // toastActionLive gate just queues this message for up to 5s instead
+      // of showing it. A successful install kills the process well inside
+      // that window, so the queued message would never be shown; the user
+      // would watch Voisr vanish with a stale "Dictation deleted / Undo"
+      // still on screen and no explanation. The banner has no such queue.
+      if (textEl) textEl.textContent = "Installing update — Voisr will restart";
+      // Emitted BEFORE the call, and that ordering must survive any future
+      // tidy-up. A successful install_update() kills the app roughly 0.75s
+      // later via Application.Exit(), and pywebview's evaluate_js blocks on
+      // a semaphore that destroy_window never releases -- so if Exit() wins
+      // that race, this await's promise never settles and anything written
+      // after it would simply never run.
+      V.ui.toast("Installing update — Voisr will restart");
+      // Routed through V.ui.tryApi, unlike settings.js's Check-now:
+      // install_update() only ever answers success ({ok, version}) or
+      // failure ({error}), so there is nothing tryApi's null-on-error
+      // collapses away that this handler still needs -- unlike Check-now,
+      // which has to tell "ready" apart from "already checking" from the
+      // very same response.
+      if (!await V.ui.tryApi(V.api().install_update(), "Install update")) {
+        installBtn.disabled = false;
+        if (textEl) textEl.textContent = priorText;
+        return;
+      }
+      // Success: the app is about to exit. Leave the button disabled and the
+      // banner reading "Installing…" -- re-enabling the button, or reverting
+      // the text, would only invite a pointless second click during shutdown.
+    });
+
+    dismissBtn.addEventListener("click", dismissUpdateBanner);
   }
 
   async function renderUpdateBanner() {
@@ -179,18 +206,27 @@ window.Voisr = window.Voisr || {};
     }
     // Render from `state`, never `version` alone: the updater never clears
     // its manifest, so `version` can still name a withdrawn release.
-    if (updateDismissed || !status || status.state !== "ready" || !status.version) {
+    if (!status || status.state !== "ready" || !status.version) {
       banner.hidden = true;
       return;
     }
+    lastReadyVersion = status.version;
+    if (status.version === dismissedVersion) {
+      banner.hidden = true;
+      return;
+    }
+    // Reveal before writing the text: #update-banner is aria-live="polite",
+    // and a live region that is still hidden when its content changes is not
+    // reliably announced once it is unhidden -- the mutation has to happen
+    // while the region is already visible/attached.
+    banner.hidden = false;
     const notes = status.notes ? ` — ${status.notes}` : "";
     document.getElementById("update-banner-text").textContent =
       `Version ${status.version} is ready${notes}`;
-    banner.hidden = false;
   }
 
   function dismissUpdateBanner() {
-    updateDismissed = true;
+    dismissedVersion = lastReadyVersion;
     const banner = document.getElementById("update-banner");
     if (banner) banner.hidden = true;
   }
