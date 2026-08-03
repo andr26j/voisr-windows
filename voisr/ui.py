@@ -109,6 +109,61 @@ def _find_window_hwnd():
         return None
 
 
+SW_RESTORE = 9
+
+
+class _User32:
+    """Adapter around the user32 calls that un-minimize a window, with
+    explicit ctypes types. Mirrors voisr.window_chrome._Dwm so tests can
+    inject a fake instead of touching the real Win32 API."""
+
+    def __init__(self):
+        import ctypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.IsIconic.argtypes = [ctypes.c_void_p]
+        user32.IsIconic.restype = ctypes.c_bool
+        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._user32 = user32
+
+    def is_minimized(self, hwnd) -> bool:
+        return bool(self._user32.IsIconic(hwnd))
+
+    def restore(self, hwnd) -> None:
+        self._user32.ShowWindow(hwnd, SW_RESTORE)
+
+
+def present_window(window, user32=None) -> None:
+    """Bring the dashboard window back for the tray's Open Dashboard.
+
+    `window.show()` alone is not enough. pywebview's winforms backend maps
+    it to Form.Show() + Form.Activate(), which un-hides a window that was
+    closed to the tray but leaves a *minimized* one minimized -- hidden and
+    minimized are different window states, and Show() only touches the
+    first. ShowWindow(SW_RESTORE) is what un-minimizes (and activates) it.
+
+    The SW_RESTORE is guarded by IsIconic because it would shrink an
+    already-visible maximized window back to its restored size. That guard
+    is also why this doesn't use pywebview's own `window.restore()`, which
+    forces FormWindowState.Normal unconditionally and so loses the
+    maximized state a window was minimized from.
+
+    Never raises: a failing tray action must not take down the app."""
+    try:
+        window.show()
+    except Exception:
+        pass
+    try:
+        hwnd = _find_window_hwnd()
+        if not hwnd:
+            return
+        if user32 is None:
+            user32 = _User32()
+        if user32.is_minimized(hwnd):
+            user32.restore(hwnd)
+    except Exception:
+        pass
+
+
 def _system_prefers_dark() -> bool:
     """Read the Windows "app mode" theme preference. Defaults to dark (this
     app's own default appearance) if the value can't be read."""
@@ -834,10 +889,7 @@ def main():
             service.toggle()
 
         def menu_open():
-            try:
-                window.show()
-            except Exception:
-                pass
+            present_window(window)
 
         def menu_quit():
             quitting.set()

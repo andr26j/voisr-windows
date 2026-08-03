@@ -669,6 +669,93 @@ def test_set_appearance_applies_chrome_when_a_window_exists(tmp_path, monkeypatc
     assert calls == [(4321, True)]
 
 
+class FakeWindow:
+    def __init__(self, show_error=None):
+        self.shown = 0
+        self._show_error = show_error
+
+    def show(self):
+        self.shown += 1
+        if self._show_error is not None:
+            raise self._show_error
+
+
+class FakeUser32:
+    """Records the window-state calls present_window makes."""
+
+    def __init__(self, minimized=False):
+        self.minimized = minimized
+        self.restored = []
+        self.checked = []
+
+    def is_minimized(self, hwnd):
+        self.checked.append(hwnd)
+        return self.minimized
+
+    def restore(self, hwnd):
+        self.restored.append(hwnd)
+
+
+def test_present_window_restores_a_minimized_window(monkeypatch):
+    from voisr import ui as ui_module
+
+    monkeypatch.setattr(ui_module, "_find_window_hwnd", lambda: 4321)
+    window = FakeWindow()
+    user32 = FakeUser32(minimized=True)
+    ui_module.present_window(window, user32=user32)
+    assert window.shown == 1
+    assert user32.restored == [4321]
+
+
+def test_present_window_leaves_an_unminimized_window_untouched(monkeypatch):
+    from voisr import ui as ui_module
+
+    monkeypatch.setattr(ui_module, "_find_window_hwnd", lambda: 4321)
+    window = FakeWindow()
+    user32 = FakeUser32(minimized=False)
+    ui_module.present_window(window, user32=user32)
+    assert window.shown == 1
+    # A maximized dashboard must stay maximized -- SW_RESTORE would shrink it.
+    assert user32.restored == []
+
+
+def test_present_window_shows_even_when_no_hwnd_is_found(monkeypatch):
+    from voisr import ui as ui_module
+
+    monkeypatch.setattr(ui_module, "_find_window_hwnd", lambda: None)
+    window = FakeWindow()
+    user32 = FakeUser32(minimized=True)
+    ui_module.present_window(window, user32=user32)
+    assert window.shown == 1
+    assert user32.checked == []
+
+
+def test_present_window_restores_even_when_show_raises(monkeypatch):
+    from voisr import ui as ui_module
+
+    monkeypatch.setattr(ui_module, "_find_window_hwnd", lambda: 4321)
+    window = FakeWindow(show_error=RuntimeError("backend gone"))
+    user32 = FakeUser32(minimized=True)
+    ui_module.present_window(window, user32=user32)
+    assert user32.restored == [4321]
+
+
+def test_present_window_survives_a_failing_user32(monkeypatch):
+    from voisr import ui as ui_module
+
+    class Exploding:
+        def is_minimized(self, hwnd):
+            raise OSError("no user32 here")
+
+        def restore(self, hwnd):
+            raise OSError("no user32 here")
+
+    monkeypatch.setattr(ui_module, "_find_window_hwnd", lambda: 4321)
+    window = FakeWindow()
+    ui_module.present_window(window, user32=Exploding())  # must not raise
+    assert window.shown == 1
+
+
 def test_is_recording_tracks_the_record_cycle(tmp_path):
     api = make_api(tmp_path)
     assert api.is_recording() is False
