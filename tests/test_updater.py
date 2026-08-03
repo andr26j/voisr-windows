@@ -437,7 +437,7 @@ def test_the_same_version_is_not_an_update(tmp_path):
     assert calls["download"] == 0
 
 
-def test_no_releases_yet_is_not_an_error(tmp_path):
+def test_no_releases_yet_is_a_failed_check_not_an_error(tmp_path):
     # fetch_manifest returns None for a 404 and for every network failure
     # alike, so the checker cannot tell "nothing published" from "no network"
     # and reports the safe one: check_failed, not up_to_date. In the field a
@@ -810,6 +810,51 @@ def test_an_offline_check_keeps_a_download_that_is_already_on_disk(tmp_path):
     assert result["check_failed"] is True
     assert checker.status()["state"] == "ready"
     assert checker.install()["ok"] is True
+
+
+def test_an_abandoned_download_is_not_re_offered_by_a_later_failed_fetch(tmp_path):
+    # _installer must never name a file the checker just deleted. The
+    # failed-fetch branch restores "ready" on the strength of that field, so a
+    # stale one resurrects a banner for an installer that is not on disk, and
+    # the click behind it gets a WinError 2.
+    checker, _ = _checker(tmp_path)
+    checker.check_now()
+    assert checker.status()["state"] == "ready"
+
+    # A newer release is published and its download drops mid-stream -- after
+    # the installer already on disk was pruned to make room for it.
+    checker._fetch = lambda url, opener=None: Manifest.from_json(
+        json.dumps(_manifest_dict(version="1.2.0")))
+
+    def dropped(url, dest, opener=None):
+        raise OSError("connection reset")
+
+    checker._download = dropped
+    assert checker.check_now(force=True)["state"] == "idle"
+    assert list(tmp_path.iterdir()) == []
+
+    # Now the network goes down entirely. There is nothing left to offer.
+    checker._fetch = lambda url, opener=None: None
+    assert checker.check_now(force=True)["state"] == "idle"
+    assert "error" in checker.install()
+
+
+def test_a_pruned_installer_is_not_re_offered_by_a_later_failed_fetch(tmp_path):
+    # The same invariant on the other path that deletes installers: a yanked
+    # release leaves nothing to offer and prunes the download, which must not
+    # leave _installer still naming it.
+    checker, _ = _checker(tmp_path)
+    checker.check_now()
+
+    # 1.1.0 is withdrawn; the latest release is the one already running.
+    checker._fetch = lambda url, opener=None: Manifest.from_json(
+        json.dumps(_manifest_dict(version="1.0.0")))
+    assert checker.check_now(force=True)["up_to_date"] is True
+    assert list(tmp_path.iterdir()) == []
+
+    checker._fetch = lambda url, opener=None: None
+    assert checker.check_now(force=True)["state"] == "idle"
+    assert "error" in checker.install()
 
 
 def test_a_failed_fetch_with_nothing_downloaded_stays_idle(tmp_path):

@@ -182,7 +182,8 @@ WebView2 init — free of network work.
   Re-verifying on the click was considered and rejected: the gap crosses no
   privilege boundary. Anything able to swap the file in
   `%LOCALAPPDATA%\Voisr\updates` can equally rewrite the app's own code in
-  `%LOCALAPPDATA%\Voisr\app`, so the re-check would buy no defence against
+  `%LOCALAPPDATA%\Programs\Voisr` (`voisr.iss`'s `DefaultDirName`), so the
+  re-check would buy no defence against
   the only attacker who can reach it. Non-adversarial corruption is caught
   anyway — Inno Setup binaries self-check a CRC and refuse to run — and a
   vanished file is already handled (`install()` drops to `idle` and

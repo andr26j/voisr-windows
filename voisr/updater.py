@@ -36,14 +36,17 @@ def _log(message: str) -> None:
     concern worth rotating for: nothing here logs on the happy path, so a
     permanently broken channel costs a line a day.
     """
-    print(f"voisr: {message}", flush=True)
     try:
+        print(f"voisr: {message}", flush=True)
         log_dir = app_data_dir() / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         with open(log_dir / "voisr.log", "a", encoding="utf-8") as f:
             f.write(f"{stamp} {message}\n")
-    except OSError:
+    except Exception:
+        # Wider than OSError, and print() is inside the try: logging is never
+        # allowed to be the thing that breaks an update. Nothing here has a
+        # caller that could do anything useful with a logging failure anyway.
         pass
 
 
@@ -615,17 +618,27 @@ class UpdateChecker:
                     # Never execute an installer we cannot vouch for.
                     dest.unlink(missing_ok=True)
                     _log("update checksum mismatch, discarded")
-                    self._set("idle",
-                              error="Update checksum did not match; discarded.")
+                    self._abandon("Update checksum did not match; discarded.")
                     return self.status()
         except Exception as e:
-            self._set("idle", error=f"Could not fetch the update: {e}")
+            self._abandon(f"Could not fetch the update: {e}")
             return self.status()
 
         with self._lock:
             self._installer = dest
         self._set("ready")
         return self.status()
+
+    def _abandon(self, error: str) -> None:
+        """Give up on the download in progress: idle, with no installer named.
+
+        Clearing _installer is the point. It must never name a file that was
+        just deleted -- the failed-fetch branch restores "ready" on the
+        strength of that field, so a stale one resurrects a banner offering an
+        installer that is not on disk, and the user's click gets a WinError 2.
+        """
+        with self._lock:
+            self._state, self._error, self._installer = "idle", error, None
 
     def _prune(self, keep: Path | None) -> None:
         """Drop every installer but `keep` (pass None to drop all of them),
@@ -654,6 +667,12 @@ class UpdateChecker:
                     path.unlink()
                 except OSError:
                     pass  # a locked leftover is not worth failing the update
+        with self._lock:
+            if self._installer is not None and self._installer != keep:
+                # Whatever it named is gone now, so the field goes with it.
+                # The invariant lives here, next to the deletion, rather than
+                # at each call site: any future pruner gets it for free.
+                self._installer = None
 
     # -- applying -------------------------------------------------------
     def _log_flag(self) -> list:
