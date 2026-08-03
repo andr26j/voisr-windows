@@ -36,6 +36,10 @@ from voisr.recording_queue import (
 from voisr.status_item import StatusItem
 from voisr.stream_recorder import StreamRecorder
 from voisr.updater import UpdateChecker
+# _log, not print: the shipped build is windowed (console=False), where
+# sys.stdout is None and print() is a silent no-op. Shared with updater.py
+# so both halves of an update failure land in the same file.
+from voisr.updater import _log as _update_log
 from voisr.window_chrome import apply_chrome
 
 WEB_DIR = _web_dir()
@@ -890,16 +894,16 @@ class Api:
         The window is microseconds wide and only opens on a write the user
         just triggered, so it is accepted here rather than fixed.
 
-        Note this is a *local* guarantee on purpose. voisr.iss gains
-        CloseApplications in task 8, but that is an unlanded external
-        dependency and this invariant should not rest on it.
+        Note this is a *local* guarantee on purpose. voisr.iss does set
+        CloseApplications=force, but that is an external dependency one
+        setup-file edit away from vanishing, and this invariant should not
+        rest on it.
         """
         quit_fn = self._quit_fn
         if quit_fn is None:
             # A headless Api (tests, a future CLI) has no window to tear
             # down, and must certainly not take the process with it.
-            print("voisr: update installing, but no quit hook is attached",
-                  flush=True)
+            _update_log("update installing, but no quit hook is attached")
             return
 
         def go():
@@ -909,7 +913,7 @@ class Api:
             try:
                 quit_fn()
             except Exception as e:
-                print(f"voisr: shutdown after install failed: {e}", flush=True)
+                _update_log(f"shutdown after install failed: {e}")
 
         self._arm(self.SHUTDOWN_DELAY_S, go)
 

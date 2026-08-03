@@ -438,11 +438,20 @@ def test_the_same_version_is_not_an_update(tmp_path):
 
 
 def test_no_releases_yet_is_not_an_error(tmp_path):
+    # fetch_manifest returns None for a 404 and for every network failure
+    # alike, so the checker cannot tell "nothing published" from "no network"
+    # and reports the safe one: check_failed, not up_to_date. In the field a
+    # 404 on a channel that has published before *is* a broken channel, and
+    # claiming "up to date" for it is the wrong answer.
+    #
+    # "Not an error" still holds where it matters: no error is set, so a
+    # background check stays completely silent and no banner appears.
     checker, _ = _checker(tmp_path)
     checker._fetch = lambda url, opener=None: None
     result = checker.check_now()
     assert result["state"] == "idle"
-    assert result["up_to_date"] is True
+    assert result["error"] is None
+    assert result["check_failed"] is True
 
 
 def test_a_hash_mismatch_deletes_the_download_and_never_offers_it(tmp_path):
@@ -781,13 +790,57 @@ def test_a_download_that_cannot_be_reached_still_clears_the_old_installer(
 
 def test_an_offline_check_keeps_a_download_that_is_already_on_disk(tmp_path):
     # The counterpart to the prune above: a moment offline must not throw away
-    # a good installer and make the next check re-burn 155 MB.
-    stale = tmp_path / "VoisrSetup-1.1.0.exe"
-    stale.write_bytes(b"installer")
+    # a good installer and make the next check re-burn 155 MB -- and must not
+    # throw away the *state* either. Demoting a verified update to idle takes
+    # the banner and the Install button away for up to 24h while the installer
+    # sits on disk unusable, so the file surviving is only half the assertion.
+    checker, _ = _checker(tmp_path)
+    checker.check_now()
+    installer = tmp_path / "VoisrSetup-1.1.0.exe"
+    assert installer.is_file()
+
+    checker._fetch = lambda url, opener=None: None
+    result = checker.check_now(force=True)
+
+    assert installer.is_file()
+    assert result["state"] == "ready"
+    # A failed fetch is not an answer about versions. Claiming "up to date"
+    # here is what makes Check now say it while offline.
+    assert "up_to_date" not in result
+    assert result["check_failed"] is True
+    assert checker.status()["state"] == "ready"
+    assert checker.install()["ok"] is True
+
+
+def test_a_failed_fetch_with_nothing_downloaded_stays_idle(tmp_path):
+    # The same path with no installer to protect: still not "up to date".
     checker, _ = _checker(tmp_path)
     checker._fetch = lambda url, opener=None: None
-    checker.check_now()
-    assert stale.is_file()
+    result = checker.check_now()
+    assert result["state"] == "idle"
+    assert result["check_failed"] is True
+    assert "up_to_date" not in result
+
+
+def test_a_failure_is_written_to_the_log_file(tmp_path, monkeypatch):
+    # console=False in the shipped build makes sys.stdout None, and print() a
+    # silent no-op -- so without this file the checksum mismatch the code says
+    # to "log loudly" leaves no artifact anywhere on the machine.
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    updater._log("update checksum mismatch, discarded")
+
+    log = tmp_path / "Voisr" / "logs" / "voisr.log"
+    assert log.is_file()
+    assert "update checksum mismatch, discarded" in log.read_text(encoding="utf-8")
+
+
+def test_logging_never_breaks_an_update(tmp_path, monkeypatch):
+    # Best-effort by design: an unwritable log directory must not become the
+    # reason an update fails.
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "nope"))
+    monkeypatch.setattr(updater.Path, "mkdir",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("denied")))
+    updater._log("this must not raise")
 
 
 # --- the config default ---------------------------------------------------

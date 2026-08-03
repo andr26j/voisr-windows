@@ -41,6 +41,19 @@ if (Test-Path $appDir) {
     Write-Host "    $appDir not present"
 }
 
+# Downloaded installers and logs are pure cache, not user data, so they go
+# unconditionally -- and before the prompt below, which is gated on config or
+# history existing. A profile that has an update downloaded but neither of
+# those would otherwise be told "No user data found" and left holding ~155 MB
+# forever.
+foreach ($cache in @("updates", "logs")) {
+    $cacheDir = Join-Path $dataDir $cache
+    if (Test-Path $cacheDir) {
+        Remove-Item $cacheDir -Recurse -Force
+        Write-Host "==> Removed cached $cache at $cacheDir"
+    }
+}
+
 $configPath = Join-Path $dataDir "config.json"
 $historyPath = Join-Path $dataDir "history.jsonl"
 $hasUserData = (Test-Path $configPath) -or (Test-Path $historyPath)

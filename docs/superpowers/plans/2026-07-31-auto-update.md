@@ -1094,7 +1094,9 @@ In `build/voisr.iss`'s `[Setup]` section, after `WizardStyle=modern`, add:
 ; A silent update spawns this installer while Voisr is still exiting. Restart
 ; Manager closes anything still holding files under {app}; it works unelevated
 ; and acts without prompting under /SILENT.
-CloseApplications=yes
+; "force", not "yes": Restart Manager cannot close an app that ignores
+; WM_CLOSE, and Voisr's message loop does. See commit d341b58.
+CloseApplications=force
 CloseApplicationsFilter=*.exe,*.dll
 RestartApplications=no
 ; Refuse to run two copies of Setup at once. Without this, two concurrent

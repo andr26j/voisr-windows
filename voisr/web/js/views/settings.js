@@ -361,6 +361,10 @@ window.Voisr = window.Voisr || {};
       else if (res.state === "ready") out.textContent = ` — ${res.version} ready to install`;
       else if (res.state === "checking" || res.state === "downloading")
         out.textContent = " — update check in progress";
+      // `check_failed` means the manifest could not be fetched at all --
+      // offline, timeout, a 404. Someone who clicked Check now is waiting on
+      // an answer, and "you're up to date" is the wrong one.
+      else if (res.check_failed) out.textContent = " — couldn't reach the update server";
       else out.textContent = " — you're up to date";
     });
 

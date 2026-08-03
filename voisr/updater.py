@@ -15,6 +15,37 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from voisr.paths import app_data_dir
+
+
+def _log(message: str) -> None:
+    """Append a timestamped line to %LOCALAPPDATA%\\Voisr\\logs\\voisr.log.
+
+    print() alone is not enough. build/voisr.spec sets console=False, so in
+    the shipped build sys.stdout is None and CPython turns print() into a
+    silent no-op -- no exception, no output, nowhere. Every failure this
+    module deliberately logs and swallows (an unreachable manifest, a
+    malformed one, a checksum mismatch) would therefore leave no trace at
+    all in exactly the place those failures actually happen. The first field
+    report of "updates don't work" needs one artifact to point at.
+
+    Still prints too: that is what a dev console and the tests read.
+
+    Best-effort by design -- logging must never be the reason an update
+    fails, so an unwritable log directory is swallowed. Growth is not a
+    concern worth rotating for: nothing here logs on the happy path, so a
+    permanently broken channel costs a line a day.
+    """
+    print(f"voisr: {message}", flush=True)
+    try:
+        log_dir = app_data_dir() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_dir / "voisr.log", "a", encoding="utf-8") as f:
+            f.write(f"{stamp} {message}\n")
+    except OSError:
+        pass
+
 
 def parse_version(text) -> tuple[int, ...]:
     """'1.10.0' -> (1, 10, 0). Tolerates a leading 'v'."""
@@ -159,6 +190,12 @@ def fetch_manifest(url: str = MANIFEST_URL, opener=None) -> "Manifest | None":
     None covers every failure a background check can hit -- no releases yet
     (404), offline, timeout, malformed JSON, failed validation. None of those
     is worth interrupting the user for, so they are logged and swallowed.
+
+    Note what that conflation costs: a caller cannot tell "nothing has been
+    published" from "the network is down", so UpdateChecker reports every
+    None as a failed check rather than as "up to date". That is the safe
+    direction -- and once a channel has published anything, a 404 on it is a
+    broken channel, not good news.
     """
     opener = opener or _default_text_opener
     try:
@@ -172,7 +209,7 @@ def fetch_manifest(url: str = MANIFEST_URL, opener=None) -> "Manifest | None":
         # they still propagate -- this only swallows failures, not shutdown.
         # Tag the exception type: a TypeError from a broken custom opener
         # otherwise looks identical in the log to a real network failure.
-        print(f"voisr: update check failed: {type(e).__name__}: {e}", flush=True)
+        _log(f"update check failed: {type(e).__name__}: {e}")
         return None
     try:
         return Manifest.from_json(raw)
@@ -180,7 +217,7 @@ def fetch_manifest(url: str = MANIFEST_URL, opener=None) -> "Manifest | None":
         # ValueError is the only thing from_json can raise, by construction
         # (it rejects non-str/bytes input before any field coercion runs),
         # not merely by the happenstance of what today's opener returns.
-        print(f"voisr: ignoring malformed update manifest: {e}", flush=True)
+        _log(f"ignoring malformed update manifest: {e}")
         return None
 
 
@@ -454,7 +491,7 @@ class UpdateChecker:
         try:
             self.check_now()
         except Exception as e:  # a background check must never kill its thread
-            print(f"voisr: update check crashed: {e}", flush=True)
+            _log(f"update check crashed: {e}")
         self._arm(self.INTERVAL_S)
 
     def stop(self) -> None:
@@ -524,20 +561,33 @@ class UpdateChecker:
             return self.status()
 
         manifest = self._fetch(self._manifest_url)
+        if manifest is None:
+            # The fetch FAILED -- offline, timeout, DNS, a malformed manifest,
+            # a 404. Emphatically not "up to date", which is a wrong answer
+            # rather than a quiet one for someone who just clicked Check now,
+            # and is why this cannot share the branch below. The state has to
+            # survive too, not just the file: demoting a verified, downloaded
+            # update to idle over a momentary blip takes the banner and the
+            # Install button away for up to 24h while the installer sits on
+            # disk unusable.
+            with self._lock:
+                # Only if the check is still ours -- an install() that landed
+                # while we were on the network owns the state now.
+                if self._state == "checking":
+                    self._state = "ready" if self._installer else "idle"
+            return {**self.status(), "check_failed": True}
+
         # Keyword arguments on purpose: both sides are plain version strings,
         # so swapping them would silently invert the test and produce an
         # update that never fires.
-        if manifest is None or not is_newer(remote=manifest.version,
-                                           local=self._current):
-            if manifest is not None:
-                # There is nothing to offer, so nothing on disk is worth
-                # keeping. This is the path a freshly updated app takes on its
-                # first check, and without it the ~155 MB installer that was
-                # just applied would sit in %LOCALAPPDATA% forever. Skipped
-                # when the fetch itself failed (manifest is None): a moment
-                # offline must not throw away a good download and make the
-                # next check re-burn 155 MB.
-                self._prune(keep=None)
+        if not is_newer(remote=manifest.version, local=self._current):
+            # There is nothing to offer, so nothing on disk is worth keeping.
+            # This is the path a freshly updated app takes on its first check,
+            # and without it the ~155 MB installer that was just applied would
+            # sit in %LOCALAPPDATA% forever. Reachable only with a manifest in
+            # hand: a failed fetch returns above precisely so that it can
+            # never trigger this and throw away a good download.
+            self._prune(keep=None)
             self._set("idle")
             return {**self.status(), "up_to_date": True}
 
@@ -564,7 +614,7 @@ class UpdateChecker:
                 if not self._verify(dest, manifest.sha256):
                     # Never execute an installer we cannot vouch for.
                     dest.unlink(missing_ok=True)
-                    print("voisr: update checksum mismatch, discarded", flush=True)
+                    _log("update checksum mismatch, discarded")
                     self._set("idle",
                               error="Update checksum did not match; discarded.")
                     return self.status()
@@ -634,7 +684,7 @@ class UpdateChecker:
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            print(f"voisr: no installer log ({e})", flush=True)
+            _log(f"no installer log ({e})")
             return []
         return [f"/LOG={log_dir / f'install-{int(time.time())}.log'}"]
 

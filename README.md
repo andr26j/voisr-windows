@@ -163,7 +163,7 @@ Neither `build\dist\` nor `build\Output\` is committed — see `.gitignore`.
 
 ## Publishing a release
 
-This script does not exist yet — the process below is the designed shape (Task 9), not something exercised end to end. No real release has been published this way, and `build_release.ps1` itself is currently blocked on a Windows Defender false positive (see Known limitations).
+This has not been run against real GitHub — `scripts\publish_release.ps1` is exercised only against a stubbed `gh`. No real release has been published this way, so treat the first one as a dry run.
 
 1. Bump `__version__` in `voisr/__init__.py`.
 2. Build, with the notes the updater will show in its banner:

@@ -141,6 +141,45 @@ test("Check now reports up to date when nothing is ready", async (t) => {
   assert.match(h["update-result"].textContent, /up to date/);
 });
 
+/* A fetch that failed is not an answer about versions. The spec is explicit
+   that a manual Check now surfaces the reason instead of staying silent,
+   because the user is waiting on one -- and "you're up to date" while the
+   machine is offline is worse than silence, it is wrong. */
+test("Check now reports a failed fetch, never as up to date", async (t) => {
+  const h = mountUpdateSettings(t, {
+    check_for_updates_now: async () => ({
+      state: "idle", current_version: "1.0.0", version: null,
+      notes: null, error: null, enabled: true, check_failed: true,
+    }),
+  });
+  h.V.views.settings.init();
+
+  h["update-check"].dispatch("click");
+  await settle();
+
+  assert.doesNotMatch(h["update-result"].textContent, /up to date/);
+  assert.match(h["update-result"].textContent, /couldn't reach/i);
+});
+
+/* A blip must not hide an update that is already downloaded and verified:
+   the checker keeps state "ready" through a failed fetch, and the ready
+   branch has to win over the check_failed one. */
+test("Check now still offers a ready update when the fetch failed", async (t) => {
+  const h = mountUpdateSettings(t, {
+    check_for_updates_now: async () => ({
+      state: "ready", current_version: "1.0.0", version: "1.1.0",
+      notes: "Adds auto-update.", error: null, enabled: true,
+      check_failed: true,
+    }),
+  });
+  h.V.views.settings.init();
+
+  h["update-check"].dispatch("click");
+  await settle();
+
+  assert.match(h["update-result"].textContent, /1\.1\.0 ready to install/);
+});
+
 test("Check now surfaces an error inline", async (t) => {
   const h = mountUpdateSettings(t, {
     check_for_updates_now: async () => ({ error: "updates unavailable" }),
