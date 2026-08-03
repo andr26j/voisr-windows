@@ -142,6 +142,137 @@ def test_replace_failure_preserves_history_bytes_and_removes_temp_file(tmp_path,
     assert list(tmp_path.glob(".h.jsonl.*.tmp")) == []
 
 
+class _LockedThenReadable:
+    """Stands in for HistoryStore.path: raises the transient Windows lock a
+    set number of times, then reads for real."""
+
+    def __init__(self, real, failures):
+        self._real = real
+        self.remaining = failures
+        self.attempts = 0
+        self.name = real.name
+
+    def read_text(self, encoding=None):
+        self.attempts += 1
+        if self.remaining > 0:
+            self.remaining -= 1
+            raise PermissionError(5, "Access is denied")
+        return self._real.read_text(encoding=encoding)
+
+
+def test_read_retries_a_transiently_locked_file(tmp_path):
+    """Characterization guard for the retry _read has always had, so folding
+    it onto one shared budget with the write path cannot quietly change it."""
+    path = tmp_path / "h.jsonl"
+    store = HistoryStore(path)
+    store.add("committed", 1.0)
+    store.path = _LockedThenReadable(path, failures=3)
+
+    assert [i["text"] for i in store.list()] == ["committed"]
+    assert store.path.attempts == 4
+
+
+def test_read_gives_up_on_a_permanently_locked_file(tmp_path, monkeypatch):
+    path = tmp_path / "h.jsonl"
+    store = HistoryStore(path)
+    store.add("committed", 1.0)
+    store.path = _LockedThenReadable(path, failures=10**6)
+    sleeps = []
+    monkeypatch.setattr(history_module.time, "sleep", sleeps.append)
+
+    with pytest.raises(PermissionError):
+        store.list()
+
+    assert store.path.attempts == 20
+    assert set(sleeps) == {0.01}
+
+
+def test_read_of_a_missing_file_is_empty_and_not_retried(tmp_path, monkeypatch):
+    """FileNotFoundError is not the transient lock -- an absent history is a
+    legitimate empty history and must answer on the first attempt."""
+    store = HistoryStore(tmp_path / "h.jsonl")
+    sleeps = []
+    monkeypatch.setattr(history_module.time, "sleep", sleeps.append)
+
+    assert store.list() == []
+    assert sleeps == []
+
+
+def test_replace_retries_a_transiently_locked_destination(tmp_path, monkeypatch):
+    """Windows Defender and the search indexer briefly hold a file that was
+    just written, which surfaces as PermissionError/WinError 5 from
+    os.replace. That is the identical external, momentary condition _read
+    already retries -- but on the write side it loses the dictation, and
+    history is the only copy when pasting is blocked."""
+    path = tmp_path / "h.jsonl"
+    store = HistoryStore(path)
+    real_replace = history_module.os.replace
+    attempts = 0
+
+    def locked_twice(src, dst, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise PermissionError(5, "Access is denied")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(history_module.os, "replace", locked_twice)
+
+    store.add("survives a locked destination", 1.0)
+
+    assert attempts == 3
+    assert [i["text"] for i in store.list()] == ["survives a locked destination"]
+    assert list(tmp_path.glob(".h.jsonl.*.tmp")) == []
+
+
+def test_replace_retry_budget_matches_the_read_path(tmp_path, monkeypatch):
+    """A destination locked for longer than the budget must still fail loudly
+    and leave the committed history byte-identical -- a retry that gave up
+    silently would be worse than the crash it replaced."""
+    path = tmp_path / "h.jsonl"
+    store = HistoryStore(path)
+    store.add("committed", 1.0)
+    before = path.read_bytes()
+    attempts = 0
+    sleeps = []
+
+    def always_locked(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(history_module.os, "replace", always_locked)
+    monkeypatch.setattr(history_module.time, "sleep", sleeps.append)
+
+    with pytest.raises(PermissionError):
+        store.add("not committed", 1.0)
+
+    assert attempts == 20  # same budget as _read's retry loop
+    assert sleeps and set(sleeps) == {0.01}  # backs off, never spins
+    assert path.read_bytes() == before
+    assert list(tmp_path.glob(".h.jsonl.*.tmp")) == []
+
+
+def test_a_non_permission_replace_failure_is_not_retried(tmp_path, monkeypatch):
+    """Only the transient lock is retried. A genuine OSError (full disk, bad
+    path) is not going to clear by waiting, so it must surface at once."""
+    path = tmp_path / "h.jsonl"
+    store = HistoryStore(path)
+    attempts = 0
+
+    def fail_replace(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(history_module.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        store.add("not committed", 1.0)
+
+    assert attempts == 1
+
+
 def test_pre_replace_fsync_failure_preserves_history_bytes_and_removes_temp_file(
         tmp_path, monkeypatch):
     path = tmp_path / "h.jsonl"

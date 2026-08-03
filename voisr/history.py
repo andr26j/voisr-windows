@@ -16,6 +16,9 @@ safe. None of that exists on Windows:
 - `os.fsync` cannot target a directory handle on Windows, so durability
   relies on fsync-ing the temp file before `os.replace`, which is atomic
   on Windows (`MoveFileEx` + `MOVEFILE_REPLACE_EXISTING`).
+- Windows lets an external scanner (Defender, the search indexer) briefly
+  lock a file that was just written, which has no macOS equivalent. Both
+  the read and the commit wait that out via `_retry_while_locked`.
 """
 
 from __future__ import annotations
@@ -30,6 +33,33 @@ from fractions import Fraction
 from pathlib import Path
 
 from voisr.filelock import FileLock
+
+
+# Windows Defender and the search indexer can hold a history file open for a
+# moment right after it is written, surfacing as PermissionError/WinError 5 on
+# both the read and the commit. It is external and momentary, not corruption,
+# so both paths wait it out on this one shared budget (~200ms) rather than
+# drifting apart -- an unretried commit loses the dictation outright.
+_LOCK_RETRIES = 20
+_LOCK_RETRY_DELAY_S = 0.01
+
+
+def _retry_while_locked(operation):
+    """Return `operation()`, retrying while it raises PermissionError.
+
+    Re-raises the last PermissionError once the budget is spent: a lock that
+    outlasts it is no longer plausibly transient, and failing loudly beats
+    giving up silently. Only PermissionError is retried -- a full disk or a
+    bad path will not clear by waiting and must surface at once.
+    """
+    last_error = None
+    for _ in range(_LOCK_RETRIES):
+        try:
+            return operation()
+        except PermissionError as error:
+            last_error = error
+            time.sleep(_LOCK_RETRY_DELAY_S)
+    raise last_error
 
 
 def _finite_number(value) -> bool:
@@ -83,22 +113,15 @@ class HistoryStore:
 
     def _read(self) -> list[dict]:
         # A file that was just replaced (os.replace onto self.path) can be
-        # transiently locked by Windows Defender / the search indexer
-        # scanning it. That is an external, momentary condition, not
-        # corruption — retry briefly rather than raising out of list().
-        contents = None
-        last_error = None
-        for attempt in range(20):
-            try:
-                contents = self.path.read_text(encoding="utf-8")
-                break
-            except FileNotFoundError:
-                return []
-            except PermissionError as error:
-                last_error = error
-                time.sleep(0.01)
-        else:
-            raise last_error
+        # transiently locked — see _retry_while_locked. An absent history is
+        # not that condition: it is a legitimately empty history, so
+        # FileNotFoundError answers on the first attempt instead of waiting
+        # out a budget that can never help.
+        try:
+            contents = _retry_while_locked(
+                lambda: self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return []
         items = []
         for line in contents.splitlines():
             if not line.strip():
@@ -132,7 +155,12 @@ class HistoryStore:
             os.fsync(fd)
             os.close(fd)
             fd = -1
-            os.replace(temp_path, self.path)
+            # The commit hits the same transient lock the read path waits out
+            # (measured ~1 write in 5 on Windows). Unretried it loses the
+            # dictation outright, and history is the only copy when pasting is
+            # blocked. os.replace itself stays atomic either way, so a retry
+            # can never publish a half-written file.
+            _retry_while_locked(lambda: os.replace(temp_path, self.path))
             temp_path = None
         finally:
             if fd >= 0:
