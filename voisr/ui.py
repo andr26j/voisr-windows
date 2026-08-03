@@ -171,6 +171,38 @@ def present_window(window, user32=None) -> None:
         pass
 
 
+def destroy_windows(window, widget) -> None:
+    """Destroy every pywebview window the app registered, so the WinForms
+    message loop actually ends and the process exits.
+
+    Destroying the dashboard alone was not enough. pywebview's winforms
+    backend only reaches WinForms.Application.Exit() once
+    BrowserView.instances is empty (see BrowserForm.on_close), and main()
+    calls widget.create() before create_window(dashboard), so the pill holds
+    the 'master' uid and kept that dict non-empty. The dashboard vanished and
+    the process stayed alive -- still holding the global right-Ctrl hotkey, so
+    the user could not dictate anywhere until they killed it in Task Manager,
+    and a relaunch produced a second instance.
+
+    Dashboard first, pill last. Both forms live on the same STA GUI thread
+    (the backend creates non-master windows via Invoke onto master's thread),
+    so order does not change correctness -- but it closes the window the user
+    is looking at immediately, and leaves 'master', the form that owns
+    Application.Run(), destroyed last as in the ordinary single-window case.
+
+    Each destroy is guarded independently: a pill that never created, or a
+    dashboard whose backend has already gone, must not strand the other window
+    and leave the loop running. Never raises -- this is the tray's Quit
+    handler and the route a finished install exits by."""
+    for target in (window, widget):
+        if target is None:
+            continue
+        try:
+            target.destroy()
+        except Exception:
+            pass
+
+
 def _system_prefers_dark() -> bool:
     """Read the Windows "app mode" theme preference. Defaults to dark (this
     app's own default appearance) if the value can't be read."""
@@ -419,10 +451,14 @@ class Api:
     SHUTDOWN_DELAY_S = 0.75
     # How long the clean shutdown gets before the hard exit. See
     # _shutdown_soon for why an app still alive by then must not stay up.
-    # Re-check this when task 8 fixes menu_quit to destroy the pill: that
-    # puts pywebview's clear_user_data() inside quit_fn, which does a
-    # process.WaitForExit(3000) plus an rmtree of the WebView2 profile,
-    # leaving under 2s of slack in this budget.
+    # menu_quit now destroys the pill as well as the dashboard, which is what
+    # lets pywebview reach Application.Exit() at all -- and that path runs
+    # clear_user_data(): a process.WaitForExit(3000) plus an rmtree of the
+    # WebView2 profile. The budget still holds. Measured end-to-end against
+    # the real EdgeChromium backend, both windows destroyed, the teardown
+    # takes ~1.7s -- and _shutdown_soon arms this backstop *before* calling
+    # quit_fn, so a slow quit spends slack instead of pushing the deadline
+    # out. Don't shrink this below ~4s without re-measuring that teardown.
     SHUTDOWN_HARD_S = 5.0
 
     def __init__(self, config_path=None,
@@ -1100,17 +1136,18 @@ def main():
             present_window(window)
 
         def menu_quit():
+            # `quitting` first: it is what lets on_closing above stop
+            # cancelling the dashboard's close.
             quitting.set()
-            try:
-                window.destroy()
-            except Exception:
-                pass
+            destroy_windows(window, widget)
 
-        # The one shutdown route: destroying the window ends the message
+        # The one shutdown route: destroying *every* window ends the message
         # loop, and the finally below stops the hotkey listener and releases
-        # the tray icon. Handed to Api so a finished install exits the same
-        # way -- a half-shutdown would keep handles open under {app} and the
-        # installer could not replace our files.
+        # the tray icon. The pill counts -- see destroy_windows for why
+        # leaving it alive left a zombie holding the global hotkey. Handed to
+        # Api so a finished install exits the same way -- a half-shutdown
+        # would keep handles open under {app} and the installer could not
+        # replace our files.
         api.attach_quit(menu_quit)
 
         status = StatusItem(

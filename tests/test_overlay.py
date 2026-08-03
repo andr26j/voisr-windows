@@ -5,9 +5,13 @@ from voisr.overlay import RecordingWidget, sanitize_pill_color, sanitize_pill_th
 class FakeWindow:
     def __init__(self):
         self.evaluated = []
+        self.destroyed = 0
 
     def evaluate_js(self, script):
         self.evaluated.append(script)
+
+    def destroy(self):
+        self.destroyed += 1
 
 
 def widget_with_window():
@@ -130,3 +134,50 @@ def test_evaluate_js_failure_never_propagates():
     widget._window = Exploding()
     widget._shown = True
     widget.show_recording()  # cosmetic failure must never break dictation
+
+
+def test_destroy_destroys_the_underlying_window():
+    """The pill is a real pywebview window and holds pywebview's 'master' uid
+    (voisr.ui.main creates it first). The winforms backend only calls
+    Application.Exit() once every BrowserView instance is gone, so without
+    this the process outlives the tray's Quit."""
+    widget = widget_with_window()
+    window = widget._window
+    widget.destroy()
+    assert window.destroyed == 1
+
+
+def test_destroy_before_create_is_a_no_op():
+    """create() swallows its own failures, so the pill may never exist. Quit
+    must not raise on the way out."""
+    RecordingWidget().destroy()
+
+
+def test_destroy_survives_a_failing_backend():
+    class Exploding:
+        def destroy(self):
+            raise RuntimeError("backend gone")
+
+    widget = RecordingWidget()
+    widget._window = Exploding()
+    widget.destroy()  # must not raise -- it runs on the tray's Quit path
+
+
+def test_destroy_stops_the_guards_touching_a_dead_hwnd():
+    """Both guard threads poll self._hwnd forever at 30ms. Once the window is
+    destroyed that handle is dead and may be recycled by another process, so
+    destroy() clears it rather than leaving the guards calling ShowWindow and
+    SetForegroundWindow on whatever inherits the number."""
+    widget = widget_with_window()
+    widget._hwnd = 1234
+    widget.destroy()
+    assert widget._hwnd is None
+    assert widget._shown is False
+
+
+def test_destroy_is_idempotent():
+    widget = widget_with_window()
+    window = widget._window
+    widget.destroy()
+    widget.destroy()
+    assert window.destroyed == 1

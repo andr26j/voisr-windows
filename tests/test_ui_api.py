@@ -1013,3 +1013,69 @@ def test_close_releases_the_status_item(tmp_path):
     api.attach_status_item(status)
     api.close()
     assert status.states == ["released"]
+
+
+class FakeDestroyable:
+    """A pywebview window or the pill, recording destroys onto a shared log so
+    a test can assert the order the two are torn down in."""
+
+    def __init__(self, name, log, error=None):
+        self.name = name
+        self._log = log
+        self._error = error
+
+    def destroy(self):
+        self._log.append(self.name)
+        if self._error is not None:
+            raise self._error
+
+
+def test_destroy_windows_destroys_the_dashboard_and_the_pill():
+    """pywebview's winforms backend only calls WinForms.Application.Exit()
+    once BrowserView.instances is empty, and main() creates the pill first so
+    it holds the 'master' uid. Destroying the dashboard alone left the process
+    alive with right-Ctrl still globally captured: the window vanished, the
+    PID answered 25s later, and a relaunch produced a second instance."""
+    from voisr import ui as ui_module
+
+    log = []
+    ui_module.destroy_windows(FakeDestroyable("dashboard", log),
+                              FakeDestroyable("pill", log))
+    # Dashboard first: the visible window goes at once, and 'master' -- the
+    # form owning Application.Run() -- is destroyed last, as in the ordinary
+    # single-window case.
+    assert log == ["dashboard", "pill"]
+
+
+def test_destroy_windows_destroys_the_pill_even_when_the_dashboard_raises():
+    """The exact failure that would recreate the zombie: one raising destroy
+    must not strand the other window and keep the message loop alive."""
+    from voisr import ui as ui_module
+
+    log = []
+    ui_module.destroy_windows(
+        FakeDestroyable("dashboard", log, error=RuntimeError("backend gone")),
+        FakeDestroyable("pill", log))
+    assert log == ["dashboard", "pill"]
+
+
+def test_destroy_windows_never_raises_out_of_the_quit_handler():
+    """menu_quit runs on the tray thread and is also the route a finished
+    install exits by, so it must not propagate a backend failure."""
+    from voisr import ui as ui_module
+
+    log = []
+    ui_module.destroy_windows(
+        FakeDestroyable("dashboard", log, error=RuntimeError("dashboard")),
+        FakeDestroyable("pill", log, error=RuntimeError("pill")))
+    assert log == ["dashboard", "pill"]
+
+
+def test_destroy_windows_survives_a_pill_that_never_got_created():
+    """RecordingWidget.create() swallows its own failures, so the pill can be
+    absent; the dashboard must still be destroyed."""
+    from voisr import ui as ui_module
+
+    log = []
+    ui_module.destroy_windows(FakeDestroyable("dashboard", log), None)
+    assert log == ["dashboard"]

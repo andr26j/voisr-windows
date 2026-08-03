@@ -242,6 +242,34 @@ class RecordingWidget:
         except Exception:
             pass
 
+    def destroy(self) -> None:
+        """Tear down the pill's pywebview window.
+
+        Not cosmetic bookkeeping. voisr.ui.main() creates this window before
+        the dashboard, so it holds pywebview's 'master' uid, and the winforms
+        backend only reaches WinForms.Application.Exit() once
+        BrowserView.instances is empty (see its BrowserForm.on_close). While
+        the pill survived, the tray's Quit destroyed the dashboard and left
+        the process running with the global right-Ctrl hotkey still captured
+        -- so the user could not dictate anywhere until they killed it in Task
+        Manager, and a relaunch produced a second instance.
+
+        _hwnd is cleared before the destroy so neither guard thread (both poll
+        it every 30ms for the life of the process) can act on a handle that is
+        being torn down, or on a recycled one afterwards.
+
+        Idempotent, and any failure is swallowed: this runs on the tray's Quit
+        path, where a raise would strand the shutdown it is part of."""
+        window, self._window = self._window, None
+        self._hwnd = None
+        self._shown = False
+        if window is None:
+            return
+        try:
+            window.destroy()
+        except Exception:
+            pass
+
     def _apply(self, state: str, theme: str | None, color: str | None) -> None:
         if self._window is None:
             return
