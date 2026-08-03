@@ -606,6 +606,38 @@ class UpdateChecker:
                     pass  # a locked leftover is not worth failing the update
 
     # -- applying -------------------------------------------------------
+    def _log_flag(self) -> list:
+        """`["/LOG=<path>"]`, or `[]` if the directory cannot be made.
+
+        The counterpart to /SUPPRESSMSGBOXES, and the only reason a failed
+        silent install is diagnosable at all. Trace it without one: Setup
+        fails a couple of seconds in -- PrepareToInstall cannot reach the
+        network for the WebView2 bootstrapper, say, or Restart Manager finds a
+        holder it cannot close -- /SUPPRESSMSGBOXES auto-answers the dialog,
+        Setup exits non-zero, and its [Run] relaunch entry never fires.
+        Nothing here notices: _default_spawn is DETACHED_PROCESS and never
+        waits, and "installing" is terminal. The app then exits on schedule
+        and the user watches Voisr vanish and not come back, with no dialog,
+        no notification and nothing written down. On the next launch the
+        checker finds the same update and offers it again -- an invisible
+        loop. Inno's log records the exact Restart Manager failure and the
+        text of every box /SUPPRESSMSGBOXES swallowed, which is the difference
+        between a diagnosable first field failure and an unfalsifiable one.
+
+        Deliberately beside the app data, never under {app}: the installer is
+        in the middle of replacing that tree. And deliberately omitted rather
+        than guessed at if the directory cannot be created -- Inno aborts
+        Setup outright when it cannot open the log file it was handed, so a
+        broken path here would turn "no log" into "no update".
+        """
+        log_dir = self._dir.parent / "logs"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"voisr: no installer log ({e})", flush=True)
+            return []
+        return [f"/LOG={log_dir / f'install-{int(time.time())}.log'}"]
+
     def install(self) -> dict:
         # Check and claim in one acquisition. Spawning first and recording
         # "installing" afterwards leaves a window in which a second install()
@@ -631,7 +663,7 @@ class UpdateChecker:
             # defaults to Cancel and exits 1 in under two seconds, and the
             # update simply retries next cycle.
             self._spawn([str(installer), "/SILENT", "/SUPPRESSMSGBOXES",
-                         "/NORESTART", "/RELAUNCH=1"])
+                         "/NORESTART", "/RELAUNCH=1", *self._log_flag()])
         except Exception as e:
             with self._lock:
                 # Only hand the state back if it is still ours to hand back.

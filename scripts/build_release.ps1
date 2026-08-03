@@ -7,6 +7,17 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $buildDir = Join-Path $root "build"
 
+# Checked here, in the first second, rather than where it is used at the very
+# bottom: the build takes 3-6 minutes, and latest.json with empty notes is a
+# manifest both publish_release.ps1 and the client's Manifest.from_json reject.
+# Finding that out after the build is six wasted minutes and another six to
+# redo it. This script exists to produce a publishable release, so a run that
+# cannot produce one should not start. For a throwaway smoke build, set the
+# variable to anything.
+if ([string]::IsNullOrWhiteSpace($env:VOISR_RELEASE_NOTES)) {
+    throw 'VOISR_RELEASE_NOTES is not set. latest.json would carry empty notes, which the updater rejects. Set it first, e.g. $env:VOISR_RELEASE_NOTES = "Adds auto-update."'
+}
+
 # Single source of truth: voisr/__init__.py. Passed to ISCC below so the
 # installer's version can never drift from the app's.
 $versionLine = Select-String -Path (Join-Path $root "voisr\__init__.py") -Pattern '^__version__\s*=\s*"([^"]+)"'
@@ -87,7 +98,9 @@ if (-not (Test-Path $installer)) { throw "Installer missing: $installer" }
 
 $sha = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
 $manifestPath = Join-Path $buildDir "Output\latest.json"
-$manifestJson = @{
+# [ordered] only so the file diffs readably between releases -- a plain @{} is
+# a hashtable and would emit the keys in an arbitrary order. No parser cares.
+$manifestJson = [ordered]@{
     version = $appVersion
     url     = "https://github.com/andr26j/voisr-releases/releases/download/v$appVersion/VoisrSetup.exe"
     sha256  = $sha
@@ -107,6 +120,3 @@ $sizeMb = [math]::Round((Get-Item $installer).Length / 1MB, 1)
 Write-Host "==> Done: $installer ($sizeMb MB)"
 Write-Host "    sha256:   $sha"
 Write-Host "    manifest: $manifestPath"
-if (-not $env:VOISR_RELEASE_NOTES) {
-    Write-Warning "VOISR_RELEASE_NOTES was not set, so latest.json has empty notes. The updater rejects a manifest with an empty field -- set it and rebuild before publishing."
-}

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -500,9 +501,39 @@ def test_install_spawns_the_installer_silently_and_relaunches(tmp_path):
     # click it once the app has exited. /NORESTART keeps Setup from rebooting
     # the machine. /RELAUNCH=1 is required because the installer's [Run]
     # entry is skipifsilent, so without it a silent update leaves Voisr
-    # closed.
-    assert argv[1:] == ["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
-                        "/RELAUNCH=1"]
+    # closed. /LOG is what makes a failure of any of the above visible at all:
+    # the spawn is detached and never waited on, so a Setup that dies after
+    # /SUPPRESSMSGBOXES auto-answers its dialog takes the app down with it and
+    # leaves no other trace. Asserted by prefix because the name carries a
+    # timestamp.
+    assert argv[1:5] == ["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+                         "/RELAUNCH=1"]
+    assert len(argv) == 6, argv
+    assert argv[5].startswith("/LOG=")
+    log_path = Path(argv[5][len("/LOG="):])
+    # Beside the app data, not under {app} -- the tree Setup is replacing.
+    assert log_path.parent == tmp_path.parent / "logs"
+    assert log_path.parent.is_dir()
+    assert log_path.name.startswith("install-")
+    assert log_path.suffix == ".log"
+
+
+def test_an_unmakeable_log_directory_drops_the_flag_rather_than_the_install(
+        tmp_path, monkeypatch):
+    # Inno aborts Setup outright when it cannot open the log file it was
+    # handed, so handing it a path we already know is unusable would turn
+    # "no log" into "no update at all". Omit the flag and install anyway.
+    spawned = []
+    checker, _ = _checker(tmp_path, spawned=spawned)
+    checker.check_now()
+
+    def no_mkdir(self, *a, **k):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(Path, "mkdir", no_mkdir)
+    assert checker.install()["ok"] is True
+    assert spawned[0][1:] == ["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+                              "/RELAUNCH=1"]
 
 
 def test_install_before_an_update_is_ready_is_refused(tmp_path):

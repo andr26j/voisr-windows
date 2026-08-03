@@ -1,12 +1,15 @@
 # Publishes build\Output\VoisrSetup.exe + latest.json as a GitHub release on
 # the public release channel. Run scripts\build_release.ps1 first.
 #
-# The release is created as a DRAFT with both assets attached and published
-# only once they are both up. A draft is invisible to
-# releases/latest/download/..., so there is never a moment at which installed
-# copies can see a release whose manifest or installer is missing -- including
-# when a run dies half way, which leaves an invisible draft rather than a
-# published release that 404s at every client until someone notices.
+# The release is created as a DRAFT with both assets attached and published in
+# a second step. `gh release create` with assets already does this internally
+# (its --help: "separate API calls are made to create the release as a draft,
+# upload the assets, and then publish the release"), so splitting it is not
+# what buys the atomicity -- gh gives us that either way. What splitting buys
+# is the failure message: if publishing the finished draft is the step that
+# fails, this script can say so precisely, and a draft is invisible to
+# releases/latest/download/... so installed copies see nothing at all rather
+# than a release whose manifest 404s until someone notices.
 param(
     [string]$Repo = "andr26j/voisr-releases"
 )
@@ -24,7 +27,16 @@ foreach ($f in @($installer, $manifest)) {
     if (-not (Test-Path $f)) { throw "$f missing -- run scripts\build_release.ps1 first" }
 }
 
-$data = Get-Content $manifest -Raw | ConvertFrom-Json
+# ReadAllText, not `Get-Content -Raw`. build_release.ps1 writes this file as
+# BOM-free UTF-8, and with no BOM to sniff, Get-Content on PowerShell 5.1
+# decodes it using the ANSI codepage (Windows-1252 here) -- so notes reading
+# "-- cafe" with an em-dash and an acute e come back as mojibake, get
+# re-encoded as perfectly valid UTF-8 into the notes file below, and reach
+# GitHub as permanent garbage in the release body. The client fetches
+# latest.json over HTTP and decodes it itself, so the in-app notes stay
+# correct and the two would visibly disagree. ReadAllText defaults to UTF-8
+# and is symmetric with the WriteAllText that produced the file.
+$data = [System.IO.File]::ReadAllText($manifest) | ConvertFrom-Json
 if (-not $data.notes) { throw "latest.json has empty notes; the updater rejects that manifest. Set VOISR_RELEASE_NOTES and rebuild." }
 $tag = "v$($data.version)"
 
@@ -81,7 +93,12 @@ if ($viewOut -notmatch 'release not found') {
 # ending in a backslash is mangled the same way (it becomes a quote). Newlines,
 # `$`, backticks and apostrophes all survive direct passing, but quotes are the
 # likeliest thing a human writes, so route every note through a file.
-$notesFile = Join-Path ([System.IO.Path]::GetTempPath()) "voisr-notes-$([guid]::NewGuid()).md"
+# Under build\Output rather than %TEMP%: the `finally` below removes it, but a
+# Ctrl+C part way through a 155 MB upload skips that, and a stray file sitting
+# with the other build artifacts under a fixed name that every run overwrites
+# is better than one accumulating per-run in the user's temp directory. Not an
+# asset -- gh only uploads the two files named on the create line.
+$notesFile = Join-Path $outDir "release-notes.md"
 [System.IO.File]::WriteAllText(
     $notesFile, [string]$data.notes, (New-Object System.Text.UTF8Encoding($false)))
 
@@ -90,8 +107,15 @@ try {
     gh release create $tag $installer $manifest --repo $Repo --title $tag --notes-file $notesFile --draft
     if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit $LASTEXITCODE)" }
 
+    # --latest is not redundant. Without it GitHub picks the Latest release
+    # itself, "based on date and version" -- and every tag this script creates
+    # points at the same single commit on voisr-releases' main, so the date
+    # component is constant and the choice rests entirely on semver comparison
+    # of the tags. releases/latest/download/latest.json is the one URL every
+    # installed copy polls; state which release it resolves to rather than
+    # inferring it.
     Write-Host "==> Publishing $tag"
-    gh release edit $tag --repo $Repo --draft=false
+    gh release edit $tag --repo $Repo --draft=false --latest
     if ($LASTEXITCODE -ne 0) {
         throw "gh release edit --draft=false failed (exit $LASTEXITCODE). The draft $tag exists with both assets but is not published; publish or delete it before re-running."
     }
