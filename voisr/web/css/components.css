@@ -401,3 +401,56 @@
 @media (prefers-reduced-motion: reduce) {
   .palette-scrim, .palette { animation: none; }
 }
+
+/* ---------- Update banner (Home) ---------- */
+
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  padding: var(--s3) var(--s4);
+  margin-bottom: var(--s5);
+}
+/* Author `display: flex` above beats the UA stylesheet's `[hidden] { display:
+   none }` at equal specificity (author wins ties), so the banner would stay
+   visible even while `hidden` is true without this override -- same fix as
+   .palette-scrim[hidden] and .toast[hidden]. */
+.update-banner[hidden] { display: none; }
+
+#update-banner-text {
+  flex: 1;
+  min-width: 0;
+  color: var(--accent-text);
+  font-weight: var(--weight-semi);
+  /* `notes` is an arbitrary string off a downloaded manifest (bounded only by
+     the 8KB whole-manifest cap), so it is clamped rather than left free to
+     push the rest of Home down the page for one long release note. */
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+/* Mirrors .icon-btn's hover convention (background var(--surface-3), color
+   var(--ink)) rather than inventing a new pairing -- a neutral hover reads
+   clearly on top of the banner's own accent-soft tint, the same way it
+   already does on top of item-row's plain surface. */
+.btn-ghost {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  color: var(--accent-text);
+  font-size: var(--text-lg);
+  line-height: 1;
+  transition: background var(--fast) var(--ease), color var(--fast) var(--ease);
+}
+
+.btn-ghost:hover { background: var(--surface-3); color: var(--ink); }

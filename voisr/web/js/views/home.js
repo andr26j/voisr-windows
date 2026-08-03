@@ -102,26 +102,167 @@ window.Voisr = window.Voisr || {};
     }).join(" ");
   }
 
-  /* Home is four independent panels (greeting, permissions, hero shortcut,
-     stats + recent list), so a failure in one degrades that panel only and
-     the rest still render — `stats.total_words` on a failed get_stats used
-     to throw and take the whole pane down with it, leaving a blank screen
-     and no message. Each section is guarded on its own null; the try/catch
-     is the backstop for anything that still manages to throw. */
+  /* ---------- update banner ----------
+
+     Home's persistent indicator for a ready update -- Settings has its own
+     app-version row and Check-now button (Task 10), but a banner here is what
+     a user who never opens Settings actually sees.
+
+     Session-scoped, and tracked by version rather than as a flat yes/no: a
+     dismissed banner stays down for the rest of this session for the release
+     it was dismissed for, but a *newer* one (Check-now finds 1.2.0 after the
+     user dismissed 1.1.0) is exactly when they should be re-prompted, so it
+     is not suppressed by the earlier dismissal. */
+  let dismissedVersion = null;
+  // Whatever version the banner is currently offering (or last offered), so
+  // dismissUpdateBanner() -- which has no status object of its own -- knows
+  // which version it is dismissing.
+  let lastReadyVersion = null;
+
+  /* Bound once both controls are actually found and wired -- unlike
+     settings.js's wheelDrawn (which sets its flag first, before the work,
+     since drawColorWheel/initColorWheel cannot themselves fail), binding here
+     only claims success after both elements exist, so a render that finds
+     one missing simply retries on the next one rather than being stuck
+     unbound for the rest of the session. Not reachable today (index.html
+     always renders both together), but cheap insurance against ever adding a
+     render path where the banner exists before its own buttons do.
+
+     Deferred to here rather than done at module-parse time (the convention
+     this file otherwise uses for the focus listener above): several tests
+     load this file standalone without ever registering #update-install or
+     #update-dismiss, and a bare `document.getElementById(...).addEventListener`
+     at parse time would throw on all of them before any test got a chance to
+     set anything up. */
+  let updateControlsBound = false;
+
+  function bindUpdateControls() {
+    if (updateControlsBound) return;
+    const installBtn = document.getElementById("update-install");
+    const dismissBtn = document.getElementById("update-dismiss");
+    if (!installBtn || !dismissBtn) return;
+    updateControlsBound = true;
+
+    installBtn.addEventListener("click", async () => {
+      // Same overlap guard as main.js's #hotkey-capture and settings.js's
+      // Check-now: without it, a second click while the first install is
+      // still in flight could fire a second install_update(). The Python
+      // side refuses a second call once installing (compare-and-set, a
+      // terminal state), so this is not catastrophic -- but skipping the
+      // guard would still let the user see a confusing second toast while
+      // the app is in the middle of shutting down.
+      if (installBtn.disabled) return;
+      installBtn.disabled = true;
+
+      const textEl = document.getElementById("update-banner-text");
+      const priorText = textEl ? textEl.textContent : "";
+      // The banner's own text is the channel of record for this message, not
+      // the toast below. V.ui.toast() can be silently swallowed: if an Undo
+      // toast is already live -- and Home's own recent-list delete buttons
+      // sit right below this banner, so that is one click away -- ui.js's
+      // toastActionLive gate just queues this message for up to 5s instead
+      // of showing it. A successful install kills the process well inside
+      // that window, so the queued message would never be shown; the user
+      // would watch Voisr vanish with a stale "Dictation deleted / Undo"
+      // still on screen and no explanation. The banner has no such queue.
+      if (textEl) textEl.textContent = "Installing update — Voisr will restart";
+      // Emitted BEFORE the call, and that ordering must survive any future
+      // tidy-up. A successful install_update() kills the app roughly 0.75s
+      // later via Application.Exit(), and pywebview's evaluate_js blocks on
+      // a semaphore that destroy_window never releases -- so if Exit() wins
+      // that race, this await's promise never settles and anything written
+      // after it would simply never run.
+      V.ui.toast("Installing update — Voisr will restart");
+      // Routed through V.ui.tryApi, unlike settings.js's Check-now:
+      // install_update() only ever answers success ({ok, version}) or
+      // failure ({error}), so there is nothing tryApi's null-on-error
+      // collapses away that this handler still needs -- unlike Check-now,
+      // which has to tell "ready" apart from "already checking" from the
+      // very same response.
+      if (!await V.ui.tryApi(V.api().install_update(), "Install update")) {
+        installBtn.disabled = false;
+        if (textEl) textEl.textContent = priorText;
+        return;
+      }
+      // Success: the app is about to exit. Leave the button disabled and the
+      // banner reading "Installing…" -- re-enabling the button, or reverting
+      // the text, would only invite a pointless second click during shutdown.
+    });
+
+    dismissBtn.addEventListener("click", dismissUpdateBanner);
+  }
+
+  async function renderUpdateBanner() {
+    const banner = document.getElementById("update-banner");
+    if (!banner) return;
+    bindUpdateControls();
+    let status;
+    try {
+      status = await V.api().get_update_status();
+    } catch {
+      // A background concern must never take the dashboard down with it.
+      banner.hidden = true;
+      return;
+    }
+    // Render from `state`, never `version` alone: the updater never clears
+    // its manifest, so `version` can still name a withdrawn release.
+    if (!status || status.state !== "ready" || !status.version) {
+      banner.hidden = true;
+      return;
+    }
+    lastReadyVersion = status.version;
+    if (status.version === dismissedVersion) {
+      banner.hidden = true;
+      return;
+    }
+    // Reveal before writing the text: #update-banner is aria-live="polite",
+    // and a live region that is still hidden when its content changes is not
+    // reliably announced once it is unhidden -- the mutation has to happen
+    // while the region is already visible/attached.
+    banner.hidden = false;
+    const notes = status.notes ? ` — ${status.notes}` : "";
+    const msg = `Version ${status.version} is ready${notes}`;
+    const textEl = document.getElementById("update-banner-text");
+    // render() calls this on every Home render -- view switches, each new
+    // dictation, after recording, after a delete -- so with an undismissed
+    // update sitting there, a naive unconditional write would mutate this
+    // live region's text on every single one of those, even when the
+    // message never actually changed. A screen reader would re-announce
+    // "Version 1.1.0 is ready…" after every dictation. Only write when the
+    // text is actually different.
+    if (textEl.textContent !== msg) textEl.textContent = msg;
+  }
+
+  function dismissUpdateBanner() {
+    dismissedVersion = lastReadyVersion;
+    const banner = document.getElementById("update-banner");
+    if (banner) banner.hidden = true;
+  }
+
+  /* Home is five independent panels (greeting, permissions, hero shortcut,
+     stats + recent list, update banner), so a failure in one degrades that
+     panel only and the rest still render — `stats.total_words` on a failed
+     get_stats used to throw and take the whole pane down with it, leaving a
+     blank screen and no message. Each section is guarded on its own null;
+     the try/catch is the backstop for anything that still manages to throw. */
   async function render() {
     const $ = V.ui.$;
     try {
       $("#greeting").textContent = greeting();
-      // All four run concurrently, and all four are awaited together so a
+      // All five run concurrently, and all five are awaited together so a
       // throw in any of them lands in the catch below. renderPermissions and
       // renderHero used to be fired bare, which both hid their failures and
       // left a rejection nobody was listening for; joining them to this
       // Promise.all attaches the handler in the same tick they start.
+      // renderUpdateBanner already has its own try/catch (a background
+      // concern must never take the dashboard down with it) -- joining it
+      // here is only the backstop for anything that still manages to throw.
       const [stats, history] = await Promise.all([
         V.ui.tryApi(V.api().get_stats(), "Load stats"),
         V.ui.tryApi(V.api().get_history(), "Load history"),
         renderPermissions(),
         renderHero(),
+        renderUpdateBanner(),
       ]);
 
       if (stats) {
@@ -190,5 +331,8 @@ window.Voisr = window.Voisr || {};
   }
 
   V.views = V.views || {};
-  V.views.home = { render, toggleRecord, renderPermissions, sparklinePath };
+  V.views.home = {
+    render, toggleRecord, renderPermissions, sparklinePath,
+    renderUpdateBanner, dismissUpdateBanner,
+  };
 })(window.Voisr);

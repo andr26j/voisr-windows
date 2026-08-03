@@ -16,7 +16,11 @@
   #define SourceDir "dist\Voisr"
 #endif
 #define MyAppName "Voisr"
-#define MyAppVersion "1.0.0"
+; Version comes from voisr/__init__.py via scripts\build_release.ps1
+; (/DMyAppVersion=...). The fallback only applies to a manual ISCC run.
+#ifndef MyAppVersion
+  #define MyAppVersion "0.0.0"
+#endif
 #define MyAppPublisher "Voisr"
 #define MyAppExeName "Voisr.exe"
 #define MyAppId "Voisr.Voisr"
@@ -43,6 +47,35 @@ SolidCompression=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
+; A silent update spawns this installer while Voisr is still exiting. Restart
+; Manager closes anything still holding files under {app}; it works unelevated
+; and acts without prompting under /SILENT.
+;
+; force, not yes. Plain `yes` asks via WM_CLOSE, and Voisr answers it by
+; closing its window while the process lives on -- tray Quit has the same bug
+; (the pill window holds pywebview's master uid, so Application.Exit() never
+; fires; tracked separately). RM then reports "Some applications could not be
+; shut down" and Setup stops on an Abort/Retry/Ignore box that /SILENT does
+; NOT suppress, so an unattended update hangs forever on an invisible dialog.
+; Measured: Setup probes for holders ~2.4s in, but ui.py's os._exit(0)
+; backstop does not fire until ~5.75s (SHUTDOWN_DELAY_S + SHUTDOWN_HARD_S), so
+; the app is always still there when RM looks. force uses RmForceShutdown and
+; terminates it instead -- verified to complete and relaunch.
+;
+; The cost is that Voisr is killed rather than asked. That is the same trade
+; os._exit(0) already makes: history.jsonl commits via os.replace so it is
+; atomic, but config.json is written with Path.write_text, whose truncate
+; window a kill can land in. Not a new risk, but it is now reachable from the
+; installer side too.
+CloseApplications=force
+CloseApplicationsFilter=*.exe,*.dll
+RestartApplications=no
+; Refuse to run two copies of Setup at once. Without this, two concurrent
+; silent installs can write into {app} simultaneously and corrupt the install.
+; UpdateChecker.install() is guarded against double-spawning, but that guard
+; is per-process: an installed copy and a dev copy share %LOCALAPPDATA%\Voisr
+; (see the README), so the mutex is the only cross-process protection.
+SetupMutex=VoisrSetupMutex
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -70,6 +103,10 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+; The entry above is skipifsilent, so a silent update would finish with Voisr
+; closed. voisr/updater.py passes /RELAUNCH=1 to ask for a restart, and only
+; then does this second entry fire.
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait; Check: IsRelaunchRequested
 
 ; Uninstall must remove only the program directory and the Run value --
 ; {app} is {localappdata}\Programs\Voisr, never {localappdata}\Voisr (the
@@ -81,6 +118,13 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: no
 const
   WebView2ClientGuid = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
   WebView2DownloadUrl = 'https://go.microsoft.com/fwlink/p/?LinkId=2124703';
+
+// True only when started with /RELAUNCH=1, which voisr/updater.py passes for
+// an unattended update. Absent for a normal interactive install.
+function IsRelaunchRequested(): Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
 
 function WebView2RuntimeInstalled(): Boolean;
 var

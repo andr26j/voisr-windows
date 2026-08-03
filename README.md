@@ -93,13 +93,27 @@ The dashboard (Start Menu → Voisr, or the Desktop shortcut) launches to a syst
   "pill_theme": "classic",
   "pill_color": null,
   "launch_at_login": false,
-  "appearance": "system"
+  "appearance": "system",
+  "check_for_updates": true
 }
 ```
 
 Add a dictionary entry for **every variant the ASR produces** for a term — dictate the word once, see what comes out, and map it.
 
 **Why right Ctrl, not right Alt (Wispr Flow / the macOS build's default):** right Alt is AltGr on many keyboard layouts, and AltGr + V can produce a different character than plain V on those layouts, which corrupts an injected Ctrl+V paste. Right Ctrl avoids that.
+
+### Updating
+
+Voisr checks for a new release 10 seconds after launch and every 24 hours,
+downloads it in the background, and shows an **Install** banner on the
+dashboard. Nothing installs until you click it, and the update needs no admin
+rights. Turn checking off in Settings → Privacy & data, where **Check now**
+also works on demand.
+
+This version check is the only network call Voisr makes. It sends no audio, no
+text, and nothing identifying — it fetches a small JSON file describing the
+latest release. Downloads are verified against a published SHA256 before
+anything is executed.
 
 ## Uninstall
 
@@ -115,6 +129,7 @@ Removes the shortcuts, the launch-at-login registry entry, and `%LOCALAPPDATA%\V
 - **No Mica/acrylic backdrop on Windows 10** — the dashboard falls back to a flat background there. (Windows 11 gets the translucent effect.)
 - **English-only by default** (`ggml-base.en`). Swap in a multilingual `ggml-*.bin` in `models\` and update `voisr\transcriber.py` if you need another language.
 - **No GPU acceleration.** Transcription is CPU-only on every install; see [Download](#download) for the measured timing.
+- **Windows Defender false positive.** Signature 1.455.474.0 (2 Aug 2026) flags Inno Setup-built executables as `Trojan:Win32/Wacatac.C!ml` — it fired even on a minimal probe installer, not just Voisr's ~155 MB payload. Employees downloading `VoisrSetup.exe` may see it quarantined outright, not merely warned about (compare the SmartScreen warning above, which the user can click through). Code signing (see "Possible future work") would likely resolve this along with the SmartScreen warning.
 
 ## Development
 
@@ -146,8 +161,29 @@ Neither `build\dist\` nor `build\Output\` is committed — see `.gitignore`.
 
 **Code signing:** not done yet (no certificate). `scripts\build_release.ps1` has a commented-out `signtool` block right after the Inno Setup step — filling in a certificate path and re-enabling it is the only change needed once one is available.
 
+## Publishing a release
+
+This has not been run against real GitHub — `scripts\publish_release.ps1` is exercised only against a stubbed `gh`. No real release has been published this way, so treat the first one as a dry run.
+
+1. Bump `__version__` in `voisr/__init__.py`.
+2. Build, with the notes the updater will show in its banner:
+
+```powershell
+$env:VOISR_RELEASE_NOTES = "What changed, in one line."
+powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
+```
+
+3. Publish to the public release channel:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\publish_release.ps1
+```
+
+Releases live in [andr26j/voisr-releases](https://github.com/andr26j/voisr-releases) — public so installed copies can fetch updates without a token, while this source repo stays private. It holds only `VoisrSetup.exe` and `latest.json`.
+
+`publish_release.ps1` refuses to publish if the tag exists, if `notes` is empty, or if the installer's SHA256 disagrees with `latest.json`. Installed copies verify that hash before running anything, so a mismatch means every client rejects the update.
+
 ## Possible future work
 
-- **Code signing**, once a certificate exists (see above) — removes the SmartScreen warning.
-- **Auto-update.** Employees currently reinstall manually.
+- **Code signing**, once a certificate exists (see above) — removes the SmartScreen warning. Would also let auto-update verify a signature instead of relying only on the published SHA256; see the Defender false positive under Known limitations, which the same certificate would likely resolve.
 - **MSI/Intune packaging**, if the company needs managed deployment instead of a manually-run installer.

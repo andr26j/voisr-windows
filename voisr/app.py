@@ -33,6 +33,7 @@ DEFAULT_CONFIG = {
     "pill_color": None,
     "launch_at_login": False,
     "appearance": "system",
+    "check_for_updates": True,
 }
 
 

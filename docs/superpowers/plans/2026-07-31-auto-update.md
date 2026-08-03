@@ -879,19 +879,27 @@ class UpdateChecker:
             self._manifest = manifest
         dest = self._dir / f"VoisrSetup-{manifest.version}.exe"
 
-        if not dest.is_file() or not self._verify(dest, manifest.sha256):
-            dest.unlink(missing_ok=True)
-            try:
-                self._download(manifest.url, dest)
-            except Exception as e:
-                self._set("idle", error=f"Download failed: {e}")
-                return self.status()
-            if not self._verify(dest, manifest.sha256):
-                # Never execute an installer we cannot vouch for.
+        # Both _verify calls must sit inside this try. verify_sha256 opens the
+        # file, so it raises OSError on a missing or locked one -- and an
+        # OSError escaping here would leave the state machine stuck at
+        # "downloading" with error=None until the next 24h tick, with the
+        # mismatch branch below never running. A file we cannot hash is
+        # unverified, which is not the same as a mismatch: only a real
+        # mismatch should delete the file and log loudly.
+        try:
+            if not dest.is_file() or not self._verify(dest, manifest.sha256):
                 dest.unlink(missing_ok=True)
-                print("voisr: update checksum mismatch, discarded", flush=True)
-                self._set("idle", error="Update checksum did not match; discarded.")
-                return self.status()
+                self._download(manifest.url, dest)
+                if not self._verify(dest, manifest.sha256):
+                    # Never execute an installer we cannot vouch for.
+                    dest.unlink(missing_ok=True)
+                    print("voisr: update checksum mismatch, discarded", flush=True)
+                    self._set("idle",
+                              error="Update checksum did not match; discarded.")
+                    return self.status()
+        except Exception as e:
+            self._set("idle", error=f"Could not fetch the update: {e}")
+            return self.status()
 
         self._prune(keep=dest)
         with self._lock:
@@ -1073,6 +1081,11 @@ git commit -m "feat: expose update state and controls over the dashboard bridge"
 **Files:**
 - Modify: `build/voisr.iss`
 
+**Before starting, note two findings from the Task 7 review that land here:**
+
+- **`CloseApplications=yes` is load-bearing, not defence-in-depth.** `UpdateChecker`'s `installing` state is terminal, and `menu_quit` does not currently exit the process (tracked separately), so this directive plus the app's own `os._exit(0)` backstop are the only things that free `{app}` for the installer. Do not drop it as redundant.
+- **`private_mode` defaults to `True`, so every quit wipes the WebView2 profile.** `main()` never passes `private_mode=False` to `create_window`. Once `menu_quit` is fixed to destroy the pill, pywebview's `clear_user_data()` runs inside the quit path and does `process.WaitForExit(3000)` plus an `rmtree` of that profile — landing a 3 s wait inside the 5 s hard-exit budget, with under 2 s of slack for the rmtree. Consider passing `private_mode=False` (the profile wipe on every quit is almost certainly unintended anyway) and re-check `SHUTDOWN_HARD_S` after.
+
 - [ ] **Step 1: Add `/RELAUNCH` and `CloseApplications`**
 
 In `build/voisr.iss`'s `[Setup]` section, after `WizardStyle=modern`, add:
@@ -1081,9 +1094,17 @@ In `build/voisr.iss`'s `[Setup]` section, after `WizardStyle=modern`, add:
 ; A silent update spawns this installer while Voisr is still exiting. Restart
 ; Manager closes anything still holding files under {app}; it works unelevated
 ; and acts without prompting under /SILENT.
-CloseApplications=yes
+; "force", not "yes": Restart Manager cannot close an app that ignores
+; WM_CLOSE, and Voisr's message loop does. See commit d341b58.
+CloseApplications=force
 CloseApplicationsFilter=*.exe,*.dll
 RestartApplications=no
+; Refuse to run two copies of Setup at once. Without this, two concurrent
+; silent installs can write into {app} simultaneously and corrupt the install.
+; UpdateChecker.install() is guarded against double-spawning, but that guard
+; is per-process: an installed copy and a dev copy share %LOCALAPPDATA%\Voisr
+; (see the README), so the mutex is the only cross-process protection.
+SetupMutex=VoisrSetupMutex
 ```
 
 Replace the `[Run]` section with:
@@ -1157,12 +1178,22 @@ In `scripts/build_release.ps1`, replace the final `Write-Host "==> Done: ..."` l
 ```powershell
 $sha = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
 $manifestPath = Join-Path $buildDir "Output\latest.json"
-@{
+$manifestJson = @{
     version = $appVersion
     url     = "https://github.com/andr26j/voisr-releases/releases/download/v$appVersion/VoisrSetup.exe"
     sha256  = $sha
     notes   = $env:VOISR_RELEASE_NOTES
-} | ConvertTo-Json | Set-Content -Path $manifestPath -Encoding utf8
+} | ConvertTo-Json
+
+# Write UTF-8 WITHOUT a BOM. Do not use Set-Content -Encoding utf8: on
+# Windows PowerShell 5.1 that emits a BOM, and a BOM makes Python's
+# json.loads reject the manifest ("Unexpected UTF-8 BOM"). The client
+# decodes with utf-8-sig so it survives one either way, but emitting a BOM
+# here would leave every published release silently invisible to any client
+# that did not. -Encoding utf8NoBOM would do it on PowerShell 6+, which is
+# not what this machine runs.
+[System.IO.File]::WriteAllText(
+    $manifestPath, $manifestJson, (New-Object System.Text.UTF8Encoding($false)))
 
 $sizeMb = [math]::Round((Get-Item $installer).Length / 1MB, 1)
 Write-Host "==> Done: $installer ($sizeMb MB)"
@@ -1238,11 +1269,12 @@ powershell -NoProfile -Command "$env:VOISR_RELEASE_NOTES='Adds auto-update.'; po
 Then feed the real file through the real validator — the round trip is the point:
 
 ```bash
-venv\Scripts\python -c "from voisr.updater import Manifest; m=Manifest.from_json(open('build/Output/latest.json',encoding='utf-8-sig').read()); print('accepted:', m.version, m.sha256[:12])"
+venv\Scripts\python -c "from voisr.updater import Manifest; m=Manifest.from_json(open('build/Output/latest.json',encoding='utf-8').read()); print('accepted:', m.version, m.sha256[:12])"
 ```
 
 Expected: `accepted: 1.0.0 <12 hex chars>`
-If this raises, `Set-Content -Encoding utf8` wrote a BOM the parser tripped on — that is why `utf-8-sig` is used here; keep it.
+
+Note this reads with plain `utf-8`, not `utf-8-sig`, deliberately: it is the check that the writer above really produced a BOM-free file. If it raises `Unexpected UTF-8 BOM`, the `WriteAllText` call was changed back to `Set-Content -Encoding utf8` — fix the writer rather than this command. (`_default_text_opener` decodes with `utf-8-sig`, so a BOM would not break a real client; it would just mean the two ends disagree, and this is the only place that catches that.)
 
 - [ ] **Step 5: Commit**
 
@@ -1314,6 +1346,12 @@ Then insert two rows before the closing `</div>` of that section (after the `cle
 ```
 
 - [ ] **Step 4: Wire the controls**
+
+Three constraints from the Task 6 review that this wiring must respect:
+
+- **Render the banner from `state`, not `version`.** `UpdateChecker` never clears `_manifest`, so `status()` can report a `version` for a release that is no longer offered. Only `state === "ready"` means installable.
+- **If you ever toggle the checker on and off, use `stop()` then `start()` — never `start()` twice.** A second `start()` without an intervening `stop()` arms an untracked timer.
+- **`check_now` may return `already_checking: true`** when a background check is mid-flight. That is not a completed check; render the in-progress state rather than reporting "up to date".
 
 In `voisr/web/js/views/settings.js`, inside `render()` next to the existing `$("#launch-toggle").checked = ...` line, add:
 
@@ -1509,9 +1547,15 @@ Inside `home.js`'s `init()`, add:
 
 ```javascript
     document.getElementById("update-install").addEventListener("click", async () => {
-      const res = await V.ui.tryApi(V.api().install_update(), "Install update");
-      if (!res || res.error) return;
+      // Say "Installing" BEFORE the call, never after it. A successful
+      // install_update() kills the app ~0.75s later, and pywebview's
+      // evaluate_js blocks on a semaphore that destroy_window does not
+      // release -- so if Application.Exit() wins the race, this promise
+      // never settles and anything in a .then() never runs. Only the error
+      // path can rely on code after the await.
       V.ui.toast("Installing update — Voisr will restart");
+      const res = await V.ui.tryApi(V.api().install_update(), "Install update");
+      if (res && res.error) V.ui.toast(`Update failed: ${res.error}`);
     });
     document.getElementById("update-dismiss")
       .addEventListener("click", dismissUpdateBanner);
@@ -1631,6 +1675,24 @@ powershell -NoProfile -Command "(Invoke-WebRequest 'https://github.com/andr26j/v
 ```
 
 Expected: the JSON, with `version` `1.0.0`. A 404 here means the asset name is wrong or the release is a draft.
+
+- [ ] **Step 2b: Confirm tray Quit actually exits the process**
+
+Do this before anything else, because the whole update flow depends on it and it is **pre-existing behaviour nobody has verified at runtime**.
+
+**Two independent reviews have confirmed from source that `menu_quit` does not exit.** `main()` calls `widget.create()` *before* `webview.create_window(dashboard)`, so the pill window holds pywebview's `uid == 'master'` (`webview/__init__.py:377`); `app.Run()` runs on that window's thread (`winforms.py:793-812`); and `on_close` calls `Application.Exit()` only when `len(BrowserView.instances) == 0` (`winforms.py:397`). Nothing in `voisr/` ever destroys the pill — `overlay.py` only ever calls `hide`. So `webview.start()` never returns, and the `finally` that stops the hotkey service and releases the tray icon never runs.
+
+This is tracked as its own task. Until it is fixed, the post-install `os._exit(0)` backstop is **load-bearing on every install**, not the fallback it was designed as. This step is the runtime confirmation.
+
+Launch Voisr, then choose **Quit Voisr** from the tray menu.
+
+```bash
+powershell -NoProfile -Command "Start-Sleep -Seconds 5; Get-Process Voisr -ErrorAction SilentlyContinue | Select-Object Id, MainWindowTitle"
+```
+
+Expected: no output — the process is gone.
+
+If a process remains, tray Quit is broken independently of auto-update, and the post-install shutdown is relying on its hard-exit backstop every time rather than as a fallback. Fix `menu_quit` to destroy the pill window as well, and re-run.
 
 - [ ] **Step 3: Install 1.0.0 and confirm no update is offered**
 

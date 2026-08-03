@@ -173,13 +173,33 @@ WebView2 init — free of network work.
 
 ## Security
 
-- SHA256 verified before the installer is executed. This is the whole
+- SHA256 verified before the update is *offered*, not at the moment it is
+  executed: a download that fails the check is deleted and never reaches
+  `ready`, but `install()` re-reads the path and spawns without re-hashing,
+  and a banner can sit un-clicked for days in between. This is the whole
   integrity story while the build is unsigned, so the check cannot be
   skipped or made best-effort.
+  Re-verifying on the click was considered and rejected: the gap crosses no
+  privilege boundary. Anything able to swap the file in
+  `%LOCALAPPDATA%\Voisr\updates` can equally rewrite the app's own code in
+  `%LOCALAPPDATA%\Programs\Voisr` (`voisr.iss`'s `DefaultDirName`), so the
+  re-check would buy no defence against
+  the only attacker who can reach it. Non-adversarial corruption is caught
+  anyway — Inno Setup binaries self-check a CRC and refuse to run — and a
+  vanished file is already handled (`install()` drops to `idle` and
+  re-downloads).
 - HTTPS only; an `http://` URL in a manifest is rejected.
 - The manifest's `url` must point at the `github.com/andr26j/voisr-releases/`
-  release path. A manifest that redirects the download elsewhere is rejected,
-  so a compromised manifest cannot point the installer at an arbitrary host.
+  release path. This pins only the *first* hop: `urlopen` follows redirects
+  without re-validating the host, so the bytes can still end up coming from
+  wherever GitHub's redirector sends them. That's fine — it means trusting
+  GitHub, not the manifest — but it's a property of relying on GitHub, not
+  something the URL check itself enforces.
+- SHA256 gives integrity, not authenticity. The hash and the `url` come from
+  the same manifest document, so anyone who can tamper with one can tamper
+  with the other to match. The hash defends against transport corruption and
+  against the download being swapped independently of the manifest; it is
+  not a second, independent factor against a compromised manifest.
 
 ## Files touched
 

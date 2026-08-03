@@ -186,11 +186,12 @@ window.Voisr = window.Voisr || {};
   async function render() {
     const $ = V.ui.$;
     try {
-      const [cfg, status, models, hotkey] = await Promise.all([
+      const [cfg, status, models, hotkey, upd] = await Promise.all([
         V.ui.tryApi(V.api().get_config(), "Load settings"),
         V.ui.tryApi(V.api().get_hotkey_status(), "Load shortcut status"),
         V.ui.tryApi(V.api().get_models(), "Load models"),
         V.ui.tryApi(V.api().hotkey_display(), "Load shortcut"),
+        V.ui.tryApi(V.api().get_update_status(), "Load update status"),
       ]);
 
       if (cfg) {
@@ -199,9 +200,22 @@ window.Voisr = window.Voisr || {};
         appliedAppearance = cfg.appearance || "system";
         $("#appearance-select").value = appliedAppearance;
         $("#launch-toggle").checked = !!cfg.launch_at_login;
+        $("#update-toggle").checked = cfg.check_for_updates !== false;
       }
       if (hotkey) $("#hotkey-current").textContent = hotkey.display || "unset";
       if (status) $("#hotkey-status").textContent = status.status;
+      // `upd.version` can outlive the release it names -- UpdateChecker never
+      // clears its manifest -- so only `current_version` (this build, always
+      // correct) belongs here. Whether an update is actually installable is
+      // Check now's / the home banner's question, not this row's.
+      if (upd) $("#app-version").textContent = `Voisr ${upd.current_version || "—"}`;
+      // The Check-now click handler writes #update-result directly, outside
+      // any render() -- so a check left in flight (or a result left over)
+      // when the user navigates away must not go on showing here after they
+      // come back and this runs again. A check still genuinely in flight is
+      // unaffected: its own response repaints this once it lands, guarded by
+      // the same updateCheckSeq token the click handler uses.
+      $("#update-result").textContent = "";
 
       if (models && models.models) {
         const select = $("#model-select");
@@ -280,6 +294,78 @@ window.Voisr = window.Voisr || {};
         V.api().set_launch_at_login(e.target.checked), "Save launch at login");
       if (!res) { e.target.checked = !e.target.checked; return; }
       V.ui.toast(e.target.checked ? "Voisr will start at login" : "Launch at login off");
+    });
+
+    document.getElementById("update-toggle").addEventListener("change", async (e) => {
+      const res = await V.ui.tryApi(
+        V.api().set_check_for_updates(e.target.checked), "Save update setting");
+      // Leaving the switch showing a state that was never saved is its own
+      // bug, so put it back on failure -- same as the launch toggle.
+      if (!res) { e.target.checked = !e.target.checked; return; }
+      V.ui.toast(e.target.checked ? "Update checks on" : "Update checks off");
+    });
+
+    /* Deliberately not routed through V.ui.tryApi: tryApi's contract is to
+       convert any {error} response into a toast and hand the caller null,
+       which would erase exactly the field this handler needs to read.
+       check_for_updates_now() always returns a full status-shaped object
+       (error is one field among several, not an exceptional case), and the
+       required distinctions -- ready vs. already-checking vs. mid-flight vs.
+       actually up to date -- all live inside that object. Only a thrown
+       rejection (the bridge itself unreachable) gets tryApi's usual
+       "label failed: message" treatment, via the catch below.
+
+       Two guards against overlap, same reasoning as main.js's #hotkey-capture
+       (`if (btn.disabled) return; btn.disabled = true; ... finally`):
+       disabling the button for the duration closes the double-click a user
+       can actually trigger. The updateCheckSeq token is the second, cheaper
+       layer for the case the button's disabled state cannot cover -- a
+       response arriving out of order relative to a newer one already
+       in flight (IPC queuing, or this handler someday being reachable from
+       more than one trigger). Painting only the response whose token still
+       matches the latest click means a slow first reply can never overwrite
+       a second, faster one that superseded it. */
+    let updateCheckSeq = 0;
+    document.getElementById("update-check").addEventListener("click", async () => {
+      // Read fresh, like clear-history's own handler above, rather than off
+      // the event: the fake DOM's dispatch() (tests/js/dom.mjs) does not
+      // model currentTarget, and there is exactly one #update-check anyway.
+      const btn = document.getElementById("update-check");
+      if (btn.disabled) return;
+      const out = document.getElementById("update-result");
+      const seq = ++updateCheckSeq;
+      btn.disabled = true;
+      out.textContent = " — checking…";
+      let res, err;
+      try {
+        res = await V.api().check_for_updates_now();
+      } catch (e2) {
+        err = e2;
+      } finally {
+        btn.disabled = false;
+      }
+      // A newer click already started (and possibly already finished) since
+      // this one was fired -- its result is the current truth, and this
+      // response is stale by definition. Never let it repaint over that.
+      if (seq !== updateCheckSeq) return;
+      if (err) { out.textContent = ` — Check for updates failed: ${err.message || err}`; return; }
+      // `already_checking` means a check already in flight (the daily
+      // schedule, or a second click) answered instead of a completed one --
+      // and `checking`/`downloading` are just as mid-flight. Neither is
+      // "up to date", which is the one thing this must never claim for them.
+      // Only state === "ready" means an update is actually installable --
+      // `version` alone does not, since UpdateChecker never clears its
+      // manifest and can still be naming a release that is no longer offered.
+      if (res.error) out.textContent = ` — ${res.error}`;
+      else if (res.already_checking) out.textContent = " — a check is already running";
+      else if (res.state === "ready") out.textContent = ` — ${res.version} ready to install`;
+      else if (res.state === "checking" || res.state === "downloading")
+        out.textContent = " — update check in progress";
+      // `check_failed` means the manifest could not be fetched at all --
+      // offline, timeout, a 404. Someone who clicked Check now is waiting on
+      // an answer, and "you're up to date" is the wrong one.
+      else if (res.check_failed) out.textContent = " — couldn't reach the update server";
+      else out.textContent = " — you're up to date";
     });
 
     document.getElementById("color-open").addEventListener("click", openColorPopover);

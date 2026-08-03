@@ -36,8 +36,13 @@ test("settings.js loads without touching the DOM at parse time", () => {
    (document/window listener recording + dispatch, node.contains/closest,
    parent links) specifically to unlock these. */
 
+// init() now also binds the update-toggle checkbox and Check-now button
+// (tests/js/update.test.mjs covers their behaviour) -- both must still be
+// registered here, or getElementById(...) hands init() a null and it throws
+// on the very first addEventListener, taking every test in this file with it.
 const SETTINGS_IDS = ["appearance-select", "model-select", "launch-toggle",
-                       "color-open", "color-popover", "clear-history", "toast"];
+                       "color-open", "color-popover", "clear-history", "toast",
+                       "update-toggle", "update-check"];
 
 function mountSettings(t, api, apis = ["setTimeout"]) {
   t.mock.timers.enable({ apis });
@@ -46,8 +51,9 @@ function mountSettings(t, api, apis = ["setTimeout"]) {
 
   const nodes = {};
   for (const id of SETTINGS_IDS) {
-    nodes[id] = makeNode(id === "launch-toggle" ? "input"
-      : id === "appearance-select" || id === "model-select" ? "select" : "div");
+    nodes[id] = makeNode(id === "launch-toggle" || id === "update-toggle" ? "input"
+      : id === "appearance-select" || id === "model-select" ? "select"
+      : id === "update-check" ? "button" : "div");
     env.register(id, nodes[id]);
   }
   nodes["color-popover"].hidden = true;

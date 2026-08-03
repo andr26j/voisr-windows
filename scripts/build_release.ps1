@@ -7,6 +7,24 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $buildDir = Join-Path $root "build"
 
+# Checked here, in the first second, rather than where it is used at the very
+# bottom: the build takes 3-6 minutes, and latest.json with empty notes is a
+# manifest both publish_release.ps1 and the client's Manifest.from_json reject.
+# Finding that out after the build is six wasted minutes and another six to
+# redo it. This script exists to produce a publishable release, so a run that
+# cannot produce one should not start. For a throwaway smoke build, set the
+# variable to anything.
+if ([string]::IsNullOrWhiteSpace($env:VOISR_RELEASE_NOTES)) {
+    throw 'VOISR_RELEASE_NOTES is not set. latest.json would carry empty notes, which the updater rejects. Set it first, e.g. $env:VOISR_RELEASE_NOTES = "Adds auto-update."'
+}
+
+# Single source of truth: voisr/__init__.py. Passed to ISCC below so the
+# installer's version can never drift from the app's.
+$versionLine = Select-String -Path (Join-Path $root "voisr\__init__.py") -Pattern '^__version__\s*=\s*"([^"]+)"'
+if (-not $versionLine) { throw "__version__ not found in voisr\__init__.py" }
+$appVersion = $versionLine.Matches[0].Groups[1].Value
+Write-Host "==> Version $appVersion"
+
 # ---------------------------------------------------------------------------
 # 1. whisper build, staged under build\ rather than reused from the repo's
 #    bin\ so a release never depends on setup.ps1 having been run first.
@@ -65,7 +83,7 @@ $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $iscc) { throw "ISCC.exe not found -- install Inno Setup 6 (winget install JRSoftware.InnoSetup)" }
 
 Write-Host "==> Compiling installer with $iscc"
-& $iscc (Join-Path $buildDir "voisr.iss")
+& $iscc "/DMyAppVersion=$appVersion" (Join-Path $buildDir "voisr.iss")
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit $LASTEXITCODE)" }
 
 $installer = Join-Path $buildDir "Output\VoisrSetup.exe"
@@ -78,5 +96,27 @@ if (-not (Test-Path $installer)) { throw "Installer missing: $installer" }
 # & signtool sign /f "$env:VOISR_CERT_PATH" /p "$env:VOISR_CERT_PASSWORD" `
 #     /tr http://timestamp.digicert.com /td sha256 /fd sha256 $installer
 
+$sha = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
+$manifestPath = Join-Path $buildDir "Output\latest.json"
+# [ordered] only so the file diffs readably between releases -- a plain @{} is
+# a hashtable and would emit the keys in an arbitrary order. No parser cares.
+$manifestJson = [ordered]@{
+    version = $appVersion
+    url     = "https://github.com/andr26j/voisr-releases/releases/download/v$appVersion/VoisrSetup.exe"
+    sha256  = $sha
+    notes   = $env:VOISR_RELEASE_NOTES
+} | ConvertTo-Json
+
+# Write UTF-8 WITHOUT a BOM. Do not use Set-Content -Encoding utf8: on
+# Windows PowerShell 5.1 that emits a BOM, and a BOM makes Python's
+# json.loads reject the manifest ("Unexpected UTF-8 BOM"). The client
+# decodes with utf-8-sig so it survives one either way, but emitting a BOM
+# here would leave every published release silently invisible to any client
+# that did not.
+[System.IO.File]::WriteAllText(
+    $manifestPath, $manifestJson, (New-Object System.Text.UTF8Encoding($false)))
+
 $sizeMb = [math]::Round((Get-Item $installer).Length / 1MB, 1)
 Write-Host "==> Done: $installer ($sizeMb MB)"
+Write-Host "    sha256:   $sha"
+Write-Host "    manifest: $manifestPath"
