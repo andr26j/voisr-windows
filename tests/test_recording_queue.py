@@ -793,3 +793,66 @@ def test_temp_wav_failure_is_a_structured_start_error(tmp_path):
             raise AssertionError("start should report temporary-file failure")
     finally:
         queue.close()
+
+
+def test_a_recorder_failure_without_a_fallback_keeps_its_own_message(tmp_path):
+    """The recorder's own error is the only thing that names WHY recording
+    could not start -- "Error querying device -1" for a disconnected
+    microphone, say. Replacing it with a generic "no fallback recorder
+    available" tells the user nothing, and that message is what reaches the
+    log and the dashboard.
+    """
+    class NoMicrophone:
+        def start(self, path):
+            raise OSError("Error querying device -1")
+
+        def stop(self):
+            return ""
+
+    queue = RecordingQueue(
+        recorder_factory=NoMicrophone,
+        fallback_recorder_factory=None,
+        processor=lambda session: SessionResult.success(session.sequence, text=""),
+        clock=iter([1.0, 2.0]).__next__,
+        temp_path_factory=lambda: tmp_path / "capture.wav",
+    )
+    try:
+        with pytest.raises(RecordingQueueError) as caught:
+            queue.start()
+        assert "Error querying device -1" in str(caught.value), str(caught.value)
+    finally:
+        queue.close()
+
+
+def test_a_failed_start_leaves_the_queue_usable(tmp_path):
+    """A microphone that comes back must work on the next press: the failed
+    start must not strand _starting/_in_flight and wedge every later one."""
+    attempts = []
+
+    class SometimesMissing:
+        def start(self, path):
+            attempts.append(path)
+            if len(attempts) == 1:
+                raise OSError("Error querying device -1")
+            self.path = path
+
+        def stop(self):
+            with open(self.path, "wb") as f:
+                f.write(b"\0" * 2000)
+            return ""
+
+    queue = RecordingQueue(
+        recorder_factory=SometimesMissing,
+        fallback_recorder_factory=None,
+        processor=lambda session: SessionResult.success(session.sequence, text="ok"),
+        clock=iter([1.0, 2.0, 3.0, 4.0]).__next__,
+        temp_path_factory=lambda: tmp_path / f"capture-{len(attempts) + 1}.wav",
+    )
+    try:
+        with pytest.raises(RecordingQueueError):
+            queue.start()
+        session = queue.start()          # microphone reconnected
+        assert session is not None
+        assert queue.release(False, {}).result(timeout=2).to_api_dict()["text"] == "ok"
+    finally:
+        queue.close()

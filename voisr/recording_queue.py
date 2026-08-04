@@ -179,7 +179,15 @@ class RecordingQueue:
                     self._safe_cancel(recorder)
                     recorder = None
                     if self._fallback_recorder_factory is None:
-                        raise RuntimeError("no fallback recorder available")
+                        # Re-raise the recorder's own error rather than a
+                        # generic one. This message is the only thing that
+                        # names why recording could not start -- a
+                        # disconnected microphone surfaces here as PortAudio's
+                        # "Error querying device -1" -- and it is what reaches
+                        # the log and the user. "no fallback recorder
+                        # available" described our configuration, not their
+                        # problem.
+                        raise
                     recorder = self._fallback_recorder_factory()
                     recorder.start(wav_path)
 
