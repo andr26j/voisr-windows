@@ -812,15 +812,20 @@ class FakeWidget:
 class FakeHotkeyApi:
     """Stands in for Api's slice HotkeyService actually talks to."""
 
-    def __init__(self, show_widget=True, fail=False):
+    def __init__(self, show_widget=True, fail=False, start_error=None):
         self._config = {"show_widget": show_widget, "pill_theme": "classic",
                          "pill_color": None}
         self._fail = fail
+        self.start_error = start_error
+        self.start_calls = 0
 
     def get_config(self):
         return dict(self._config)
 
     def start_recording(self):
+        self.start_calls += 1
+        if self.start_error is not None:
+            return {"error": self.start_error}
         return {"recording": True}
 
     def _release_recording(self, paste=True):
@@ -1079,3 +1084,69 @@ def test_destroy_windows_survives_a_pill_that_never_got_created():
     log = []
     ui_module.destroy_windows(FakeDestroyable("dashboard", log), None)
     assert log == ["dashboard"]
+
+
+# --- a hotkey press that cannot start recording -----------------------------
+# A disconnected microphone made press() return before the pill was ever
+# shown, with nothing logged. The app looked completely dead: no pill, no
+# dictation, no explanation -- indistinguishable from a broken build, which
+# is exactly what it got blamed on.
+
+_MIC_GONE = "recorder failed: Error querying device -1"
+
+
+def _failing_start_service(monkeypatch, show_widget=True):
+    from voisr import ui as ui_module
+
+    logged = []
+    monkeypatch.setattr(ui_module, "_update_log", logged.append)
+    widget = FakeWidget()
+    api = FakeHotkeyApi(show_widget=show_widget, start_error=_MIC_GONE)
+    service = HotkeyService(api, widget=widget, hide_delay=0)
+    return service, widget, api, logged
+
+
+def test_a_start_failure_flashes_the_error_pill(monkeypatch):
+    service, widget, _api, _logged = _failing_start_service(monkeypatch)
+    service.press()
+    assert "error" in widget.calls, (
+        "a press that cannot record must look like a failure, not a no-op")
+
+
+def test_a_start_failure_is_logged_with_its_reason(monkeypatch):
+    """The log is the only durable trace. Without it a user cannot tell a
+    missing microphone from a broken release."""
+    service, _widget, _api, logged = _failing_start_service(monkeypatch)
+    service.press()
+    assert any(_MIC_GONE in line for line in logged), logged
+
+
+def test_auto_repeat_reports_a_start_failure_only_once(monkeypatch):
+    """Holding the hotkey auto-repeats WM_KEYDOWN. _pressed stays False when
+    the start failed, so without a guard every repeat would re-report --
+    spamming the log and respawning a hide thread per repeat."""
+    service, widget, api, logged = _failing_start_service(monkeypatch)
+    for _ in range(6):
+        service.press()
+    assert widget.calls.count("error") == 1, widget.calls
+    assert len(logged) == 1, logged
+    assert api.start_calls == 1, "the queue must not be hammered per repeat"
+
+
+def test_releasing_lets_the_next_press_try_again(monkeypatch):
+    """The once-per-hold guard must clear on key up, or plugging the mic back
+    in would never recover without a restart."""
+    service, widget, api, _logged = _failing_start_service(monkeypatch)
+    service.press()
+    service.release()
+    api.start_error = None          # microphone reconnected
+    service.press()
+    assert "recording" in widget.calls
+
+
+def test_a_start_failure_is_logged_even_with_the_pill_disabled(monkeypatch):
+    service, widget, _api, logged = _failing_start_service(
+        monkeypatch, show_widget=False)
+    service.press()
+    assert widget.calls == []
+    assert len(logged) == 1

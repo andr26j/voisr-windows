@@ -248,6 +248,7 @@ class HotkeyService:
         self._watcher = None
         self._stopped = False
         self._pressed = False
+        self._start_failed = False
         self._key_name = None
         self._target_vk = None
         self._state_lock = threading.RLock()
@@ -269,11 +270,17 @@ class HotkeyService:
 
     def press(self) -> None:
         with self._state_lock:
-            if self._pressed:
+            # _start_failed: holding the key auto-repeats WM_KEYDOWN, and a
+            # failed start leaves _pressed False -- so without this guard
+            # every repeat would hammer the queue and re-report. One report
+            # per physical hold; release() clears it.
+            if self._pressed or self._start_failed:
                 return
             result = self._api.start_recording()
             if "error" in result:
-                return  # e.g. a dashboard recording is already running
+                self._start_failed = True
+                self._report_start_failure(result["error"])
+                return
             self._pressed = True
             self._epoch += 1
             epoch = self._epoch
@@ -286,6 +293,9 @@ class HotkeyService:
 
     def release(self) -> None:
         with self._state_lock:
+            # Cleared on key up, not on the next press: a microphone plugged
+            # back in must recover on the very next hold, without a restart.
+            self._start_failed = False
             if not self._pressed:
                 return
             self._pressed = False
@@ -300,6 +310,44 @@ class HotkeyService:
             name=f"voisr-widget-{epoch}",
             daemon=True,
         ).start()
+
+    def _report_start_failure(self, reason) -> None:
+        """Make a hotkey press that cannot record visible.
+
+        Returning silently is what let a disconnected microphone read as a
+        dead app: no pill, no dictation, and nothing in the log to separate a
+        missing device from a broken release. The reason is always logged --
+        that line is the only durable trace -- and the pill flashes its error
+        state when enabled, so the press looks like a failure rather than a
+        no-op.
+
+        Runs with _state_lock held (an RLock) inside the keyboard hook
+        callback, so it stays to one short append and hands the timed hide to
+        a thread. A WH_KEYBOARD_LL callback that sleeps risks Windows
+        skipping the hook, so nothing here may wait.
+        """
+        try:
+            _update_log(f"hotkey press could not start recording: {reason}")
+        except Exception:
+            pass  # a broken log must not swallow the dictation path
+        if not self._widget_enabled():
+            return
+        self._epoch += 1
+        epoch = self._epoch
+        self._widget_action("show_error", epoch)
+        threading.Thread(
+            target=self._hide_after_delay, args=(epoch,),
+            name=f"voisr-widget-failed-{epoch}", daemon=True).start()
+
+    def _hide_after_delay(self, epoch: int) -> None:
+        try:
+            if self._hide_delay:
+                time.sleep(self._hide_delay)
+            with self._state_lock:
+                if epoch == self._epoch:
+                    self._widget_action("hide", epoch)
+        except Exception:
+            pass
 
     def _finish(self, future, show: bool, epoch: int) -> None:
         try:
