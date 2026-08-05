@@ -11,6 +11,30 @@ def wav_seconds(path):
         return w.getnframes() / w.getframerate()
 
 
+def _has_input_device() -> bool:
+    """True when PortAudio can open a default capture device.
+
+    Mirrors exactly what StreamRecorder.start does: sd.RawInputStream with no
+    explicit device resolves the default input, and with none present that
+    raises PortAudioError("Error querying device -1").
+    """
+    try:
+        import sounddevice as sd
+        sd.query_devices(kind="input")
+        return True
+    except Exception:
+        return False
+
+
+# The two tests below open the real microphone. On a machine without one they
+# failed with PortAudioError, which reads as a code regression when it is only
+# absent hardware -- an unplugged headset produced exactly that, and the red
+# suite muddied a live incident. Skipping keeps "red" meaning "regression".
+requires_microphone = pytest.mark.skipif(
+    not _has_input_device(), reason="no audio input device available")
+
+
+@requires_microphone
 def test_captures_full_hold_duration_immediately(tmp_path):
     rec = StreamRecorder()
     try:
@@ -25,6 +49,7 @@ def test_captures_full_hold_duration_immediately(tmp_path):
         rec.close()
 
 
+@requires_microphone
 def test_back_to_back_recordings(tmp_path):
     rec = StreamRecorder()
     try:
