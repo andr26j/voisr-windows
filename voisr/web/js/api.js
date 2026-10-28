@@ -15,8 +15,8 @@ window.Voisr = window.Voisr || {};
     ];
     let mockCfg = { hotkey: "ctrl_r", paste: true, show_widget: true, pill_theme: "classic", pill_color: null, dictionary: { trademake: "TradeMate", "trade mate": "TradeMate" }, model: "small.en", launch_at_login: false, check_for_updates: true };
     let recording = false;
-    // mirrors voisr/keys.py's hotkey_options(), used both for the dropdown
-    // mock and to resolve a human label for hotkey_display() below.
+    // mirrors voisr/keys.py's hotkey_options(), to resolve a human label for
+    // hotkey_display() below.
     const HOTKEY_OPTIONS = [
       { value: "ctrl_r", label: "Right Ctrl" }, { value: "ctrl_l", label: "Left Ctrl" },
       { value: "alt_r", label: "Right Alt" }, { value: "alt_l", label: "Left Alt" },
@@ -38,10 +38,14 @@ window.Voisr = window.Voisr || {};
         daily: Array.from({ length: 14 }, (_, i) => ({
           date: `2026-07-${String(12 + i).padStart(2, "0")}`,
           words: [0, 120, 340, 90, 0, 610, 480, 220, 0, 130, 700, 540, 310, 260][i],
+          saved_seconds: [0, 140, 400, 95, 0, 760, 560, 250, 0, 150, 820, 610, 350, 300][i],
         })),
       }),
       get_config: async () => JSON.parse(JSON.stringify(mockCfg)),
       set_config: async (u) => Object.assign(mockCfg, u),
+      // mirrors Api.take_config_notice() in voisr/ui.py: {} unless a corrupt
+      // config.json was moved aside at load.
+      take_config_notice: async () => ({}),
       // mirrors Api.set_appearance() in voisr/ui.py, used by the command
       // palette's "Toggle appearance" command.
       set_appearance: async (mode) => {
@@ -109,7 +113,6 @@ window.Voisr = window.Voisr || {};
         mockCfg.hotkey_vk = 0x5D; mockCfg.hotkey_label = "Menu";
         return { vk: 0x5D, label: "Menu" };
       },
-      get_hotkey_options: async () => HOTKEY_OPTIONS,
       // mirrors Api.hotkey_display() in voisr/ui.py: captured label, else
       // the matching HOTKEY_OPTIONS label, else the raw value, else "unset".
       hotkey_display: async () => {
@@ -118,7 +121,9 @@ window.Voisr = window.Voisr || {};
         if (opt) return { display: opt.label };
         return { display: mockCfg.hotkey || "unset" };
       },
-      get_hotkey_status: async () => ({ status: `active on ${mockCfg.hotkey}` }),
+      // mirrors Api.get_hotkey_status(): state drives Home's listener dot
+      get_hotkey_status: async () => ({ status: `active on ${mockCfg.hotkey}`,
+                                        state: recording ? "busy" : "listening" }),
       get_pill_themes: async () => [
         { value: "classic", label: "Classic" }, { value: "ember", label: "Ember" },
         { value: "aurora", label: "Aurora" }, { value: "ocean", label: "Ocean" },
@@ -126,6 +131,14 @@ window.Voisr = window.Voisr || {};
         { value: "scanner", label: "Scanner" },
       ],
       start_recording: async () => { recording = true; return { recording: true }; },
+      // mirrors Api.get_level(): a simulated voice (syllables and pauses)
+      // while recording, null otherwise
+      get_level: async () => {
+        if (!recording) return null;
+        const t = Date.now() / 1000;
+        const syllable = Math.max(0, Math.sin(t * 9.5)) * (Math.sin(t * 1.3) > -0.6 ? 1 : 0);
+        return 0.03 + 0.85 * syllable * (0.75 + 0.25 * Math.sin(t * 3.1));
+      },
       stop_recording: async () => {
         if (!recording) return { error: "not recording" };
         recording = false;

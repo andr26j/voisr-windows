@@ -1138,7 +1138,7 @@ def test_the_update_config_reader_does_not_read_the_disk_every_call(
     reads = []
     real = ui.load_config
     monkeypatch.setattr(ui, "load_config",
-                        lambda p: (reads.append(p), real(p))[1])
+                        lambda p, **kw: (reads.append(p), real(p, **kw))[1])
     for _ in range(5):
         api.read_config_cached()
     assert len(reads) == 1
@@ -1166,8 +1166,8 @@ def test_a_read_racing_an_invalidation_does_not_resurrect_stale_config(
     real = ui.load_config
     first = [True]
 
-    def gated_load(p):
-        cfg = real(p)               # the parse completes...
+    def gated_load(p, **kw):
+        cfg = real(p, **kw)         # the parse completes...
         if first[0]:
             first[0] = False
             reading.set()

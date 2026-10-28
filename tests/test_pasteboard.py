@@ -24,6 +24,7 @@ class FakeWin32:
         self.closed = 0
         self.emptied = 0
         self.null_handles = set()
+        self.names = {}
 
     def open(self):
         if self.open_failures:
@@ -54,6 +55,9 @@ class FakeWin32:
 
     def get_sequence(self):
         return self.sequence
+
+    def format_name(self, fmt):
+        return self.names.get(fmt)
 
 
 def make(win32):
@@ -183,3 +187,14 @@ def test_empty_snapshot_restores_without_error():
     snap = clip.snapshot()
     count = clip.write_text_if_unchanged("temp", snap)
     assert clip.restore_if_unchanged(snap, count) is True
+
+
+def test_snapshot_flags_a_password_manager_secret():
+    exclude = 0xC123
+    win32 = FakeWin32({CF_UNICODETEXT: "hunter2".encode("utf-16-le"), exclude: b""})
+    win32.names[exclude] = "ExcludeClipboardContentFromMonitorProcessing"
+    assert make(win32).snapshot().concealed is True
+
+
+def test_snapshot_of_plain_text_is_not_concealed():
+    assert make(FakeWin32()).snapshot().concealed is False

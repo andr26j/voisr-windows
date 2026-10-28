@@ -35,6 +35,8 @@ from pathlib import Path
 from voisr.filelock import FileLock
 
 
+TYPING_WPM = 40  # the baseline Time saved is measured against
+
 # Windows Defender and the search indexer can hold a history file open for a
 # moment right after it is written, surfacing as PermissionError/WinError 5 on
 # both the read and the commit. It is external and momentary, not corruption,
@@ -118,12 +120,17 @@ class HistoryStore:
         # FileNotFoundError answers on the first attempt instead of waiting
         # out a budget that can never help.
         try:
-            contents = _retry_while_locked(
-                lambda: self.path.read_text(encoding="utf-8"))
+            contents = _retry_while_locked(self.path.read_bytes)
         except FileNotFoundError:
             return []
         items = []
-        for line in contents.splitlines():
+        # Decode per line: one undecodable byte (a torn write from an older
+        # build, a disk error) must cost that line only, not the whole store.
+        for raw_line in contents.splitlines():
+            try:
+                line = raw_line.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
             if not line.strip():
                 continue
             try:
@@ -221,11 +228,16 @@ class HistoryStore:
         return self._mutate(wipe)
 
     def _daily_series(self, items, days: int = 14) -> list[dict]:
-        """Word counts per day for the last `days` days, oldest first,
-        zero-filled. Entries outside the window are ignored."""
+        """Words and time saved per day for the last `days` days, oldest
+        first, zero-filled. Entries outside the window are ignored.
+
+        saved_seconds is the same sum stats() uses for time_saved_seconds,
+        per day: Home's Time saved tile draws its own trend and week delta
+        from it rather than borrowing the word series."""
         today = date.today()
         window = [today - timedelta(days=n) for n in range(days - 1, -1, -1)]
         counts = {d: 0 for d in window}
+        spoken = {d: Fraction() for d in window}
         for item in items:
             try:
                 d = date.fromtimestamp(item["ts"])
@@ -233,7 +245,11 @@ class HistoryStore:
                 continue
             if d in counts:
                 counts[d] += item["words"]
-        return [{"date": d.isoformat(), "words": counts[d]} for d in window]
+                spoken[d] += Fraction(item["duration_s"])
+        return [{"date": d.isoformat(), "words": counts[d],
+                 "saved_seconds": round(max(
+                     Fraction(counts[d] * 60, TYPING_WPM) - spoken[d], 0))}
+                for d in window]
 
     def stats(self) -> dict:
         items = self._read()
@@ -244,8 +260,7 @@ class HistoryStore:
                      "daily": self._daily_series([])}
         total_words = sum(i["words"] for i in items)
         total_time = sum((Fraction(i["duration_s"]) for i in items), Fraction())
-        # typing baseline: 40 words per minute
-        typed_time = Fraction(total_words * 60, 40)
+        typed_time = Fraction(total_words * 60, TYPING_WPM)
         saved = typed_time - total_time
         if saved < 0:
             saved = Fraction(0)
@@ -258,7 +273,11 @@ class HistoryStore:
                 days.add(date.fromtimestamp(item["ts"]))
             except (OverflowError, OSError, ValueError):
                 continue
+        # A streak is alive until today ends: one that ran through yesterday
+        # must not read 0 every morning before the first dictation.
         streak, d = 0, date.today()
+        if d not in days:
+            d -= timedelta(days=1)
         while d in days:
             streak += 1
             d -= timedelta(days=1)

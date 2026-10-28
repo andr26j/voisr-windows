@@ -24,7 +24,7 @@ test("settings.js exposes render/init after adding update controls", () => {
 // all of them must be registered or getElementById(...) hands back null and
 // init() throws on the very first addEventListener.
 const UPDATE_IDS = [
-  "paste-toggle", "widget-toggle", "appearance-select", "launch-toggle",
+  "paste-toggle", "widget-toggle", "appearance-grid", "launch-toggle",
   "model-select", "hotkey-current", "hotkey-status",
   "update-toggle", "app-version", "update-result", "update-check",
   "color-open", "color-popover", "clear-history", "toast",
@@ -37,7 +37,7 @@ function mountUpdateSettings(t, api) {
   for (const id of UPDATE_IDS) {
     nodes[id] = makeNode(id === "update-toggle" || id === "launch-toggle" || id === "paste-toggle"
       || id === "widget-toggle" ? "input"
-      : id === "appearance-select" || id === "model-select" ? "select"
+      : id === "model-select" ? "select"
       : id === "update-check" || id === "clear-history" ? "button" : "div");
     env.register(id, nodes[id]);
   }

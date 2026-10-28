@@ -71,6 +71,21 @@ class WindowsKeyListener:
         self._hook = None
         self._thread_id = None
         self.running = False
+        # set once the hook install has been tried, whichever way it went
+        self._settled = threading.Event()
+
+    @property
+    def state(self) -> str:
+        """"starting" until the hook install is tried, then "running" while
+        the hook is live and "failed" once it is gone or never came up."""
+        if self.running:
+            return "running"
+        return "failed" if self._settled.is_set() else "starting"
+
+    def wait_started(self, timeout: float) -> str:
+        """Wait up to `timeout` for the install to settle; return state."""
+        self._settled.wait(timeout)
+        return self.state
 
     def _callback(self, ncode, wparam, lparam):
         if ncode < 0:
@@ -100,8 +115,10 @@ class WindowsKeyListener:
         self._hook = user32.SetWindowsHookExW(
             WH_KEYBOARD_LL, self._proc, None, 0)
         if not self._hook:
+            self._settled.set()
             return  # caller retries; nothing usable without a hook
         self.running = True
+        self._settled.set()
         try:
             message = wintypes.MSG()
             while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:

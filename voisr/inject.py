@@ -16,7 +16,11 @@ from voisr.pasteboard import (
     _Win32Clipboard,
 )
 
-PASTE_GRACE_S = 0.3
+# Ctrl+V is posted asynchronously and nothing reports when the target app has
+# read the clipboard, so the restore waits. 300 ms was shorter than a busy
+# Electron or chat app's stall, which then pasted the restored clipboard
+# instead. restore_if_unchanged still won't clobber anything copied meanwhile.
+PASTE_GRACE_S = 1.0
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -294,6 +298,11 @@ def _paste_with_adapter(text, *, adapter, post_ctrl_v,
             ) from restore_error
         raise PasteDeliveryError(
             "paste was blocked; clipboard preserved", pasted=False)
+    if snapshot.concealed:
+        # A late Ctrl+V would paste whatever is back on the clipboard; a
+        # password must never be that. Leaving the dictation there instead
+        # costs nothing a password manager wouldn't clear anyway.
+        return True
     try:
         sleeper(PASTE_GRACE_S)
     except BaseException as error:

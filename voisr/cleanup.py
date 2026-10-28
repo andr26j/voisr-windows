@@ -1,9 +1,30 @@
 import hashlib
 import re
+from collections.abc import Callable
 
+# Case-sensitive on purpose: whisper writes fillers lowercase, or capitalised
+# at a sentence start, so "ER" (the ward) is a word. A hyphen next to it means
+# a word too ("uh-oh"). Only the filler's own comma goes; a following . ? !
+# ends the sentence and stays. A filler alone in parentheses goes with them.
+_FILLER = r"(?:[Uu]m+|[Uu]h+|[Uu]hm+|[Ee]rm+|[Ee]r|[Aa]h+|[Hh]mm+)"
 FILLER_RE = re.compile(
-    r"\b(?:um+|uh+|uhm+|erm+|er|ah+|hmm+)\b[,.!?]?\s*",
-    re.IGNORECASE,
+    rf"\(\s*{_FILLER}\s*\)\s*|(?<![\w-]){_FILLER}(?![\w-]),?\s*"
+)
+
+# whisper.cpp annotates non-speech instead of returning nothing: a key click
+# or room noise comes back as `[BLANK_AUDIO]`, `[ Silence ]`, `(wind blowing)`.
+# Whisper's square-bracket tags are plain words, so a bracketed run of words
+# goes (a bracketed URL or number stays). Parentheses can be dictated, so only
+# those naming a sound go.
+NON_SPEECH_RE = re.compile(
+    r"""
+    \[[\sA-Za-z_'-]*\]
+    | \((?=[^()]*\b(?:blank|silence|silent|music|inaudible|noise|wind|
+                      blowing|laugh\w*|cough\w*|sigh\w*|applause|static|
+                      beep\w*|breath\w*|click\w*|typing|keyboard|mumbl\w*|
+                      sniff\w*)\b)[^()]*\)
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 PROTECTED_TOKEN_RE = re.compile(
@@ -20,6 +41,9 @@ PROTECTED_TOKEN_RE = re.compile(
     | \bph\.d\.                                             # degree
     | \b(?:[a-z]\.){2,}                                     # abbreviation
     | \b(?:dr|mr|mrs|ms|prof|sr|jr|st)\.               # title
+    | (?-i:(?<![\w.])(?![A-Z]\.)[^\W_]\w*(?:\.[a-z0-9][\w-]*)+)
+      # dotted name: google.com, config.json, Node.js. A capital after the
+      # dot ("yes.No") or a lone capital before it ("I.am") is prose instead.
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -91,30 +115,44 @@ def _placeholder_namespace(content: str) -> str:
         counter += 1
 
 
-def _apply_dictionary(text: str, dictionary: dict[str, str] | None) -> str:
-    out = text
-    for spoken, written in (dictionary or {}).items():
-        # whole-word match (don't rewrite inside longer words); replacement is
-        # a callable so backslashes in `written` stay literal
-        pattern = re.escape(spoken)
-        if spoken[:1].isalnum():
+def _dictionary_rewriter(dictionary: dict[str, str] | None) -> Callable[[str], str]:
+    """One pass, longest phrase first: a replacement never feeds another
+    entry ({"york": ..., "new york": ...} gave "New Yorkshire"), and a space
+    in a phrase matches any run of whitespace (whisper may break a line).
+    Built once per clean(): it runs on every gap between protected tokens."""
+    entries = sorted(((k, v) for k, v in (dictionary or {}).items() if k.strip()),
+                     key=lambda kv: len(kv[0]), reverse=True)
+    if not entries:
+        return lambda text: text
+    patterns = []
+    for i, (spoken, _) in enumerate(entries):
+        # whole-word match: don't rewrite inside longer words
+        pattern = r"\s+".join(re.escape(part) for part in spoken.split())
+        if spoken.strip()[:1].isalnum():
             pattern = r"\b" + pattern
-        if spoken[-1:].isalnum():
+        if spoken.strip()[-1:].isalnum():
             pattern = pattern + r"\b"
-        out = re.sub(pattern, lambda m: written, out, flags=re.IGNORECASE)
-    return out
+        patterns.append(f"(?P<d{i}>{pattern})")
+    compiled = re.compile("|".join(patterns), re.IGNORECASE)
+
+    def rewrite(text: str) -> str:
+        # a callable replacement keeps backslashes in `written` literal
+        return compiled.sub(lambda m: entries[int(m.lastgroup[1:])][1], text)
+
+    return rewrite
 
 
 def _protect_original_spans(
     text: str, dictionary: dict[str, str] | None
 ) -> tuple[str, list[str], re.Pattern[str]]:
     spans = list(_protected_spans(text))
+    rewrite = _dictionary_rewriter(dictionary)
     gaps: list[str] = []
     last = 0
     for start, end, _ in spans:
-        gaps.append(_apply_dictionary(FILLER_RE.sub("", text[last:start]), dictionary))
+        gaps.append(rewrite(FILLER_RE.sub("", text[last:start])))
         last = end
-    gaps.append(_apply_dictionary(FILLER_RE.sub("", text[last:]), dictionary))
+    gaps.append(rewrite(FILLER_RE.sub("", text[last:])))
 
     reserved_parts = [text]
     for gap, (_, _, token) in zip(gaps, spans):
@@ -124,12 +162,28 @@ def _protect_original_spans(
     namespace = _placeholder_namespace(reserved)
     placeholder_re = re.compile(re.escape(namespace) + r"([0-9a-f]+)" + re.escape(namespace))
     protected: list[str] = []
+
+    def hold(token: str) -> str:
+        protected.append(token)
+        return f"{namespace}{len(protected) - 1:x}{namespace}"
+
+    # The user's replacement text is final: "e.g." or "12:00" must not get
+    # the spacing pass. Only values it could touch are held, so a plain
+    # replacement at the start is still capitalised.
+    written = sorted({w for w in (dictionary or {}).values()
+                      if re.search(r"[,.;:!?]", w)}, key=len, reverse=True)
+    written_re = re.compile("|".join(map(re.escape, written))) if written else None
+
+    def hold_written(gap: str) -> str:
+        if written_re is None:
+            return gap
+        return written_re.sub(lambda m: hold(m.group(0)), gap)
+
     parts: list[str] = []
     for gap, (_, _, token) in zip(gaps, spans):
-        parts.append(gap)
-        parts.append(f"{namespace}{len(protected):x}{namespace}")
-        protected.append(token)
-    parts.append(gaps[-1])
+        parts.append(hold_written(gap))
+        parts.append(hold(token))
+    parts.append(hold_written(gaps[-1]))
     return "".join(parts), protected, placeholder_re
 
 
@@ -140,13 +194,18 @@ def _restore_tokens(text: str, protected: list[str], placeholder_re: re.Pattern[
 def clean(text: str, dictionary: dict[str, str] | None = None) -> str:
     """Normalize a raw transcript: strip fillers, fix spacing/punctuation,
     apply the user's spoken->written dictionary, capitalize the first letter."""
+    text = NON_SPEECH_RE.sub(" ", text)
     if not text.strip():
         return ""
     out, protected, placeholder_re = _protect_original_spans(text, dictionary)
     out = re.sub(r"\s+", " ", out).strip()
     out = re.sub(r"\s+([,.;:!?])", r"\1", out)
-    out = re.sub(r"^[,.;:\s]+", "", out)
-    out = re.sub(r"([,.;:!?])(?=\S)", r"\1 ", out)
-    if out and out[0].islower():
-        out = out[0].upper() + out[1:]
+    # a dropped filler can leave its comma against the sentence end ("it, uh?")
+    out = re.sub(r",(?=[.?!])", "", out)
+    out = re.sub(r"^[,.;:!?\s]+", "", out)
+    # space after punctuation, but never inside a run ("...", "?!")
+    out = re.sub(r"([,.;:!?])(?=[^\s,.;:!?])", r"\1 ", out)
+    first_word = out.split(" ", 1)[0]
+    if out and out[0].islower() and not any(c.isupper() for c in first_word):
+        out = out[0].upper() + out[1:]  # but leave iPhone and eBay alone
     return _restore_tokens(out, protected, placeholder_re)

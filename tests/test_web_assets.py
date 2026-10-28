@@ -4,8 +4,8 @@ from pathlib import Path
 WEB = Path(__file__).resolve().parent.parent / "voisr" / "web"
 INDEX = WEB / "index.html"
 
-JS_FILES = ["js/api.js", "js/ui.js", "js/palette.js",
-            "js/views/home.js", "js/views/history.js",
+JS_FILES = ["js/api.js", "js/ui.js", "js/lists.js", "js/palette.js",
+            "js/meter.js", "js/dock-meter.js", "js/views/home.js", "js/views/history.js",
             "js/views/dictionary.js", "js/views/settings.js", "js/main.js"]
 CSS_FILES = ["css/tokens.css", "css/base.css",
              "css/components.css", "css/views.css"]
@@ -112,6 +112,15 @@ ALLOWED_LITERAL_COLOURS = {
     "rgba(28, 26, 23, .96)": "mini-pill's own fixed dark chrome background",
     "rgba(0, 0, 0, .35)": "colour-wheel thumb shadow ring",
     "rgba(0, 0, 0, .4)": "colour-wheel thumb shadow ring",
+    # -- appearance thumbnails: fixed light/dark preview swatches (views.css).
+    #    Like the pill colours these must NOT follow the active appearance --
+    #    a Light thumbnail has to still look light while the app is in dark
+    #    mode, which is the whole point of showing the choice as a picture.
+    "rgb(246, 243, 238)": "theme thumbnail: light --bg",
+    "rgb(232, 227, 218)": "theme thumbnail: light --border",
+    "rgb(35, 32, 25)": "theme thumbnail: dark --surface",
+    "rgb(26, 24, 21)": "theme thumbnail: dark --bg",
+    "rgb(51, 47, 39)": "theme thumbnail: dark --border",
     "rgba(255, 255, 255, .08)": "toast-action button: a fixed white-on-dark "
         "hover surface for the undo button. The toast chip itself uses "
         "var(--ink), which flips light/dark with the theme (light chip in "
@@ -199,16 +208,27 @@ def test_permission_strip_refreshes_on_window_focus():
     assert '"focus"' in src or "'focus'" in src
 
 
-def test_home_hero_is_keycap_led():
+def test_home_leads_with_a_status_line_not_a_record_card():
+    """Dictation happens outside this window — the old hero record card
+    implied otherwise, and gave the fallback recorder the whole fold."""
     html = INDEX.read_text()
-    assert 'id="hero-keycap"' in html
-    assert 'id="hero-wave"' in html
+    assert 'id="ptt-bar"' in html
+    assert 'id="ptt-keycap"' in html
+    # the keycap and the sentence must both be able to name the key
+    assert 'id="ptt-key-name"' in html
+    assert 'class="record-card' not in html
+    assert 'id="hero-wave"' not in html
 
 
-def test_record_button_is_demoted_to_secondary():
+def test_record_button_is_docked_not_the_headline():
+    """Click-to-record survives as the fallback for when the key can't be
+    used, so it lives in the dock: never a primary button, never the hero."""
     html = INDEX.read_text()
-    assert 'class="btn-secondary"' in html
-    assert "or click to record" in html
+    assert 'class="dock"' in html
+    assert 'id="record-btn" class="dock-mic"' in html
+    assert 'id="dock-time"' in html, "the dock reports elapsed time while listening"
+    dock = html[html.index('class="dock"'):html.index("</section>", html.index('class="dock"'))]
+    assert "btn-primary" not in dock
 
 
 def test_hero_renders_the_configured_hotkey_label():
@@ -220,11 +240,19 @@ def test_hero_renders_the_configured_hotkey_label():
     assert "cfg.hotkey" not in src
 
 
-def test_stats_strip_replaces_the_stacked_column():
+def test_stats_are_three_tiles_each_carrying_its_own_trend():
+    """One lead stat, a sparkline floating between unrelated numbers, and two
+    shrunken also-rans became three equal tiles: every chart now belongs to
+    the number above it."""
     html = INDEX.read_text()
-    assert 'class="stats-strip"' in html
-    assert 'id="stat-saved"' in html
-    assert 'id="spark"' in html
+    assert 'class="tiles"' in html
+    # `class="tile"` or `class="tile tile-lead"`, but not the `tiles` grid
+    assert len(re.findall(r'class="tile(?:"| )', html)) == 3
+    for el_id in ["stat-saved", "stat-words", "stat-streak",
+                  "trend-saved", "trend-words", "trend-streak"]:
+        assert f'id="{el_id}"' in html, el_id
+    assert 'class="stats-strip"' not in html
+    assert 'id="spark"' not in html
     assert 'class="home-side"' not in html
 
 
@@ -232,7 +260,17 @@ def test_home_uses_time_saved_and_daily():
     src = (WEB / "js" / "views" / "home.js").read_text()
     assert "time_saved_seconds" in src
     assert "daily" in src
-    assert "sparklinePath" in src
+    assert "trendBars" in src
+    assert "weekDelta" in src
+
+
+def test_a_blocked_permission_takes_the_canvas_from_the_status_line():
+    """Without Input Monitoring, holding the key does nothing — a chip above
+    a line still promising it works was the app lying to the user."""
+    src = (WEB / "js" / "views" / "home.js").read_text()
+    assert "perm-block" in src
+    assert "#ptt-bar" in src, "the status line has to be hideable"
+    assert "perm-chip" not in src, "the chip strip is what the block replaced"
 
 
 def test_ui_exposes_format_duration():
@@ -328,11 +366,25 @@ def test_settings_is_split_into_four_sections():
     for section in ["Dictation", "Push-to-talk", "Appearance", "Privacy & data"]:
         assert section in html, section
     assert html.count('class="settings-section') >= 4
+    # four stacked cards read as four objects; this is one list of
+    # preferences, so the sections are headings over hairline rows
+    assert 'class="settings-section card"' not in html
+
+
+def test_appearance_is_chosen_by_picture():
+    """An appearance choice is the one control that should show its own
+    result — and it sits beside the pill-theme grid, which already did."""
+    html = INDEX.read_text()
+    assert 'id="appearance-grid"' in html
+    assert 'id="appearance-select"' not in html
+    src = (WEB / "js" / "views" / "settings.js").read_text()
+    assert "renderAppearance" in src
+    assert "thumb-art" in src
 
 
 def test_settings_has_the_new_controls():
     html = INDEX.read_text()
-    for el_id in ["appearance-select", "model-select", "launch-toggle",
+    for el_id in ["appearance-grid", "model-select", "launch-toggle",
                   "color-popover", "clear-history"]:
         assert f'id="{el_id}"' in html, el_id
 
@@ -394,8 +446,185 @@ def test_view_transition_class_exists_and_respects_reduced_motion():
     assert rule, "expected an 'animation: none' rule inside the reduced-motion block"
     disabled_selectors = rule.group(1)
     assert ".view.entering" in disabled_selectors
-    assert ".item-list .item-row" in disabled_selectors
+    assert ".item-list.is-staggering .item-row" in disabled_selectors
+    # the landing wash is colour, not movement: reduced motion keeps it
+    assert ".item-row.is-landed" not in disabled_selectors
 
 
 def test_show_applies_the_entering_class():
     assert "entering" in (WEB / "js" / "main.js").read_text()
+
+
+def test_switching_views_returns_to_the_top():
+    """.main is the single scroll container, so its offset survives a view
+    switch — scrolled to the bottom of Home, Settings would otherwise open
+    scrolled past its own content, showing a blank pane."""
+    src = (WEB / "js" / "main.js").read_text()
+    show = re.search(r"function show\(view\)\s*\{(.*?)\n  \}", src, re.S)
+    assert show, "could not find main.js's show()"
+    assert "scrollTop = 0" in show.group(1)
+
+
+# ---- M2: copy must not claim the clipboard holds every dictation ----
+# In hotkey mode with auto-paste on, a successful paste RESTORES the previous
+# clipboard (voisr/inject.py), so the dictation is not left on it. The old
+# Settings row ("Always on", "placed on your clipboard") and the pill's done
+# label ("Dictation copied") both said otherwise.
+
+def test_settings_does_not_claim_clipboard_is_always_on():
+    html = INDEX.read_text()
+    assert "Always on" not in html
+    assert "placed on your clipboard" not in html
+    assert "Copied when auto-paste is off or blocked" in html
+
+
+def test_pill_done_label_does_not_say_copied():
+    widget = (WEB / "widget.html").read_text()
+    assert 'aria-label="Dictation copied"' not in widget
+    assert 'aria-label="Dictation ready"' in widget
+
+
+# ---- M3: on-accent text must meet WCAG AA (4.5:1) in both themes ----
+
+def _theme_block(css, selector):
+    start = css.index(selector)
+    return css[start:css.index("}", start)]
+
+
+def _token(block, name):
+    return re.search(rf"{name}:\s*(#[0-9A-Fa-f]{{6}})", block).group(1)
+
+
+def _luminance(hex_colour):
+    def channel(c):
+        c /= 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (int(hex_colour[i:i + 2], 16) for i in (1, 3, 5))
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+
+
+def contrast_ratio(a, b):
+    la, lb = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def test_primary_button_text_meets_aa_contrast_in_both_themes():
+    css = TOKENS.read_text()
+    for selector in (':root[data-appearance="light"]', ':root[data-appearance="dark"]'):
+        block = _theme_block(css, selector)
+        ratio = contrast_ratio(_token(block, "--on-accent"), _token(block, "--accent"))
+        assert ratio >= 4.5, f"{selector}: on-accent/accent is {ratio:.2f}:1"
+
+
+def test_settings_explains_smart_join_spacing():
+    """L8: consecutive dictations are joined with a space unless a key was
+    pressed in between; a mouse click does not count. Say so."""
+    html = INDEX.read_text()
+    assert "joined with a space" in html
+    assert "mouse" in html
+
+
+def test_boot_toasts_a_moved_aside_config_and_the_mock_answers_it():
+    # H3: a corrupt config.json is quarantined at load; boot must say so.
+    assert "take_config_notice" in (WEB / "js" / "main.js").read_text()
+    assert "take_config_notice" in (WEB / "js" / "api.js").read_text()
+
+
+def test_words_tile_says_its_number_is_all_time():
+    # M9: the number is total_words; "last 14 days" described only the bars
+    src = INDEX.read_text()
+    tile = src[src.index('id="stat-words"'):]
+    tile = tile[:tile.index("</div>\n          </div>") if "</div>\n          </div>" in tile else 600]
+    assert "all time" in tile
+    assert "last 14 days" not in tile
+
+
+def test_palette_dictation_goes_through_home():
+    # M7: a dock recording started from another view was invisible
+    assert "dictateFromAnywhere" in (WEB / "js" / "palette.js").read_text()
+
+
+# ---- M11 (2026-10-12 audit) ----
+
+def test_theme_pickers_are_radio_groups():
+    html = INDEX.read_text()
+    for grid in ("appearance-grid", "theme-grid"):
+        tag = re.search(rf'<div id="{grid}"[^>]*>', html).group(0)
+        assert 'role="radiogroup"' in tag, grid
+
+
+def test_dock_status_is_announced():
+    tag = re.search(r'<p id="record-status"[^>]*>', INDEX.read_text()).group(0)
+    assert 'role="status"' in tag
+
+
+def test_apply_appearance_tells_the_rest_of_the_app():
+    src = (WEB / "js" / "main.js").read_text()
+    assert "voisr:appearance" in src
+    assert "V.appearancePref" in src
+
+
+def test_accent_text_meets_aa_on_every_background_in_both_themes():
+    css = TOKENS.read_text()
+    for selector in (':root[data-appearance="light"]', ':root[data-appearance="dark"]'):
+        block = _theme_block(css, selector)
+        for bg in ("--bg", "--surface", "--surface-2"):
+            ratio = contrast_ratio(_token(block, "--accent-text"), _token(block, bg))
+            assert ratio >= 4.5, f"{selector}: accent-text on {bg} is {ratio:.2f}:1"
+
+
+def test_the_more_disclosure_uses_the_text_safe_accent():
+    css = (WEB / "css" / "views.css").read_text()
+    rule = css[css.index(".more summary {"):]
+    rule = rule[:rule.index("}")]
+    assert "var(--accent-text)" in rule
+
+
+# ---- L8 (2026-10-12 audit) ----
+
+def test_settings_status_colour_follows_its_state():
+    css = (WEB / "css" / "views.css").read_text()
+    assert '.setting-status[data-state="off"]' in css
+
+
+def test_dock_sits_near_the_window_edge_not_a_padding_above_it():
+    # sticky bottom:0 is inset by .main's 60px bottom padding, so the dock
+    # floated 60px up with rows showing through the gap
+    css = (WEB / "css" / "views.css").read_text()
+    rule = css[css.index(".dock {"):]
+    rule = rule[:rule.index("}")]
+    assert "bottom: 0;" not in rule
+
+
+def test_dead_home_code_is_gone():
+    assert "PERM_HELP" not in (WEB / "js" / "views" / "home.js").read_text()
+    assert 'id="delta-streak"' not in INDEX.read_text()
+
+
+def test_dock_offset_derives_from_the_main_padding():
+    # review: -44px silently encoded .main's 60px padding
+    views = (WEB / "css" / "views.css").read_text()
+    base = (WEB / "css" / "base.css").read_text()
+    assert "var(--main-pad-b)" in views and "-44px" not in views
+    assert "--main-pad-b:" in base
+
+
+def test_landed_wash_outranks_the_row_stagger():
+    """Opening a page replays the stagger (.is-staggering) while a refresh
+    lands new rows. The stagger's `animation` (specificity 0,3,0) used to
+    beat the wash's (0,2,0), so a row that arrived while you were away never
+    showed where it went -- and under reduced motion, the stagger's
+    `animation: none` erased it too."""
+    css = re.sub(r"/\*.*?\*/", "", (WEB / "css" / "base.css").read_text(), flags=re.S)
+    assert re.search(
+        r"\.item-list\.is-staggering \.item-row\.is-landed[^{]*\{[^}]*animation:\s*wash", css)
+
+
+def test_trend_bars_keep_round_caps_when_scaled():
+    """Trend bars grow with scaleY, which squashes a plain 2px radius into a
+    flat top. Like the pill and dock bars, the vertical radius is
+    pre-stretched by the inverse of the scale (--h)."""
+    css = re.sub(r"/\*.*?\*/", "", (WEB / "css" / "views.css").read_text(), flags=re.S)
+    rule = re.search(r"\.trend \.bar \{([^}]*)\}", css).group(1)
+    assert "scaleY(var(--h))" in rule
+    assert re.search(r"border-radius:\s*2px\s*/\s*calc\(2px\s*/\s*var\(--h\)\)", rule)

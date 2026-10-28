@@ -35,18 +35,18 @@
   --edge-hi: rgba(255, 255, 255, .9);
 
   /* --- brand ----------------------------------------------------------- */
-  --accent: #E05B32;
-  --accent-hover: #C94D28;
-  --accent-press: #B44322;
-  /* Accent used AS TEXT on a light surface. The brand orange is only 3.68:1
-     on white -- fine for a fill or a 3px rail, below AA for a label. This
-     darkened variant is 5.48:1 on white and 4.86:1 on --bg, so accent-
-     coloured text passes without dulling the fills. */
+  /* Deep enough that white button text clears AA (4.68:1); the brighter
+     #E05B32 it replaced was 3.68:1 under a label. */
+  --accent: #C94A25;
+  --accent-hover: #B8401E;
+  --accent-press: #A63A1C;
+  /* Accent used AS TEXT on a light surface: 5.48:1 on white and 4.86:1 on
+     --bg, a step darker than the fill so small accent labels keep margin. */
   --accent-text: #B8421C;
   --accent-soft: #FCEDE7;
   --accent-line: #F3C9B8;
   --on-accent: #FFFFFF;
-  --accent-grad: linear-gradient(180deg, #EC6B40 0%, #DA5027 100%);
+  --accent-grad: linear-gradient(180deg, #CB4D27 0%, #BA4220 100%);
 
   /* --- status ---------------------------------------------------------- */
   --success: #2F6B41;
@@ -79,7 +79,7 @@
     0 4px 8px rgba(27, 25, 23, .08),
     0 16px 32px -6px rgba(27, 25, 23, .14),
     0 40px 80px -16px rgba(27, 25, 23, .22);
-  --shadow-accent: 0 6px 16px -4px rgba(224, 91, 50, .42);
+  --shadow-accent: 0 6px 16px -4px rgba(201, 74, 37, .42);
 
   /* Keycap's lit inner top edge -- white reads as a physical key on the
      light cream surface. */

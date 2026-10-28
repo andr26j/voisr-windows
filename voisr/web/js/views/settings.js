@@ -18,14 +18,43 @@ window.Voisr = window.Voisr || {};
       V.ui.tryApi(V.api().get_pill_themes(), "Load pill themes"),
     ]);
     if (!cfg || !themes) return;
-    const active = cfg.pill_theme || "classic";
-    $("#theme-grid").replaceChildren(...themes.map((t) =>
-      V.ui.el("button", {
-        type: "button",
-        class: `theme-opt${t.value === active ? " active" : ""}`,
-        data: { value: t.value },
-        "aria-pressed": String(t.value === active),
-      }, miniPillNode(t.value), V.ui.el("span", { class: "theme-name", text: t.label }))));
+    const labels = Object.fromEntries(themes.map((t) => [t.value, t.label]));
+    V.ui.syncRadios($("#theme-grid"), {
+      values: themes.map((t) => t.value),
+      checked: cfg.pill_theme || "classic",
+      cls: "theme-opt",
+      build: (value) => V.ui.el("button", { type: "button", data: { value } },
+        miniPillNode(value), V.ui.el("span", { class: "theme-name", text: labels[value] })),
+    });
+  }
+
+  /* ----- appearance thumbnails -----
+
+     An appearance choice is the one control that should show its own result,
+     so it is picked by picture rather than from a <select>. Built here (not
+     in index.html) so the active state has a single source of truth, exactly
+     like the pill grid above. */
+
+  const APPEARANCES = [
+    { value: "system", label: "Match system" },
+    { value: "light", label: "Light" },
+    { value: "dark", label: "Dark" },
+  ];
+
+  function thumbNode(mode) {
+    return V.ui.el("span", { class: "thumb-art", data: { mode }, "aria-hidden": "true" },
+      V.ui.el("i"), V.ui.el("b"));
+  }
+
+  function renderAppearance() {
+    const labels = Object.fromEntries(APPEARANCES.map((a) => [a.value, a.label]));
+    V.ui.syncRadios(V.ui.$("#appearance-grid"), {
+      values: APPEARANCES.map((a) => a.value),
+      checked: appliedAppearance,
+      cls: "thumb",
+      build: (value) => V.ui.el("button", { type: "button", data: { value } },
+        thumbNode(value), V.ui.el("span", { class: "thumb-name", text: labels[value] })),
+    });
   }
 
   /* ----- custom color wheel (HSV, V=1; standard f(5),f(3),f(1) mapping) ----- */
@@ -198,12 +227,12 @@ window.Voisr = window.Voisr || {};
         $("#paste-toggle").checked = !!cfg.paste;
         $("#widget-toggle").checked = cfg.show_widget !== false;
         appliedAppearance = cfg.appearance || "system";
-        $("#appearance-select").value = appliedAppearance;
+        renderAppearance();
         $("#launch-toggle").checked = !!cfg.launch_at_login;
         $("#update-toggle").checked = cfg.check_for_updates !== false;
       }
       if (hotkey) $("#hotkey-current").textContent = hotkey.display || "unset";
-      if (status) $("#hotkey-status").textContent = status.status;
+      if (status) renderHotkeyStatus(status);
       // `upd.version` can outlive the release it names -- UpdateChecker never
       // clears its manifest -- so only `current_version` (this build, always
       // correct) belongs here. Whether an update is actually installable is
@@ -267,14 +296,34 @@ window.Voisr = window.Voisr || {};
      document-level listeners in particular would stack. */
 
   function init() {
-    document.getElementById("appearance-select").addEventListener("change", async (e) => {
-      const prev = appliedAppearance;
-      const next = e.target.value;
+    /* Delegated, because renderAppearance() replaces the buttons on every
+       render — a listener bound to each button would be lost with it. A
+       failed write re-renders from appliedAppearance, so the grid can never
+       be left highlighting a theme that was neither applied nor persisted. */
+    const pickAppearance = V.ui.serial(async (btn) => {
+      const next = btn.dataset.value;
+      if (next === appliedAppearance) return;
       const res = await V.ui.tryApi(V.api().set_appearance(next), "Change theme");
-      if (!res) { e.target.value = prev; return; }
+      if (!res) { renderAppearance(); return; }
       appliedAppearance = next;
+      renderAppearance();
       V.applyAppearance(next);
       V.ui.toast(`Theme: ${next}`);
+    });
+    const appearanceGrid = document.getElementById("appearance-grid");
+    appearanceGrid.addEventListener("click", (e) => {
+      const btn = e.target.closest(".thumb");
+      if (btn) pickAppearance(btn);
+    });
+    V.ui.radioKeys(appearanceGrid, ".thumb", pickAppearance);
+    // The palette's "Toggle appearance" changes the theme without this view:
+    // follow it, or the grid highlights a theme that is no longer applied.
+    window.addEventListener("voisr:appearance", () => {
+      if (!V.appearancePref) return;
+      const pref = V.appearancePref();
+      if (pref === appliedAppearance) return;  // our own pick: already shown
+      appliedAppearance = pref;
+      renderAppearance();
     });
 
     document.getElementById("model-select").addEventListener("change", async (e) => {
@@ -419,5 +468,13 @@ window.Voisr = window.Voisr || {};
   }
 
   V.views = V.views || {};
-  V.views.settings = { init, render, renderThemes, renderColorWheel, initColorWheel, openColorPopover };
+  /* The sentence comes from Python; its colour from state, so "push-to-talk
+     not running" no longer shows in the same green as "active". */
+  function renderHotkeyStatus(status) {
+    const node = V.ui.$("#hotkey-status");
+    node.textContent = status.status;
+    node.dataset.state = status.state || "unknown";
+  }
+
+  V.views.settings = { renderAppearance, renderHotkeyStatus, init, render, renderThemes, renderColorWheel, initColorWheel, openColorPopover };
 })(window.Voisr);

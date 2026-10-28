@@ -51,11 +51,21 @@ class PasteboardItemSnapshot:
     payloads: tuple[tuple[str, bytes], ...]
 
 
+# Password managers (KeePass, Bitwarden, 1Password) mark a secret by adding
+# one of these registered formats alongside the text, so clipboard history
+# and sync skip it.
+CONCEALED_FORMAT_NAMES = frozenset({
+    "ExcludeClipboardContentFromMonitorProcessing",
+    "Clipboard Viewer Ignore",
+})
+
+
 @dataclass(frozen=True)
 class PasteboardSnapshot:
     change_count: int
     items: tuple[PasteboardItemSnapshot, ...]
     partial: bool = field(default=False)
+    concealed: bool = field(default=False)
 
 
 class PasteDeliveryError(RuntimeError):
@@ -134,6 +144,12 @@ class _Win32Clipboard:
     def get_sequence(self) -> int:
         return int(self.user32.GetClipboardSequenceNumber())
 
+    def format_name(self, fmt: int) -> str | None:
+        """Name of a registered format; None for the predefined CF_* ones."""
+        buffer = ctypes.create_unicode_buffer(256)
+        length = self.user32.GetClipboardFormatNameW(fmt, buffer, len(buffer))
+        return buffer.value if length else None
+
 
 class WindowsClipboard:
     """Same interface as the macOS AppKitPasteboard: snapshot,
@@ -154,8 +170,10 @@ class WindowsClipboard:
         self._open()
         try:
             sequence = self._w.get_sequence()
-            payloads, partial = [], False
+            payloads, partial, concealed = [], False, False
             for fmt in self._w.enum_formats():
+                if self._w.format_name(fmt) in CONCEALED_FORMAT_NAMES:
+                    concealed = True
                 if is_synthesized(fmt):
                     continue
                 data = self._w.get_data(fmt)
@@ -168,7 +186,7 @@ class WindowsClipboard:
         finally:
             self._w.close()
         items = (PasteboardItemSnapshot(tuple(payloads)),) if payloads else ()
-        return PasteboardSnapshot(sequence, items, partial)
+        return PasteboardSnapshot(sequence, items, partial, concealed)
 
     def is_owned(self, expected_count) -> bool:
         try:

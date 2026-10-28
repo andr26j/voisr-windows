@@ -9,10 +9,34 @@ window.Voisr = window.Voisr || {};
   let enteringTarget = null;
   let enteringController = null;
 
+  /* One highlight glides behind the sidebar to the active item (180 ms,
+     base.css) instead of each item painting its own. The first placement
+     happens with the transition off, so the first paint doesn't glide in;
+     reduced motion snaps in CSS. */
+  function glideTo(view) {
+    const glide = document.getElementById("nav-glide");
+    const item = Array.from(document.querySelectorAll(".nav-item"))
+      .find((b) => b.dataset.view === view);
+    if (!glide || !item) return;
+    glide.style.height = `${item.offsetHeight}px`;
+    glide.style.transform = `translateY(${item.offsetTop}px)`;
+    if (!glide.classList.contains("is-live")) {
+      void glide.offsetWidth;  // commit the first position before transitions switch on
+      glide.classList.add("is-live");
+    }
+  }
+
   function show(view) {
     document.querySelectorAll(".view").forEach((v) => { v.hidden = v.id !== `view-${view}`; });
     document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+    glideTo(view);
     const target = document.getElementById(`view-${view}`);
+
+    // .main is the one scroll container for every view, so its offset
+    // carries across a switch: leave Home scrolled to the bottom, open
+    // Settings, and it opens scrolled past its own content — a blank pane.
+    const main = document.querySelector(".main");
+    if (main) main.scrollTop = 0;
 
     if (enteringController) {
       enteringController.abort();
@@ -38,7 +62,10 @@ window.Voisr = window.Voisr || {};
     target.addEventListener("animationend", finishEntering, { once: true, signal: controller.signal });
     target.addEventListener("animationcancel", finishEntering, { once: true, signal: controller.signal });
 
-    if (view === "home") V.views.home.render();
+    // opening a page replays the row stagger on what is already there
+    if (V.lists) target.querySelectorAll(".item-list").forEach((list) => V.lists.stagger(list));
+
+    if (view === "home") V.views.home.render({ entering: true });
     if (view === "history") V.views.history.render();
     if (view === "dictionary") V.views.dictionary.render();
     if (view === "settings") V.views.settings.render();
@@ -61,8 +88,12 @@ window.Voisr = window.Voisr || {};
      tokens.css needs one block per theme instead of restating both. */
   V.applyAppearance = function (pref) {
     appearancePref = pref || "system";
-    return resolveAppearance();
+    const mode = resolveAppearance();
+    // Settings' picker listens: the palette applies a theme without it.
+    window.dispatchEvent(new Event("voisr:appearance"));
+    return mode;
   };
+  V.appearancePref = () => appearancePref;
 
   // keep following Windows when the user has not pinned a theme
   DARK_QUERY.addEventListener("change", () => {
@@ -91,9 +122,7 @@ window.Voisr = window.Voisr || {};
       if (!res) { e.target.checked = !e.target.checked; return; }
       V.ui.toast(e.target.checked ? "Recording widget on" : "Recording widget off");
     });
-    $("#theme-grid").addEventListener("click", async (e) => {
-      const btn = e.target.closest(".theme-opt");
-      if (!btn) return;
+    const pickPillTheme = V.ui.serial(async (btn) => {
       const res = await V.ui.tryApi(
         V.api().set_config({ pill_theme: btn.dataset.value }), "Save pill theme");
       // Re-render regardless: on success this reflects the newly active
@@ -104,6 +133,11 @@ window.Voisr = window.Voisr || {};
       if (!res) return;
       V.ui.toast(`Pill theme: ${btn.querySelector(".theme-name").textContent}`);
     });
+    $("#theme-grid").addEventListener("click", (e) => {
+      const btn = e.target.closest(".theme-opt");
+      if (btn) pickPillTheme(btn);
+    });
+    V.ui.radioKeys($("#theme-grid"), ".theme-opt", pickPillTheme);
     // pushed from Python after each dictation (hotkey ones land while the
     // dashboard is open) — refresh whichever view is on screen
     window.addEventListener("voisr:new-dictation", () => {
@@ -139,6 +173,11 @@ window.Voisr = window.Voisr || {};
     // appearance may not match what was saved.
     const cfg = await V.ui.tryApi(V.api().get_config(), "Load settings");
     V.applyAppearance((cfg && cfg.appearance) || "system");
+
+    // A config.json that couldn't be parsed was moved aside at load; say so
+    // once, or the user just sees their dictionary gone.
+    const notice = await V.ui.tryApi(V.api().take_config_notice(), "Check settings file");
+    if (notice && notice.notice) V.ui.toast(notice.notice);
 
     show("home");
   }

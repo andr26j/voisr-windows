@@ -94,8 +94,9 @@ def test_url_preserves_adjacent_exclamation_and_prose_as_uri_text():
     assert clean("visit https://example.com!now") == "Visit https://example.com!now"
 
 
-def test_non_url_www_substring_is_not_protected():
-    assert clean("say notwww.example.com now") == "Say notwww. example. com now"
+def test_non_url_www_substring_is_kept_as_a_dotted_token():
+    # was pinned as "notwww. example. com" -- the M1 bug (2026-10-12 audit)
+    assert clean("say notwww.example.com now") == "Say notwww.example.com now"
 
 
 def test_time_preserves_final_period_in_meridiem():
@@ -125,8 +126,8 @@ def test_preserves_uri_commas_colons_and_semicolons():
     assert clean(raw) == "Open https://example.com/a:b,c;d?x=one,two;three#now"
 
 
-def test_unicode_embedded_www_substring_is_not_protected():
-    assert clean("say éwww.example.com now") == "Say éwww. example. com now"
+def test_unicode_embedded_www_substring_is_kept_as_a_dotted_token():
+    assert clean("say éwww.example.com now") == "Say éwww.example.com now"
 
 
 def test_preserves_urls_wrapped_in_parentheses_and_quotes():
@@ -161,16 +162,23 @@ def test_dictionary_phrases_apply_around_multiple_protected_spans():
 @pytest.mark.parametrize(
     ("written", "expected"),
     [
-        ("https://example.com", "Say https: //example. com"),
-        ("a@example.com", "Say a@example. com"),
+        ("https://example.com", "Say https://example.com"),
+        ("a@example.com", "Say a@example.com"),
+        ("e.g.", "Say e.g."),
+        ("12:00", "Say 12:00"),
+        ("trademate.com.au", "Say trademate.com.au"),
     ],
 )
-def test_dictionary_generated_structured_text_keeps_base_cleanup_behavior(written, expected):
+def test_dictionary_output_is_written_exactly_as_the_user_typed_it(written, expected):
+    # was pinned as "https: //example. com": the user's own replacement text
+    # must not be re-punctuated (M1, 2026-10-12 audit)
     assert clean("say token", {"token": written}) == expected
 
 
-def test_dictionary_replacements_keep_cascade_order():
-    assert clean("say alpha", {"alpha": "beta", "beta": "gamma"}) == "Say gamma"
+def test_dictionary_replacements_do_not_cascade():
+    # was pinned as "Say gamma": a replacement must not feed another entry
+    # (L4, 2026-10-12 audit), or {"york": ..., "new york": ...} breaks
+    assert clean("say alpha", {"alpha": "beta", "beta": "gamma"}) == "Say beta"
 
 
 def test_unmatched_closing_parenthesis_and_suffix_are_unprotected():
@@ -350,3 +358,92 @@ def test_mixed_length_dotted_prose_keeps_legacy_cleanup(raw, dictionary, expecte
 )
 def test_namespace_digest_accepts_lone_surrogates(raw, dictionary, expected):
     assert clean(raw, dictionary) == expected
+
+
+# ---- M1 / M2 (2026-10-12 audit) ----
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("go to google.com", "Go to google.com"),
+        ("open config.json now", "Open config.json now"),
+        ("built with Node.js today", "Built with Node.js today"),
+        ("see trademate.com.au.", "See trademate.com.au."),
+        ("google.com, then bing.com", "google.com, then bing.com"),
+    ],
+)
+def test_dotted_names_keep_their_dots(raw, expected):
+    assert clean(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Wait...", "Wait..."),
+        ("wait... then go", "Wait... then go"),
+        ("Really?!", "Really?!"),
+        ("no way!? yes", "No way!? yes"),
+    ],
+)
+def test_punctuation_runs_stay_together(raw, expected):
+    assert clean(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "dictionary", "expected"),
+    [
+        ("iphone is great", {"iphone": "iPhone"}, "iPhone is great"),
+        ("ebay sold it", {"ebay": "eBay"}, "eBay sold it"),
+        ("iPad first", None, "iPad first"),
+        ("hello there", None, "Hello there"),
+    ],
+)
+def test_a_first_word_with_its_own_capitals_is_not_recapitalised(raw, dictionary, expected):
+    assert clean(raw, dictionary) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Take him to the ER now.", "Take him to the ER now."),
+        ("Uh-oh, that broke.", "Uh-oh, that broke."),
+        ("I need it, uh?", "I need it?"),
+        ("so (um) yes", "So yes"),
+        ("I think uh.", "I think."),
+        ("Um. I think so", "I think so"),
+        ("Is it, hmm?", "Is it?"),
+    ],
+)
+def test_filler_removal_keeps_real_words_and_sentence_punctuation(raw, expected):
+    assert clean(raw) == expected
+
+
+# ---- L4 (2026-10-12 audit) ----
+
+def test_the_longest_dictionary_phrase_wins_whatever_the_order():
+    d = {"york": "Yorkshire", "new york": "NYC"}
+    assert clean("fly to new york", d) == "Fly to NYC"
+    assert clean("drive to york", d) == "Drive to Yorkshire"
+
+
+def test_a_dictionary_phrase_matches_across_any_whitespace():
+    assert clean("ask trade\n mate", {"trade mate": "TradeMate"}) == "Ask TradeMate"
+
+
+def test_an_empty_dictionary_key_is_ignored():
+    assert clean("x marks", {"": "Z"}) == "X marks"
+
+
+def test_a_large_dictionary_is_compiled_once_not_per_protected_span():
+    # was one pattern build per gap between protected tokens: a dictation
+    # full of numbers paid it hundreds of times, ~60x slower than one build.
+    # One-space gaps keep the matching itself negligible, so this times the
+    # builds alone; best of 3 so one GC pause or busy moment can't fail it.
+    dictionary = {f"word{i}": f"Written{i}" for i in range(500)}
+    raw = " ".join(["1.2"] * 400) + " word7"
+    timings = []
+    for _ in range(3):
+        started = perf_counter()
+        assert clean(raw, dictionary) == " ".join(["1.2"] * 400) + " Written7"
+        timings.append(perf_counter() - started)
+    assert min(timings) < 0.05

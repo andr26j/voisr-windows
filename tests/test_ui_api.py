@@ -153,10 +153,12 @@ def test_hotkey_display_falls_back_to_option_label(tmp_path):
     assert api.hotkey_display()["display"] == "Right Alt"
 
 
-def test_hotkey_display_unset_when_nothing_configured(tmp_path):
+def test_hotkey_display_of_an_invalid_hotkey_is_the_default(tmp_path):
+    # A hand-edited null hotkey is salvaged back to the default on load, so
+    # the display names the key that is actually live.
     api = make_api(tmp_path, config_path=tmp_path / "empty.json")
     (tmp_path / "empty.json").write_text(json.dumps({"hotkey": None}))
-    assert api.hotkey_display() == {"display": "unset"}
+    assert api.hotkey_display() == {"display": "Right Ctrl"}
 
 
 def test_released_sessions_paste_and_enter_history_fifo(tmp_path):

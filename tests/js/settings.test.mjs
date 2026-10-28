@@ -36,11 +36,11 @@ test("settings.js loads without touching the DOM at parse time", () => {
    (document/window listener recording + dispatch, node.contains/closest,
    parent links) specifically to unlock these. */
 
-// init() now also binds the update-toggle checkbox and Check-now button
+// init() also binds the update-toggle checkbox and Check-now button
 // (tests/js/update.test.mjs covers their behaviour) -- both must still be
 // registered here, or getElementById(...) hands init() a null and it throws
 // on the very first addEventListener, taking every test in this file with it.
-const SETTINGS_IDS = ["appearance-select", "model-select", "launch-toggle",
+const SETTINGS_IDS = ["appearance-grid", "model-select", "launch-toggle",
                        "color-open", "color-popover", "clear-history", "toast",
                        "update-toggle", "update-check"];
 
@@ -52,7 +52,7 @@ function mountSettings(t, api, apis = ["setTimeout"]) {
   const nodes = {};
   for (const id of SETTINGS_IDS) {
     nodes[id] = makeNode(id === "launch-toggle" || id === "update-toggle" ? "input"
-      : id === "appearance-select" || id === "model-select" ? "select"
+      : id === "model-select" ? "select"
       : id === "update-check" ? "button" : "div");
     env.register(id, nodes[id]);
   }
@@ -324,4 +324,181 @@ test("outside click and Escape dismiss the colour popover; a click inside it or 
 
   h.document.dispatch("keydown", { key: "Escape" });
   assert.equal(pop.hidden, true, "Escape closes the open popover");
+});
+
+/* ---------- appearance thumbnails ----------
+
+   The grid replaces its own buttons on every render, so the click listener
+   is delegated onto the grid; a per-button listener would be thrown away
+   with the buttons. These drive it the way dom.mjs intends -- dispatching
+   on the grid with the button as the event target. */
+
+function mountAppearance(t, api) {
+  const env = mountSettings(t, {
+    get_config: async () => ({ appearance: "system", pill_theme: "classic" }),
+    set_appearance: async (mode) => ({ ok: true, appearance: mode }),
+    ...api,
+  });
+  // main.js owns applyAppearance; settings.js only calls it
+  const applied = [];
+  env.V.applyAppearance = (mode) => applied.push(mode);
+  env.V.views.settings.renderAppearance();
+  return { ...env, applied };
+}
+
+const labelsOf = (grid) => grid.children.map((b) => b.dataset.value);
+const activeOf = (grid) =>
+  (grid.children.find((b) => b.className.includes("active")) || {}).dataset?.value;
+
+test("the appearance grid offers all three modes as pictures, with the stored one marked", async (t) => {
+  const s = mountAppearance(t, {});
+
+  assert.deepEqual(labelsOf(s["appearance-grid"]), ["system", "light", "dark"]);
+  // each is a picture of the theme, not a text row
+  assert.ok(s["appearance-grid"].children.every((b) =>
+    b.children.some((c) => c.className === "thumb-art")));
+  assert.equal(activeOf(s["appearance-grid"]), "system");
+  // M11 (2026-10-12 audit): one-of-three is a radio group, not toggles
+  assert.equal(s["appearance-grid"].children[0].getAttribute("role"), "radio");
+  assert.equal(s["appearance-grid"].children[0].getAttribute("aria-checked"), "true");
+  assert.equal(s["appearance-grid"].children[2].getAttribute("aria-checked"), "false");
+  // roving tabindex: Tab lands on the checked option only
+  assert.deepEqual(s["appearance-grid"].children.map((b) => b.getAttribute("tabindex")),
+    ["0", "-1", "-1"]);
+});
+
+test("picking a theme saves it, applies it, and moves the highlight", async (t) => {
+  const saved = [];
+  const s = mountAppearance(t, {
+    set_appearance: async (mode) => { saved.push(mode); return { ok: true }; },
+  });
+
+  const dark = s["appearance-grid"].children[2];
+  s["appearance-grid"].dispatch("click", { target: dark });
+  await settle();
+
+  assert.deepEqual(saved, ["dark"]);
+  assert.deepEqual(s.applied, ["dark"]);
+  assert.equal(activeOf(s["appearance-grid"]), "dark");
+});
+
+test("a failed save leaves the grid on the theme that is actually applied", async (t) => {
+  // The <select> this replaced had the same contract: a write that fails
+  // must never leave the control showing a theme that was neither applied
+  // nor persisted.
+  const s = mountAppearance(t, { set_appearance: async () => ({ error: "read-only config" }) });
+
+  s["appearance-grid"].dispatch("click", { target: s["appearance-grid"].children[1] });
+  await settle();
+
+  assert.equal(activeOf(s["appearance-grid"]), "system",
+    "the highlight snaps back to what is really stored");
+  assert.deepEqual(s.applied, [], "nothing was applied");
+});
+
+test("clicking the already-active theme is a no-op, not a redundant write", async (t) => {
+  const saved = [];
+  const s = mountAppearance(t, {
+    set_appearance: async (mode) => { saved.push(mode); return { ok: true }; },
+  });
+
+  s["appearance-grid"].dispatch("click", { target: s["appearance-grid"].children[0] });
+  await settle();
+
+  assert.deepEqual(saved, []);
+});
+
+test("a click on the grid's own padding does nothing", async (t) => {
+  const saved = [];
+  const s = mountAppearance(t, {
+    set_appearance: async (mode) => { saved.push(mode); return { ok: true }; },
+  });
+
+  s["appearance-grid"].dispatch("click", { target: s["appearance-grid"] });
+  await settle();
+
+  assert.deepEqual(saved, []);
+});
+
+
+/* ---------- M11 (2026-10-12 audit): keyboard and stale-state fixes ---------- */
+
+test("picking a theme keeps the same buttons, so keyboard focus stays on the choice", async (t) => {
+  // replaceChildren on every render dropped focus to <body> after a pick
+  const s = mountAppearance(t, {});
+  const before = [...s["appearance-grid"].children];
+  s["appearance-grid"].dispatch("click", { target: before[2] });
+  await settle();
+  assert.ok(s["appearance-grid"].children.every((b, i) => b === before[i]),
+    "the grid was rebuilt instead of updated");
+  assert.equal(activeOf(s["appearance-grid"]), "dark");
+  assert.equal(before[2].getAttribute("tabindex"), "0");
+});
+
+test("arrow keys move the theme choice like any radio group", async (t) => {
+  const saved = [];
+  const s = mountAppearance(t, {
+    set_appearance: async (mode) => { saved.push(mode); return { ok: true }; },
+  });
+  const [system, light, dark] = s["appearance-grid"].children;
+  s["appearance-grid"].dispatch("keydown", { key: "ArrowRight", target: system, preventDefault() {} });
+  await settle();
+  s["appearance-grid"].dispatch("keydown", { key: "ArrowLeft", target: light, preventDefault() {} });
+  await settle();
+  s["appearance-grid"].dispatch("keydown", { key: "ArrowLeft", target: system, preventDefault() {} });
+  await settle();
+  assert.deepEqual(saved, ["light", "system", "dark"], "wraps from first to last");
+  assert.equal(activeOf(s["appearance-grid"]), "dark");
+  void dark;
+});
+
+test("the theme picker follows an appearance change made elsewhere (the palette)", async (t) => {
+  const s = mountAppearance(t, {});
+  s.V.appearancePref = () => "dark";
+  globalThis.window.dispatch("voisr:appearance");
+  assert.equal(activeOf(s["appearance-grid"]), "dark",
+    "the highlighted option must be the one actually applied");
+});
+
+test("the push-to-talk status is only green while the key is listening", async (t) => {
+  // L8 (2026-10-12 audit): "push-to-talk not running" used to show in green
+  const s = mountSettings(t, {});
+  const node = makeNode("p");
+  s.V.ui.$ = ((orig) => (sel) => (sel === "#hotkey-status" ? node : orig(sel)))(s.V.ui.$);
+  s.V.views.settings.renderHotkeyStatus({ status: "active on F13", state: "listening" });
+  assert.equal(node.dataset.state, "listening");
+  s.V.views.settings.renderHotkeyStatus({ status: "push-to-talk not running", state: "off" });
+  assert.equal(node.dataset.state, "off");
+  assert.equal(node.textContent, "push-to-talk not running");
+});
+
+test("fast theme picks are saved in the order they were made", async (t) => {
+  // overlapping set_appearance calls let the slower one win
+  const saved = [];
+  const pending = [];
+  const s = mountAppearance(t, {
+    set_appearance: (mode) => new Promise((r) => pending.push(() => { saved.push(mode); r({ ok: true }); })),
+  });
+  const [system, light] = s["appearance-grid"].children;
+  s["appearance-grid"].dispatch("keydown", { key: "ArrowRight", target: system, preventDefault() {} });
+  s["appearance-grid"].dispatch("keydown", { key: "ArrowRight", target: light, preventDefault() {} });
+  await settle();
+  assert.equal(pending.length, 1, "the second pick waits for the first");
+  pending.shift()();
+  await settle(); await settle();
+  assert.equal(pending.length, 1);
+  pending.shift()();
+  await settle(); await settle();
+  assert.deepEqual(saved, ["light", "dark"]);
+  assert.deepEqual(s.applied, ["light", "dark"]);
+  assert.equal(activeOf(s["appearance-grid"]), "dark");
+});
+
+test("the appearance event doesn't re-render a picker that already shows it", async (t) => {
+  const s = mountAppearance(t, {});
+  const btn = s["appearance-grid"].children[0];
+  btn.setAttribute("tabindex", "sentinel");
+  s.V.appearancePref = () => "system";
+  globalThis.window.dispatch("voisr:appearance");
+  assert.equal(btn.getAttribute("tabindex"), "sentinel");
 });

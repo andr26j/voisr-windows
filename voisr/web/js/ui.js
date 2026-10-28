@@ -9,6 +9,7 @@ window.Voisr = window.Voisr || {};
     copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>',
     trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>',
     arrow: '<svg class="dict-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>',
+    keyboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="20" height="14" x="2" y="7" rx="3"/><path d="M6 11h.01M10 11h.01M14 11h.01M18 11h.01M8 15h8"/></svg>',
   };
 
   function timeOf(ts) {
@@ -412,6 +413,48 @@ window.Voisr = window.Voisr || {};
                      html: ICONS.trash, on: { click: (e) => { e.stopPropagation(); onDelete(item); } } }));
   }
 
+  /* One-of-N pickers (theme, pill) are radio groups. syncRadios updates the
+     buttons in place and only builds them when the option set changes:
+     rebuilding on every render dropped keyboard focus to <body> mid-choice.
+     Roving tabindex puts Tab on the checked option; radioKeys moves the
+     choice with the arrow keys, wrapping, as a native radio group does. */
+  function syncRadios(grid, { values, checked, cls, build }) {
+    const current = [...grid.children];
+    const same = current.length === values.length &&
+      current.every((b, i) => b.dataset.value === values[i]);
+    if (!same) grid.replaceChildren(...values.map(build));
+    for (const b of grid.children) {
+      const on = b.dataset.value === checked;
+      b.className = on ? `${cls} active` : cls;
+      b.setAttribute("role", "radio");
+      b.setAttribute("aria-checked", String(on));
+      b.setAttribute("tabindex", on ? "0" : "-1");
+    }
+  }
+
+  const ARROW_STEP = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 };
+
+  function radioKeys(grid, selector, pick) {
+    grid.addEventListener("keydown", (e) => {
+      const step = ARROW_STEP[e.key];
+      const btn = step && e.target && e.target.closest ? e.target.closest(selector) : null;
+      if (!btn) return;
+      e.preventDefault();
+      const items = [...grid.children];
+      const next = items[(items.indexOf(btn) + step + items.length) % items.length];
+      next.focus();
+      pick(next);
+    });
+  }
+
+  /* Queue calls to an async fn so each starts after the last settles. Fast
+     arrow-key picks otherwise overlap their saves, and whichever resolves
+     last wins on disk while the picker shows the other. */
+  function serial(fn) {
+    let chain = Promise.resolve();
+    return (...args) => (chain = chain.then(() => fn(...args)).catch(() => {}));
+  }
+
   V.ui = { el, $, toast, tryApi, timeOf, dayOf, formatDuration, ICONS, itemRow,
-           offerDictationUndo, offerEntryUndo };
+           offerDictationUndo, offerEntryUndo, syncRadios, radioKeys, serial };
 })(window.Voisr);

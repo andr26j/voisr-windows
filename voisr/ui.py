@@ -8,6 +8,7 @@ dedicated Windows module is imported rather than re-implemented:
 `voisr.window_chrome` (DWM dark titlebar), `voisr.launch_agent` (per-user Run
 key), and `voisr.status_item` (the tray icon).
 """
+import functools
 import json
 import os
 import threading
@@ -15,9 +16,9 @@ import time
 from pathlib import Path
 
 import voisr
-from voisr import launch_agent, permissions
+from voisr import launch_agent, permissions, speech_gate
+from voisr.app import config_errors, load_config
 from voisr.app import config_path as default_config_path
-from voisr.app import load_config
 from voisr.cleanup import clean
 from voisr.history import HistoryStore
 from voisr.inject import paste_at_cursor, set_clipboard
@@ -76,22 +77,48 @@ PILL_THEMES = [
 ]
 
 
-def wav_peak(path) -> int:
-    """Peak |amplitude| of a 16-bit WAV, -1 if unparseable (skip the check)."""
-    import array
+def wav_seconds(path) -> float:
+    """Length of a WAV in seconds, -1 if unparseable (skip the check)."""
     import wave
     try:
         with wave.open(str(path), "rb") as w:
-            if w.getsampwidth() != 2:
-                return -1
-            data = w.readframes(w.getnframes())
-        if not data:
-            return 0
-        samples = array.array("h")
-        samples.frombytes(data[:len(data) // 2 * 2])
-        return max(abs(s) for s in samples) if samples else 0
+            return w.getnframes() / w.getframerate()
     except Exception:
-        return -1
+        return -1.0
+
+
+# Shorter than any spoken word: a tap, or a hotkey used as a modifier. The
+# WAV is measured, not the key hold, because the hold includes mic start-up.
+MIN_SPEECH_S = 0.3
+# Exact zeros from start to finish: Windows gives an app that microphone
+# access is switched off for digital silence, and so does a wedged device.
+MIC_SILENT_MESSAGE = (
+    "the microphone sent only silence — check that microphone access is on "
+    "in Settings → Privacy & security → Microphone, and the input device in "
+    "Settings → System → Sound")
+NO_SPEECH_MESSAGE = "didn't catch that — hold the key and speak"
+
+# whisper.cpp truncates --prompt at ~224 tokens with no warning, so a large
+# dictionary would silently lose its newest terms. Keep the most recently
+# added ones (dict insertion order) and bound the text.
+GLOSSARY_MAX_TERMS = 40
+GLOSSARY_MAX_CHARS = 600
+
+
+def glossary_prompt(dictionary) -> str | None:
+    """Bias whisper toward the user's spellings: 'Glossary: A, B, C.'"""
+    if not dictionary:
+        return None
+    seen = []
+    for written in reversed(list(dictionary.values())):
+        if written not in seen:
+            seen.append(written)
+        if len(seen) >= GLOSSARY_MAX_TERMS:
+            break
+    seen.reverse()
+    while seen and len("Glossary: " + ", ".join(seen) + ".") > GLOSSARY_MAX_CHARS:
+        seen.pop(0)
+    return ("Glossary: " + ", ".join(seen) + ".") if seen else None
 
 
 def capture_next_key(timeout: float = 8.0):
@@ -232,28 +259,166 @@ def _run_save_dialog(suggested_name: str):
         raise
 
 
+def _log(message: str) -> None:
+    """Hotkey diagnostics. Never raises: a broken log must not swallow the
+    dictation path."""
+    try:
+        _update_log(f"hotkey: {message}")
+    except Exception:
+        pass
+
+
+def _hook_listener_factory(handler):
+    """Create and start the WH_KEYBOARD_LL listener (see voisr.keytap)."""
+    listener = WindowsKeyListener(handler)
+    listener.start()
+    return listener
+
+
+# Hotkey timing (Wispr's observed values)
+TAP_GATE_S = 0.5  # let go sooner: a tap, unless a second press follows within this
+CHORD_WINDOW_S = 1.0  # another key this soon after the press: a shortcut
+ESC_VK = 0x1B
+STALE_CHECK_S = 5.0  # how often a long hold is checked against the keyboard
+STALE_AFTER_S = 10.0  # a hold this long has its key state confirmed
+
+
+def hotkey_key_down(vk):
+    """The keyboard's own reading of whether `vk` is down: True or False, or
+    None when it can't be read. Never raises."""
+    try:
+        import ctypes
+        state = ctypes.WinDLL("user32").GetAsyncKeyState(int(vk))
+        return bool(state & 0x8000)
+    except Exception:
+        return None
+
+
+def _daemon_timer(delay, fn):
+    timer = threading.Timer(delay, fn)
+    timer.daemon = True
+    return timer
+
+
 class HotkeyService:
     """Global push-to-talk listener driving the shared Api record path."""
 
+    PANE_REOPEN_S = 60  # a refused permission's pane opens at most this often
+
     def __init__(self, api, widget=None, hide_delay=1.2,
                  permissions_check=lambda: True, poll_interval=3.0,
-                 listener_factory=None):
+                 listener_factory=None, tap_gate_s=TAP_GATE_S,
+                 timer_factory=None, key_state=None,
+                 stale_interval=STALE_CHECK_S):
         self._api = api
         self._widget = widget
         self._hide_delay = hide_delay
         self._permissions_check = permissions_check
         self._poll_interval = poll_interval
-        self._listener_factory = listener_factory or WindowsKeyListener
+        self._listener_factory = listener_factory or _hook_listener_factory
+        self._pane_opener = permissions.open_pane
+        self._clock = time.monotonic
+        self._pane_opened_at = None
         self._listener = None
         self._watcher = None
-        self._stopped = False
+        self._wake = threading.Event()  # set by stop() to end a sleeping poll
+        self._stopped = True  # until start(); see running
         self._pressed = False
-        self._start_failed = False
+        self._latched = False  # hands-free: the tray toggle, or a double-tap
+        self._latch_armed = False  # hands-free and the key is up: the next press stops it
+        self._pressed_at = None  # event time of the press that owns the recording
+        # event time of the second press that latched a double-tap, until its
+        # release is seen: the latch is provisional (held >= the gate, that
+        # press was a dictation). None for toggles and once released.
+        self._latch_press_at = None
+        self._tap_gate_s = tap_gate_s
+        self._timer_factory = timer_factory or _daemon_timer
+        self._pending = None  # token while a quick tap waits for a second press
+        self._pending_from = None  # event time that tap was let go
+        self._pending_timer = None
+        # Opt-in (main() passes hotkey_key_down): None means no stuck-key
+        # check, so tests never read the real keyboard.
+        self._key_state = key_state
+        self._key_trusted = False  # the probe has read the held key as down
+        self._stale_interval = stale_interval
+        self._ticker = None
+        self._tick_wake = threading.Event()  # set by stop() to end the ticker
+        # This press already reported it couldn't start. Holding the key
+        # auto-repeats WM_KEYDOWN, and without this every repeat would
+        # hammer the queue and re-report: one report per physical hold.
+        self._rejected = False
+        # press() calls start_recording() with _state_lock released (it can
+        # take seconds, and the pill's callbacks take the lock). While it
+        # runs _pressed is already True, so auto-repeat stays out; a release
+        # or chord in the gap is noted here and settled after.
+        self._starting = False
+        self._start_released = False
+        self._start_released_at = None
+        self._start_cancelled = False
         self._key_name = None
         self._target_vk = None
         self._state_lock = threading.RLock()
         self._epoch = 0  # bumped per recording; stale _finish threads must not touch the widget
+        # Key events are handed to this serial worker instead of being acted
+        # on inside the hook callback: press() can wait on the previous
+        # recorder's stop(), and Windows silently unregisters a
+        # WH_KEYBOARD_LL hook whose callback exceeds LowLevelHooksTimeout --
+        # with every event in the gap lost, including the release that ends
+        # the dictation. One worker keeps press/release ordering exactly as
+        # the keyboard sent it.
+        self._ops = None
+        self._ops_thread = None
         self.status = "not started"
+        # active | starting | failed | off -- see _refresh_status
+        self.health = "off"
+
+    _OPS_STOP = object()
+
+    @property
+    def running(self) -> bool:
+        """False while stopped, e.g. for capture_hotkey's 8 s key capture,
+        when status still reads "active on ..."."""
+        return not self._stopped
+
+    @property
+    def holding(self) -> bool:
+        """True while the key itself owns the current recording."""
+        return self._pressed
+
+    def _submit(self, fn) -> None:
+        """Run fn on the serial worker; inline if the worker is not running
+        (direct callers such as tests and the CLI)."""
+        ops = self._ops
+        if ops is None:
+            fn()
+            return
+        ops.put(fn)
+
+    def _start_worker(self) -> None:
+        import queue as queue_module
+        if self._ops is not None:
+            return
+        ops = queue_module.Queue()
+
+        def run():
+            while True:
+                fn = ops.get()
+                if fn is self._OPS_STOP:
+                    return
+                try:
+                    fn()
+                except Exception:
+                    pass  # a failed op must never kill the worker
+
+        self._ops = ops
+        self._ops_thread = threading.Thread(target=run, name="voisr-hotkey-ops",
+                                            daemon=True)
+        self._ops_thread.start()
+
+    def _stop_worker(self) -> None:
+        ops, self._ops = self._ops, None
+        if ops is not None:
+            ops.put(self._OPS_STOP)
 
     def _widget_enabled(self) -> bool:
         return self._widget is not None and bool(self._api.get_config().get("show_widget", True))
@@ -265,89 +430,247 @@ class HotkeyService:
 
     def _widget_action(self, name: str, epoch: int, *args, **kwargs) -> None:
         method = getattr(self._widget, name)
-        method(*args, **kwargs,
-               if_current=lambda action: self._run_widget_action(epoch, action))
+        if getattr(self._widget, "_supports_ownership_action", False):
+            method(*args, **kwargs,
+                   if_current=lambda action: self._run_widget_action(epoch, action))
+        else:
+            method(*args, **kwargs)
 
-    def press(self) -> None:
+    def press(self, latched=False, at=None) -> None:
+        at = self._clock() if at is None else at
+        if self._settle_pending(at):
+            return
+        finish = None
         with self._state_lock:
-            # _start_failed: holding the key auto-repeats WM_KEYDOWN, and a
-            # failed start leaves _pressed False -- so without this guard
-            # every repeat would hammer the queue and re-report. One report
-            # per physical hold; release() clears it.
-            if self._pressed or self._start_failed:
-                return
+            if self._pressed:
+                # auto-repeat, or the key already held: only a fresh press
+                # of a hands-free dictation stops it
+                if latched or not (self._latched and self._latch_armed):
+                    return
+                finish = self._end_recording()
+            else:
+                if self._rejected and not latched:
+                    return  # auto-repeat of a press that couldn't start
+                self._pressed = True
+                self._pressed_at = at
+                self._latched = latched
+                self._latch_press_at = None
+                # a toggle isn't held: its next press (any key) stops it
+                self._latch_armed = latched
+                self._starting = True
+                self._start_released = False
+                self._start_released_at = None
+                self._start_cancelled = False
+        if finish is not None:
+            self._spawn_finish(*finish)
+            return
+        try:
             result = self._api.start_recording()
-            if "error" in result:
-                self._start_failed = True
-                self._report_start_failure(result["error"])
-                return
-            self._pressed = True
-            self._epoch += 1
-            epoch = self._epoch
-            cfg = self._api.get_config()
-            if self._widget is not None and bool(cfg.get("show_widget", True)):
-                self._widget_action(
-                    "show_recording", epoch,
-                    theme=sanitize_pill_theme(cfg.get("pill_theme")),
-                    color=sanitize_pill_color(cfg.get("pill_color")))
-
-    def release(self) -> None:
+        except Exception as error:
+            result = {"error": str(error)}
+        except BaseException:
+            # nothing will settle this press: un-mark it or the key is dead
+            with self._state_lock:
+                self._starting = False
+                self._pressed = False
+                self._latched = False
+            raise
+        pane = None
+        refused = False
+        learn = False
         with self._state_lock:
-            # Cleared on key up, not on the next press: a microphone plugged
-            # back in must recover on the very next hold, without a restart.
-            self._start_failed = False
-            if not self._pressed:
+            self._starting = False
+            released, cancelled = self._start_released, self._start_cancelled
+            if "error" in result:
+                self._pressed = False
+                self._latched = False
+                # e.g. the dashboard owns the mic, the microphone is
+                # unplugged, or the queue is full. Say so once per press.
+                if not self._rejected:
+                    # The log is the only durable trace that separates a
+                    # missing device from a broken release.
+                    _log(f"press could not start recording: {result['error']}")
+                    self._flash_error()
+                # a key already let go needs no guard against its repeats
+                self._rejected = not released
+                pane = self._claim_pane_open(result.get("permission"))
+                refused = True
+            else:
+                self._rejected = False
+                self._epoch += 1
+                epoch = self._epoch
+                if cancelled:
+                    # still hide: the new epoch orphans an older pill's own hide
+                    self._drop_chord(epoch)
+                else:
+                    cfg = self._api.get_config()
+                    if self._widget is not None and bool(cfg.get("show_widget", True)):
+                        self._widget_action(
+                            "show_recording", epoch,
+                            theme=sanitize_pill_theme(cfg.get("pill_theme")),
+                            color=sanitize_pill_color(cfg.get("pill_color")))
+                    if released:
+                        # a toggle ends at once; a held key goes through the gate
+                        finish = (self._end_recording() if self._latched
+                                  else self._release_held(self._start_released_at))
+                    else:
+                        learn = not self._latched
+        if refused:
+            if pane is not None:
+                try:
+                    self._pane_opener(pane)
+                except Exception:
+                    pass
+            return
+        if cancelled:
+            self._api._cancel_recording()
+        if finish is not None:
+            self._spawn_finish(*finish)
+        elif learn:
+            self._learn_key_state()
+
+    def _settle_pending(self, at) -> bool:
+        """A press while a quick tap waits. Within the tap gate it makes the
+        dictation hands-free (True: nothing else to do). Later, the tap is
+        dropped first and the press starts afresh (False)."""
+        with self._state_lock:
+            if self._pending is None:
+                return False
+            self._clear_pending()
+            if at - self._pending_from <= self._tap_gate_s:
+                self._latched = True
+                self._latch_armed = False  # this press's own release comes first
+                self._latch_press_at = at
+                latched = True
+            else:
+                latched = False
+                self._drop_chord(self._epoch)
+        if latched:
+            _log("hands-free on (double-tap)")
+            return True
+        self._api._cancel_recording()
+        return False
+
+    def _clear_pending(self) -> None:
+        """Forget a waiting tap; caller holds _state_lock."""
+        timer, self._pending_timer = self._pending_timer, None
+        self._pending = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+    def _release_held(self, at):
+        """The held key let go; caller holds _state_lock. Sooner than the tap
+        gate it's a tap: keep recording, wait for a second press, and return
+        None. Otherwise end the recording (the result is for _spawn_finish)."""
+        if (self._tap_gate_s and at is not None and self._pressed_at is not None
+                and at - self._pressed_at < self._tap_gate_s):
+            token = object()
+            self._pending = token
+            self._pending_from = at
+            delay = max(0.0, at + self._tap_gate_s - self._clock())
+            timer = self._timer_factory(
+                delay, lambda: self._submit(lambda: self._expire_tap(token)))
+            self._pending_timer = timer
+            timer.start()
+            return None
+        return self._end_recording()
+
+    def _expire_tap(self, token) -> None:
+        """No second press came: the tap is dropped, silently."""
+        with self._state_lock:
+            if self._pending is not token:
                 return
-            self._pressed = False
-            epoch = self._epoch
-            show = self._widget_enabled()
-            if show:
-                self._widget_action("show_processing", epoch)
-            future = self._api._release_recording(paste=True)
+            held = ((self._pending_from - self._pressed_at)
+                    if self._pressed_at is not None else 0.0)
+            self._clear_pending()
+            self._drop_chord(self._epoch)
+        _log(f"tap dropped (held {held:.2f} s)")
+        self._api._cancel_recording()
+
+    def _claim_pane_open(self, key):
+        """Open a refused permission's Settings page at most once a minute;
+        caller holds _state_lock."""
+        if not key:
+            return None
+        now = self._clock()
+        if (self._pane_opened_at is not None
+                and now - self._pane_opened_at < self.PANE_REOPEN_S):
+            return None
+        self._pane_opened_at = now
+        return key
+
+    def _flash_error(self) -> None:
+        """Error pill, then hide; caller holds _state_lock. The timed hide
+        runs on its own thread: nothing here may wait."""
+        if not self._widget_enabled():
+            return
+        self._epoch += 1
+        epoch = self._epoch
+        self._widget_action("show_error", epoch)
+
+        def hide_later():
+            try:
+                if self._hide_delay:
+                    time.sleep(self._hide_delay)
+                with self._state_lock:
+                    if epoch == self._epoch:
+                        self._widget_action("hide", epoch)
+            except Exception:
+                pass
+
+        threading.Thread(target=hide_later, name=f"voisr-widget-failed-{epoch}",
+                         daemon=True).start()
+
+    def release(self, at=None) -> None:
+        at = self._clock() if at is None else at
+        with self._state_lock:
+            if not self._pressed:
+                # Cleared on key up, not on the next press: a microphone
+                # plugged back in must recover on the very next hold.
+                self._rejected = False
+                return
+            if self._latched:
+                held_from, self._latch_press_at = self._latch_press_at, None
+                if (held_from is not None
+                        and at - held_from >= self._tap_gate_s):
+                    # the second press was held, not tapped: a dictation
+                    # that ends on its release, not a hands-free latch
+                    finish = self._end_recording()
+                else:
+                    self._latch_armed = True  # hands-free: the next press stops it
+                    return
+            elif self._pending is not None:
+                return  # already let go: a repeated edge
+            elif self._starting:
+                self._start_released = True  # press() ends it once started
+                self._start_released_at = at
+                return
+            else:
+                finish = self._release_held(at)
+        if finish is not None:
+            self._spawn_finish(*finish)
+
+    def _end_recording(self):
+        """Close the mic and show processing; caller holds _state_lock and
+        passes the result to _spawn_finish after letting go of it."""
+        self._pressed = False
+        epoch = self._epoch
+        show = self._widget_enabled()
+        if show:
+            self._widget_action("show_processing", epoch)
+        future = self._api._release_recording(paste=True)
+        return future, show, epoch
+
+    def _spawn_finish(self, future, show: bool, epoch: int) -> None:
         threading.Thread(
             target=self._finish,
             args=(future, show, epoch),
             name=f"voisr-widget-{epoch}",
             daemon=True,
         ).start()
-
-    def _report_start_failure(self, reason) -> None:
-        """Make a hotkey press that cannot record visible.
-
-        Returning silently is what let a disconnected microphone read as a
-        dead app: no pill, no dictation, and nothing in the log to separate a
-        missing device from a broken release. The reason is always logged --
-        that line is the only durable trace -- and the pill flashes its error
-        state when enabled, so the press looks like a failure rather than a
-        no-op.
-
-        Runs with _state_lock held (an RLock) inside the keyboard hook
-        callback, so it stays to one short append and hands the timed hide to
-        a thread. A WH_KEYBOARD_LL callback that sleeps risks Windows
-        skipping the hook, so nothing here may wait.
-        """
-        try:
-            _update_log(f"hotkey press could not start recording: {reason}")
-        except Exception:
-            pass  # a broken log must not swallow the dictation path
-        if not self._widget_enabled():
-            return
-        self._epoch += 1
-        epoch = self._epoch
-        self._widget_action("show_error", epoch)
-        threading.Thread(
-            target=self._hide_after_delay, args=(epoch,),
-            name=f"voisr-widget-failed-{epoch}", daemon=True).start()
-
-    def _hide_after_delay(self, epoch: int) -> None:
-        try:
-            if self._hide_delay:
-                time.sleep(self._hide_delay)
-            with self._state_lock:
-                if epoch == self._epoch:
-                    self._widget_action("hide", epoch)
-        except Exception:
-            pass
 
     def _finish(self, future, show: bool, epoch: int) -> None:
         try:
@@ -374,7 +697,7 @@ class HotkeyService:
         """Return (vk, label) for the push-to-talk key.
 
         Explicit key_name (tests/CLI) wins; otherwise the config's captured
-        hotkey_vk, falling back to the legacy 'hotkey' name."""
+        hotkey_vk, falling back to the named 'hotkey'."""
         if key_name is not None:
             vk = resolve_key(key_name)
             return vk, key_label(vk) if vk is not None else key_name
@@ -389,28 +712,186 @@ class HotkeyService:
     def start(self, key_name=None) -> None:
         self._stopped = False
         vk, label = self._resolve_target(key_name)
+        if vk != self._target_vk:
+            self._key_trusted = False  # the probe was read on another key
         self._target_vk = vk
         self._key_name = label
+        self._start_worker()
         self._spawn_listener()
         self._refresh_status()
         self._watch()
+        self._start_ticker()
+
+    def _toggle(self) -> None:
+        """The tray's Dictate now: the first toggle starts a hands-free
+        dictation, the second ends it, however it began."""
+        if self._pressed:
+            self._stop_hands_free()
+        else:
+            # every toggle is a press of its own, and a refused one gets no
+            # release() to clear the once-per-press guard
+            self._rejected = False
+            self.press(latched=True)
+
+    def toggle(self) -> None:
+        """press()/release() pair for a single-action trigger (the tray
+        menu's "Dictate now"), on the worker so the tray's own event loop
+        never waits on queue admission."""
+        self._submit(self._toggle)
+
+    def _stop_hands_free(self) -> None:
+        with self._state_lock:
+            if not self._pressed:
+                return
+            if self._starting:
+                self._start_released = True  # press() ends it once started
+                self._start_released_at = None  # not a key hold: no tap gate
+                return
+            self._clear_pending()
+            finish = self._end_recording()
+        self._spawn_finish(*finish)
+
+    def cancel_chord(self, at=None) -> None:
+        """Another key went down while the hotkey was held. Within
+        CHORD_WINDOW_S of the press it's a shortcut (Right Ctrl+C), not a
+        dictation: cancel. Held longer, the person is dictating and the key
+        is theirs. A hands-free dictation isn't held, so typing during it is
+        left alone; a quick tap then typing is dropped. A double-tap's second
+        press is still held until it is let go (the latch is provisional),
+        so it counts as held here."""
+        at = self._clock() if at is None else at
+        with self._state_lock:
+            if not self._pressed or (self._latched
+                                     and self._latch_press_at is None):
+                return
+            was_held = self._pending is None
+            if self._pending is not None:
+                self._clear_pending()
+            elif (self._pressed_at is not None
+                    and at - self._pressed_at >= CHORD_WINDOW_S):
+                return
+            elif self._starting:
+                # once let go, a key going down is typing, not a chord
+                if not self._start_released:
+                    self._start_cancelled = True
+                return
+            self._drop_chord(self._epoch)
+        if was_held:
+            _log("dictation cancelled (another key within 1 s)")
+        self._api._cancel_recording()
+
+    def cancel_escape(self) -> None:
+        """Esc cancels a dictation in progress, however it began: the audio
+        is dropped and nothing is pasted. Esc itself still reaches the app."""
+        with self._state_lock:
+            if not self._pressed:
+                return
+            if self._starting:
+                self._start_cancelled = True
+                return
+            self._clear_pending()
+            self._drop_chord(self._epoch)
+        _log("dictation cancelled by Esc")
+        self._api._cancel_recording()
+
+    def _learn_key_state(self) -> None:
+        """Trust the key-state probe once it has read the held hotkey as
+        down: a probe that is blind (always False) would otherwise end every
+        long dictation at the first stuck-key check."""
+        if self._key_trusted or self._key_state is None:
+            return
+        try:
+            down = self._key_state(self._target_vk)
+        except Exception:
+            return
+        if down is True:
+            self._key_trusted = True
+            _log("key state readable — stuck-key check on")
+
+    def _check_stale_key(self, force=False) -> None:
+        """A held key whose release never arrived (lost while Windows had
+        unhooked us) would record until the 600 s cap. A hold of
+        STALE_AFTER_S or more -- or any hold, right after the hook was
+        respawned -- is checked against the keyboard; up means the release
+        is made up here. Runs on the worker, in order with the key events."""
+        probe = self._key_state
+        if probe is None or not self._key_trusted:
+            return
+        if self._stopped:
+            return  # a check queued before stop() must not act on a dead service
+        now = self._clock()
+        with self._state_lock:
+            if (not self._pressed or self._latched or self._starting
+                    or self._pending is not None or self._pressed_at is None):
+                return
+            if not force and now - self._pressed_at < STALE_AFTER_S:
+                return
+            vk = self._target_vk
+        try:
+            down = probe(vk)
+        except Exception:
+            return
+        if down is not False:
+            return  # down, or unknown: unknown is never a release
+        _log("the key is up but its release never arrived — ending the dictation")
+        self.release(at=now)
+
+    def _start_ticker(self) -> None:
+        """Every _stale_interval, queue a stuck-key check on the worker."""
+        if self._key_state is None or self._ticker is not None:
+            return
+        self._tick_wake.clear()
+
+        def tick():
+            me = threading.current_thread()
+            while not self._stopped and self._ticker is me:
+                if self._tick_wake.wait(self._stale_interval):
+                    return
+                if self._stopped or self._ticker is not me:
+                    return
+                self._submit(self._check_stale_key)
+
+        self._ticker = threading.Thread(target=tick, name="voisr-hotkey-stale",
+                                        daemon=True)
+        self._ticker.start()
+
+    def _drop_chord(self, epoch: int) -> None:
+        """Un-press and hide; caller holds _state_lock, then cancels the
+        recording after letting go of it: closing a mic can block, and the
+        pill's callbacks take the lock."""
+        self._pressed = False
+        if self._widget_enabled():
+            self._widget_action("hide", epoch)
 
     def _spawn_listener(self) -> None:
         target_vk = self._target_vk
 
         def handler(vk, kind):
-            # Never raise: a callback error must not kill the hook.
+            # Never raise, and never wait: a callback error must not kill
+            # the hook, and a slow one gets it unregistered. Stopped: the
+            # worker is gone, so _submit would run press() and friends
+            # inline on the hook thread.
+            if self._stopped:
+                return
             try:
+                # stamped here: the worker may run the op much later, and
+                # the tap gate and chord window measure the keyboard's timing
+                at = self._clock()
                 if vk != target_vk:
                     if kind == "down":
                         # user is typing manually -> don't smart-join the
                         # next dictation onto the previous one
                         self._api.note_user_typing()
+                        if vk == ESC_VK:
+                            self._submit(self.cancel_escape)
+                        else:
+                            self._submit(functools.partial(self.cancel_chord,
+                                                           at=at))
                     return
                 if kind == "down":       # auto-repeats; press() guards
-                    self.press()
+                    self._submit(functools.partial(self.press, at=at))
                 elif kind == "up":
-                    self.release()
+                    self._submit(functools.partial(self.release, at=at))
             except Exception:
                 pass
 
@@ -421,72 +902,106 @@ class HotkeyService:
             except Exception:
                 pass
         try:
-            listener = self._listener_factory(handler)
-            listener.start()
-            self._listener = listener
+            self._listener = self._listener_factory(handler)
         except Exception as e:
-            print(f"Voisr hotkey: listener start failed: {e}", flush=True)
+            _log(f"listener start failed: {e}")
+
+    def _hook_state(self, granted: bool) -> str:
+        """What Windows actually gave us: "running", "starting" (not decided
+        yet) or "failed". A listener without wait_started is a test double
+        (a bare handler, not a hook): it counts as running only if the
+        permission check passed."""
+        listener = self._listener
+        if listener is None:
+            return "failed"
+        wait = getattr(listener, "wait_started", None)
+        if wait is None:
+            return "running" if granted else "failed"
+        return wait(0.5)
 
     def _refresh_status(self) -> None:
-        if self._permissions_check():
+        # May block up to 0.5 s in wait_started: only start() and the poll
+        # thread call this, never the hook callback.
+        before = self.status
+        hook = self._hook_state(self._permissions_check())
+        if self._stopped:
+            return  # stop() already ran: health stays "off"
+        if hook == "running":
+            self.health = "active"
             self.status = f"active on {self._key_name}"
+        elif hook == "starting":
+            self.health = "starting"
+            self.status = f"starting push-to-talk on {self._key_name}…"
         else:
-            self.status = "waiting for permission"
-        print(f"Voisr hotkey: {self.status}", flush=True)
+            self.health = "failed"
+            self.status = "the keyboard hook could not be installed — retrying"
+        if self.status != before:  # the poll re-derives this every interval
+            _log(self.status)
 
     def _watch(self) -> None:
         """Respawn the hook if it goes quiet. A WH_KEYBOARD_LL hook whose
         callback exceeds LowLevelHooksTimeout gets silently unregistered by
-        Windows -- WindowsKeyListener.running goes False when that happens
-        (see voisr.keytap), which is what this polls for."""
+        Windows -- WindowsKeyListener.state goes "failed" when that happens
+        (see voisr.keytap), which is what this polls for. A release may have
+        been lost in the gap, so a respawn also checks the held key."""
         if self._watcher is not None:
             return
+        self._wake.clear()
 
         def poll():
-            while not self._stopped:
-                time.sleep(self._poll_interval)
-                if self._stopped:
-                    break
+            me = threading.current_thread()
+            while not self._stopped and self._watcher is me:
+                # wait, not sleep: stop() wakes this immediately
+                if self._wake.wait(self._poll_interval):
+                    return
+                if self._stopped or self._watcher is not me:
+                    return
                 listener = self._listener
-                if listener is not None and not getattr(listener, "running", True):
+                state = getattr(listener, "state", None)
+                if listener is None or state == "failed" or (
+                        state is None and not getattr(listener, "running", True)):
                     self._spawn_listener()
-                    self._refresh_status()
-            self._watcher = None
+                    self._submit(functools.partial(self._check_stale_key,
+                                                   force=True))
+                self._refresh_status()
 
-        self._watcher = threading.Thread(target=poll, daemon=True)
+        self._watcher = threading.Thread(target=poll, name="voisr-hotkey-watch",
+                                         daemon=True)
         self._watcher.start()
 
     def stop(self) -> None:
         self._stopped = True
+        self._stop_worker()
+        # Wake and join the poll so a following start() never races a
+        # watcher that is still winding down.
+        watcher, self._watcher = self._watcher, None
+        if watcher is not None and watcher is not threading.current_thread():
+            self._wake.set()
+            watcher.join(timeout=2.0)
+        ticker, self._ticker = self._ticker, None
+        if ticker is not None and ticker is not threading.current_thread():
+            self._tick_wake.set()
+            ticker.join(timeout=2.0)
         listener, self._listener = self._listener, None
-        if listener is None:
-            return
-        try:
-            listener.stop()
-        except Exception:
-            pass  # a dead listener's teardown must not crash the app
+        if listener is not None:
+            try:
+                listener.stop()
+            except Exception:
+                pass  # a dead listener's teardown must not crash the app
+        # last, so a poll that was mid-refresh can't leave a stale health
+        self.health = "off"
 
     def restart(self, key_name=None) -> None:
         self.stop()
         self.start(key_name)
-
-    def toggle(self) -> None:
-        """press()/release() pair for a single-action trigger (the tray
-        menu's "Dictate now"), reusing the same path the hotkey itself
-        drives so the pill shows the same feedback either way."""
-        with self._state_lock:
-            pressed = self._pressed
-        if pressed:
-            self.release()
-        else:
-            self.press()
 
 
 _UPDATES_UNAVAILABLE = "Updates are unavailable in this build."
 
 
 class Api:
-    """JS<->Python bridge exposed to the dashboard via pywebview."""
+    """What the dashboard talks to. Only BRIDGE_METHODS reach the page, via
+    bridge_functions; never pass this as js_api."""
 
     SPACE_JOIN_WINDOW_S = 300  # only join dictations this close together
     APPEARANCES = ("system", "light", "dark")
@@ -519,7 +1034,8 @@ class Api:
                  clipboard_fn=set_clipboard,
                  save_dialog_fn=None,
                  timer_factory=threading.Timer,
-                 exit_fn=None):
+                 exit_fn=None,
+                 mic_check=None):
         self._config_path = Path(config_path) if config_path else default_config_path()
         self._history = history or HistoryStore(self._config_path.parent / "history.jsonl")
         self._transcribe_fn = transcribe_fn
@@ -531,6 +1047,9 @@ class Api:
         self._save_dialog_fn = save_dialog_fn or _run_save_dialog
         self._timer_factory = timer_factory
         self._exit_fn = exit_fn or (lambda: os._exit(0))
+        # None = no check, so tests never probe the machine's real privacy
+        # settings
+        self._mic_check = mic_check
         # Both None until the matching attach_*(): a headless or test Api has
         # no updater and no window, and every method below tolerates that.
         self._updates = None
@@ -549,10 +1068,16 @@ class Api:
         self._window = None
         self._status_item = None
         self._is_recording = False
+        self._quitting = False  # set by close(): queued dictations still land
         self._sessions_in_flight = set()
         self._glyph_busy = False
         self._active_sequence = None
         self._session_lock = threading.Lock()
+        # Serialises every read-modify-write of config.json in this process
+        # (set_config from pywebview workers, capture_hotkey, launch-at-login).
+        self._config_lock = threading.RLock()
+        self._config_stat_cache = None  # (stat key, parsed config) or None
+        self._config_notice = None  # set when a corrupt config was moved aside
         self._recordings = RecordingQueue(
             recorder_factory=recorder_factory,
             fallback_recorder_factory=fallback_recorder_factory,
@@ -563,15 +1088,23 @@ class Api:
     def _default_transcribe(self, wav, cfg):
         """Transcribe with the release-time model and dictionary prompt."""
         from voisr.transcriber import resolve_model, transcribe as _transcribe
-        vocab = sorted({v for v in (cfg.get("dictionary") or {}).values()})
-        prompt = ("Glossary: " + ", ".join(vocab) + ".") if vocab else None
         return _transcribe(wav, model_path=resolve_model(cfg.get("model")),
-                           prompt=prompt)
+                           prompt=glossary_prompt(cfg.get("dictionary")))
 
     def _transcribe_audio(self, wav, cfg):
         if self._transcribe_fn is not None:
             return self._transcribe_fn(wav)
         return self._default_transcribe(wav, cfg)
+
+    def current_level(self):
+        """Live mic level of the dictation being captured (0..1), or None.
+        Read by the pill's 30 Hz feed; deliberately not a bridge method."""
+        return self._recordings.active_level()
+
+    def get_level(self):
+        """The dashboard's 30 Hz poll while it records: the live mic level
+        (0..1), or None when nothing is metered. Bridge method."""
+        return self.current_level()
 
     def note_user_typing(self):
         """Record manual typing without blocking the event-tap callback."""
@@ -654,11 +1187,7 @@ class Api:
             if not got:
                 return {"error": "no key detected — click Change and press a key"}
             vk, label = got
-            cfg = self.get_config()
-            cfg["hotkey_vk"] = vk
-            cfg["hotkey_label"] = label
-            self._config_path.write_text(json.dumps(cfg, indent=2))
-            self._invalidate_config_cache()  # this path bypasses set_config
+            self._update_config({"hotkey_vk": vk, "hotkey_label": label})
             return {"vk": vk, "label": label}
         finally:
             if svc is not None:
@@ -677,17 +1206,32 @@ class Api:
         wav = session.wav_path
         cfg = session.context
         duration = max((session.released_at - session.started_at), 0.1)
+        # Some audio but too little is a tap, not a mic fault. No audio at
+        # all still falls through to the permission message below.
+        if 0 < wav_seconds(wav) < MIN_SPEECH_S:
+            return SessionResult.failure(
+                session.sequence, "audio",
+                "too short — hold the key while you speak")
         if not wav.exists() or wav.stat().st_size < 1000:
             detail = session.capture_stderr.strip()[:120]
             return SessionResult.failure(
                 session.sequence, "audio",
                 f"recording failed (mic permission?) {detail}".rstrip())
-        peak = wav_peak(wav)
-        if 0 <= peak < 60:
-            return SessionResult.failure(
-                session.sequence, "audio",
-                "no audio captured — allow Voisr to use the Microphone in "
-                "Settings → Privacy & security, then try again")
+        span = speech_gate.gate_wav(wav)  # None: unreadable, skip the gate
+        if span is not None:
+            if span.verdict == "all_zeros":
+                return SessionResult.failure(
+                    session.sequence, "audio", MIC_SILENT_MESSAGE)
+            if span.verdict == "no_speech":
+                return SessionResult.failure(
+                    session.sequence, "audio", NO_SPEECH_MESSAGE)
+            # Leading and trailing non-speech beyond the padding: fewer
+            # [BLANK_AUDIO] hallucinations and less audio to decode.
+            try:
+                speech_gate.trim_wav(wav, span.start, span.end)
+            except Exception as error:
+                # an untrimmed clip still transcribes
+                _update_log(f"audio: trim failed: {error}")
         try:
             raw = self._transcribe_audio(wav, cfg)
             text = clean(raw, dictionary=cfg.get("dictionary", {}))
@@ -712,7 +1256,7 @@ class Api:
         paste_error = None
         fallback_safe = True
         typing_generation = None
-        if session.paste_requested and cfg.get("paste"):
+        if session.paste_requested and cfg.get("paste") and not self._quitting:
             with self._paste_state_lock:
                 typing_generation = self._typing_generation
                 join = (
@@ -737,7 +1281,7 @@ class Api:
 
         copied = pasted
         clipboard_error = None
-        if not pasted and fallback_safe:
+        if not pasted and fallback_safe and not self._quitting:
             try:
                 self._clipboard_fn(text)
                 copied = True
@@ -762,6 +1306,14 @@ class Api:
         return SessionResult.success(session.sequence, **fields)
 
     def start_recording(self):
+        if self._mic_check is not None:
+            try:
+                mic = self._mic_check()
+            except Exception:
+                mic = None  # unknown never blocks
+            if mic is False:
+                return {"error": "Microphone access is switched off for Voisr",
+                        "permission": "microphone"}
         try:
             session = self._recordings.start()
         except RecordingQueueError as error:
@@ -788,7 +1340,21 @@ class Api:
     def stop_recording(self, paste=False):
         return self._release_recording(paste).result().to_api_dict()
 
+    def _cancel_recording(self) -> bool:
+        """Close the mic and drop the capture. Private so the JS bridge
+        can't reach it; only the hotkey path cancels."""
+        sequence, self._active_sequence = self._active_sequence, None
+        self._is_recording = False
+        cancelled = self._recordings.cancel()
+        if sequence is not None:
+            self._mark_session(sequence, False)
+        return cancelled
+
     def close(self):
+        # Quit still finishes queued transcriptions (they are the user's
+        # words and go to History), but nothing may paste or touch the
+        # clipboard after the user has left the app.
+        self._quitting = True
         self._recordings.close()
         if self._status_item is not None:
             self._status_item.release()
@@ -803,8 +1369,80 @@ class Api:
     def get_stats(self):
         return self._history.stats()
 
+    def _config_stat_key(self):
+        try:
+            st = self._config_path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+
     def get_config(self):
-        return load_config(self._config_path)
+        """Parsed config.json, served from memory while the file is unchanged
+        (the hotkey worker reads it on every press and release).
+
+        The parse runs outside _config_lock: a slow read must not hold up a
+        set_config. A store-back racing a write is harmless, because the
+        entry is keyed on the file's stat and the write changes it."""
+        import copy
+        key = self._config_stat_key()
+        cached = self._config_stat_cache
+        if key is not None and cached is not None and cached[0] == key:
+            return copy.deepcopy(cached[1])
+        cfg = load_config(self._config_path,
+                          on_corrupt=self._note_corrupt_config)
+        self._config_stat_cache = (key, copy.deepcopy(cfg))
+        return cfg
+
+    def _write_config_atomic(self, cfg: dict) -> None:
+        """Temp file + fsync + os.replace, so a crash mid-write (or the
+        installer's hard exit) can never leave a truncated config.json,
+        which load_config would then quarantine and replace with defaults."""
+        import tempfile
+        path = self._config_path
+        payload = json.dumps(cfg, indent=2)
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
+                                   dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            tmp = None
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    def _update_config(self, updates: dict) -> dict:
+        """Locked read-modify-write; returns the merged config."""
+        with self._config_lock:
+            cfg = self.get_config()
+            if "hotkey" in updates and updates["hotkey"] != cfg.get("hotkey"):
+                # the named key is now the source of truth; a stale captured
+                # vk would otherwise keep winning in HotkeyService._resolve_target
+                cfg.pop("hotkey_vk", None)
+                cfg.pop("hotkey_label", None)
+            cfg.update(updates)
+            self._write_config_atomic(cfg)
+            self._config_stat_cache = None
+            # Before anything else can read it back: a stale
+            # "check_for_updates" would make the Settings toggle look like it
+            # did nothing.
+            self._invalidate_config_cache()
+            return cfg
+
+    def _note_corrupt_config(self, saved):
+        self._config_notice = (
+            f"Your settings file couldn't be read, so Voisr started on "
+            f"defaults. The old file is kept as {saved.name}.")
+
+    def take_config_notice(self):
+        """One-shot: the dashboard toasts this once at boot."""
+        notice, self._config_notice = self._config_notice, None
+        return {"notice": notice} if notice else {}
 
     def read_config_cached(self):
         """get_config() with a short TTL, for callers that ask repeatedly.
@@ -859,13 +1497,14 @@ class Api:
             self._config_cache_generation += 1
 
     def set_config(self, updates):
-        old_hotkey = self.get_config().get("hotkey")
-        cfg = self.get_config()
-        cfg.update(updates)
-        self._config_path.write_text(json.dumps(cfg, indent=2))
-        # Before anything else can read it back: a stale "check_for_updates"
-        # would make the Settings toggle look like it did nothing.
-        self._invalidate_config_cache()
+        # The bridge is the only way in from the dashboard: a wrong type here
+        # would be saved and then break every dictation that reads it.
+        errors = config_errors(updates)
+        if errors:
+            return {"error": "; ".join(errors)}
+        with self._config_lock:
+            old_hotkey = self.get_config().get("hotkey")
+            cfg = self._update_config(updates)
         new_hotkey = cfg.get("hotkey")
         if self._hotkey_service and new_hotkey != old_hotkey:
             self._hotkey_service.restart(new_hotkey)
@@ -904,9 +1543,22 @@ class Api:
         return PILL_THEMES
 
     def get_hotkey_status(self):
-        if self._hotkey_service is None:
-            return {"status": "push-to-talk not running"}
-        return {"status": self._hotkey_service.status}
+        """status is the sentence Settings shows; state is what Home's dot
+        shows: "listening", "busy" (another recording owns the mic, so press()
+        drops the key) or "off"."""
+        svc = self._hotkey_service
+        if svc is None:
+            return {"status": "push-to-talk not running", "state": "off",
+                    "health": "off"}
+        status = svc.status
+        if not (getattr(svc, "running", True) and status.startswith("active")):
+            state = "off"
+        elif self._is_recording and not getattr(svc, "holding", False):
+            state = "busy"
+        else:
+            state = "listening"
+        return {"status": status, "state": state,
+                "health": getattr(svc, "health", "off")}
 
     def get_permissions(self):
         return {"panes": permissions.states()}
@@ -1085,9 +1737,14 @@ class Api:
         if fmt == "json":
             text = json.dumps(items, indent=2)
         elif fmt == "md":
-            text = "\n".join(
-                f"- **{datetime.datetime.fromtimestamp(i['ts']):%Y-%m-%d %H:%M}** "
-                f"— {i['text']}" for i in items)
+            def when(ts):
+                # history keeps records whose ts can't be a date (e.g.
+                # milliseconds); one of those must not sink the export
+                try:
+                    return f"{datetime.datetime.fromtimestamp(ts):%Y-%m-%d %H:%M}"
+                except (OverflowError, OSError, ValueError):
+                    return "unknown time"
+            text = "\n".join(f"- **{when(i['ts'])}** — {i['text']}" for i in items)
         elif fmt == "txt":
             text = "\n".join(i["text"] for i in items)
         else:
@@ -1121,6 +1778,47 @@ class Api:
         return {"ok": True}
 
 
+# Every Api method the dashboard calls, and nothing else.
+# tests/test_js_bridge_surface.py pins this to the V.api() calls in voisr/web/js.
+BRIDGE_METHODS = (
+    "capture_hotkey", "check_for_updates_now", "clear_history", "copy_text",
+    "delete_history_item", "export_history", "get_config", "get_history",
+    "get_hotkey_status", "get_level", "get_models", "get_permissions",
+    "get_pill_themes", "get_stats", "get_update_status", "hotkey_display",
+    "install_update", "open_settings_pane", "restore_history_item",
+    "save_text_file", "set_appearance", "set_check_for_updates", "set_config",
+    "set_launch_at_login", "start_recording", "stop_recording",
+    "take_config_notice",
+)
+
+
+def bridge_functions(api):
+    """The dashboard's bridge: one plain function per BRIDGE_METHODS name,
+    for window.expose(). Passing the Api as js_api instead exposes it whole:
+    pywebview resolves a call's dotted name with getattr and no underscore
+    filter, so page script could reach "_history.path.unlink" or a method's
+    __func__.__globals__. Exposed functions are looked up by exact name."""
+    def forward(name):
+        def call(*args):
+            return getattr(api, name)(*args)
+        call.__name__ = call.__qualname__ = name
+        return call
+    return [forward(name) for name in BRIDGE_METHODS]
+
+
+def start_hotkey_service(service):
+    """Start push-to-talk without letting a failure abort the rest of startup:
+    the window chrome is applied after this, and an app with no hotkey can
+    still be fixed from its own Settings. Returns the error text, or None."""
+    try:
+        service.start()
+    except Exception as e:
+        service.status = f"push-to-talk not running: {e}"[:200]
+        _log(service.status)
+        return str(e)
+    return None
+
+
 def main():
     import webview
 
@@ -1134,9 +1832,9 @@ def main():
     updates = None
     try:
         set_app_user_model_id()
-        api = Api()
-        widget = RecordingWidget()
-        service = HotkeyService(api, widget=widget)
+        api = Api(mic_check=permissions.microphone_switch)
+        widget = RecordingWidget(level_source=api.current_level)
+        service = HotkeyService(api, widget=widget, key_state=hotkey_key_down)
         api.attach_hotkey_service(service)
 
         # pywebview allows exactly one webview.start() call per process,
@@ -1145,9 +1843,11 @@ def main():
         # See voisr.overlay.RecordingWidget.create() for why the pill can't
         # own a second, independent start() call.
         widget.create()
+        # No js_api: see bridge_functions
         window = webview.create_window(
             WINDOW_TITLE, str(WEB_DIR / "index.html"),
-            js_api=api, width=1060, height=700, min_size=(900, 620))
+            width=1060, height=700, min_size=(900, 620))
+        window.expose(*bridge_functions(api))
         api.attach_window(window)
 
         # Closing the dashboard window is not quitting the app -- that is
@@ -1210,7 +1910,7 @@ def main():
             # Runs on a worker thread after the GUI loop is up. Mic opens
             # only during an actual dictation, so nothing here blocks
             # startup or shows a mic-in-use indicator while idle.
-            service.start()  # config-driven: prefers captured hotkey_vk
+            start_hotkey_service(service)  # config-driven: prefers captured hotkey_vk
             try:
                 mode = api.get_config().get("appearance", "system")
                 dark = mode == "dark" or (mode == "system" and _system_prefers_dark())

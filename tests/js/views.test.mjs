@@ -4,54 +4,59 @@ import { loadVoisr } from "./load.mjs";
 import { makeNode } from "./dom.mjs";
 
 /* ui.js first: both views call V.ui.el / V.ui.$ at module scope. */
-const { V } = loadVoisr(["js/ui.js", "js/views/home.js", "js/views/history.js"]);
+const { V } = loadVoisr(["js/ui.js", "js/lists.js", "js/views/home.js", "js/views/history.js"]);
 
-/* ---------- home: sparklinePath ---------- */
+/* ---------- home: trendBars + weekDelta ---------- */
 
-const sparklinePath = V.views.home.sparklinePath;
+const trendBars = V.views.home.trendBars;
+const weekDelta = V.views.home.weekDelta;
 
-const daily = (...words) => words.map((w, i) => ({ day: `d${i}`, words: w }));
+const daily = (...words) => words.map((w, i) => ({ date: `d${i}`, words: w }));
 
-test("sparklinePath draws a NaN-free polyline for a mixed 14-day series", () => {
-  const series = daily(0, 120, 45, 900, 30, 0, 610, 210, 75, 1000, 5, 480, 260, 90);
-  const path = sparklinePath(series);
-
-  assert.ok(path.startsWith("M"), `path should start with a moveto, got: ${path}`);
-  assert.ok(!/NaN|Infinity|undefined/.test(path), `path has bad numbers: ${path}`);
-
-  const segs = path.split(" L").length;   // "M.. .. L.. .. L.. .."
-  assert.equal(segs, 14, "one point per day");
-  assert.equal((path.match(/M/g) || []).length, 1, "exactly one moveto");
-
-  // x spans the full 240-wide viewBox, left to right.
-  const xs = path.split(/[ML]/).filter(Boolean).map((p) => parseFloat(p.trim()));
-  assert.equal(xs[0], 0);
-  assert.equal(parseFloat(path.split("L").pop().trim().split(" ")[0]), 240);
-
-  // The tallest day (1000 words) sits at the top of the band: 38 - 34 = 4.
-  const ys = path.split(/[ML]/).filter(Boolean)
-    .map((p) => parseFloat(p.trim().split(" ")[1]));
-  assert.equal(Math.min(...ys), 4);
-  assert.equal(ys[0], 38, "a zero day rests on the baseline");
+test("trendBars scales every day against the tallest one in the series", () => {
+  const bars = trendBars(daily(0, 50, 100, 25, 0, 75, 100, 10, 0, 40, 100, 60, 30, 20));
+  assert.equal(bars.length, 14);
+  assert.ok(bars.every((b) => b >= 0 && b <= 1), `out of range: ${bars.join()}`);
+  assert.ok(bars.every((b) => Number.isFinite(b)), `non-finite: ${bars.join()}`);
+  assert.equal(bars[2], 1, "the tallest day is the full height");
+  assert.equal(bars[1], 0.5);
+  assert.equal(bars[0], 0);
 });
 
-test("sparklinePath keeps an all-zero series flat on the baseline (no divide-by-zero)", () => {
-  const path = sparklinePath(daily(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
-  assert.ok(!/NaN/.test(path), `all-zero series produced NaN: ${path}`);
-  const ys = path.split(/[ML]/).filter(Boolean)
-    .map((p) => parseFloat(p.trim().split(" ")[1]));
-  assert.deepEqual([...new Set(ys)], [38], "every point on the baseline");
+test("trendBars keeps an all-zero series flat instead of dividing by zero", () => {
+  const bars = trendBars(daily(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+  assert.equal(bars.length, 14);
+  assert.ok(bars.every((b) => b === 0), `expected a flat floor, got ${bars.join()}`);
 });
 
-test("sparklinePath returns an empty path for fewer than two points", () => {
-  assert.equal(sparklinePath([]), "");
-  assert.equal(sparklinePath(daily(42)), "");
-  assert.equal(sparklinePath(null), "");
-  assert.equal(sparklinePath(undefined), "");
+test("trendBars treats a missing word count as zero rather than NaN", () => {
+  const bars = trendBars([{ date: "d0" }, { date: "d1", words: 10 }]);
+  assert.deepEqual(bars, [0, 1]);
+});
+
+test("trendBars returns nothing for an empty or absent series", () => {
+  assert.deepEqual(trendBars([]), []);
+  assert.deepEqual(trendBars(null), []);
+  assert.deepEqual(trendBars(undefined), []);
+});
+
+test("weekDelta compares the last seven days against the seven before them", () => {
+  // 70 in the first week, 140 in the second
+  assert.equal(weekDelta(daily(10, 10, 10, 10, 10, 10, 10, 20, 20, 20, 20, 20, 20, 20)), 100);
+  assert.equal(weekDelta(daily(20, 20, 20, 20, 20, 20, 20, 10, 10, 10, 10, 10, 10, 10)), -50);
+});
+
+test("weekDelta answers null rather than a fabricated percentage", () => {
+  // nothing last week is not a 0% or an infinite change -- there is no
+  // comparison to draw, and the tile shows no delta at all
+  assert.equal(weekDelta(daily(0, 0, 0, 0, 0, 0, 0, 10, 10, 10, 10, 10, 10, 10)), null);
+  // a fresh install has no fortnight of history yet
+  assert.equal(weekDelta(daily(10, 20, 30)), null);
+  assert.equal(weekDelta([]), null);
+  assert.equal(weekDelta(null), null);
 });
 
 /* ---------- history: matchesQuery ---------- */
-
 const { matchesQuery, highlighted } = V.views.history;
 
 test("matchesQuery matches a multi-word query with its spaces intact", () => {
@@ -158,7 +163,7 @@ const NODE_IDS = ["history-search", "history-empty", "history-more",
    the mock's. t.mock restores them when the test ends. */
 async function mountHistory(t) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const env = loadVoisr(["js/ui.js", "js/api.js", "js/views/history.js"]);
+  const env = loadVoisr(["js/ui.js", "js/lists.js", "js/api.js", "js/views/history.js"]);
   // js/api.js resolves the bridge lazily as `window.pywebview.api`, so
   // stubbing the property is enough -- no need to replace V.api itself.
   env.window.pywebview = { api: { get_history: async () => HISTORY.map((i) => ({ ...i })) } };
@@ -260,7 +265,7 @@ const UNDO_IDS = [...NODE_IDS, "toast"];
 
 async function mountHistoryWithToast(t, api) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const env = loadVoisr(["js/ui.js", "js/api.js", "js/views/history.js"]);
+  const env = loadVoisr(["js/ui.js", "js/lists.js", "js/api.js", "js/views/history.js"]);
   let live = HISTORY.map((i) => ({ ...i }));
   const restoreCalls = [];
   env.window.pywebview = { api: {
@@ -393,7 +398,7 @@ test("a failed delete does not offer an Undo for something still present", async
 
 test("history render surfaces a bridge failure rather than blanking the pane", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const env = loadVoisr(["js/ui.js", "js/api.js", "js/views/history.js"]);
+  const env = loadVoisr(["js/ui.js", "js/lists.js", "js/api.js", "js/views/history.js"]);
   let calls = 0;
   env.window.pywebview = { api: { get_history: async () => {
     calls++;
@@ -524,4 +529,83 @@ test("a save_text_file error toasts and does not claim the export succeeded", as
   assert.match(text, /Save file failed: disk full/);
   assert.doesNotMatch(text, /History exported/,
     "a failed save must never be reported as an export that happened");
+});
+
+/* ---------- history: the keyboard selection under keyed rows ----------
+
+   Rows now survive a refresh (js/lists.js) and a deleted row stays in the
+   DOM while it fades out. The selection has to follow the rows on screen,
+   not an index into `flat`, which is already the new list mid-animation. */
+
+const keyOf = (row) => row.dataset.key;
+
+async function mountHistoryKeys(t, { animate = false } = {}) {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const env = loadVoisr(["js/ui.js", "js/lists.js", "js/api.js", "js/views/history.js"]);
+  let live = HISTORY.map((i) => ({ ...i }));
+  const deleted = [];
+  env.window.pywebview = { api: {
+    get_history: async () => live.map((i) => ({ ...i })),
+    delete_history_item: async (id) => {
+      deleted.push(id);
+      live = live.filter((i) => i.id !== id);
+      return { ok: true };
+    },
+  } };
+  // Web Animations stand-in: an animation finishes when its duration has
+  // passed on the mocked clock, so a test can stop mid-fade
+  const withMotion = (n) => {
+    n.animate = (frames, opts) => ({
+      finished: new Promise((r) => setTimeout(r, opts.duration)) });
+    n.getBoundingClientRect = () => ({ top: n.parent ? n.parent.children.indexOf(n) * 50 : 0 });
+    return n;
+  };
+  if (animate) {
+    const make = env.document.createElement;
+    env.document.createElement = (tag) => withMotion(make(tag));
+  }
+  const nodes = {};
+  for (const id of [...UNDO_IDS, "view-history"]) {
+    nodes[id] = makeNode(id === "history-search" ? "input" : "div");
+    if (animate) withMotion(nodes[id]);
+    env.register(id, nodes[id]);
+  }
+  nodes["history-search"].value = "";
+  nodes["export-popover"].hidden = true;
+  await env.V.views.history.render();
+  env.V.views.history.initKeys();
+  const press = (key) => env.document.dispatch("keydown", {
+    key, target: { tagName: "BODY" }, preventDefault() {} });
+  const selected = () => rowsIn(nodes["history-groups"]).filter((r) => r.classList.contains("selected"));
+  return { V: env.V, deleted, press, selected, ...nodes };
+}
+
+test("a refresh clears the keyboard selection along with the cursor", async (t) => {
+  const h = await mountHistoryKeys(t);
+  h.press("ArrowDown");
+  assert.equal(h.selected().length, 1);
+
+  await h.V.views.history.render();   // a dictation landed elsewhere
+
+  assert.equal(h.selected().length, 0,
+    "a kept row must not stay highlighted when Enter and Backspace would ignore it");
+});
+
+test("mid-fade, Backspace deletes the row that is highlighted, never its neighbour", async (t) => {
+  const h = await mountHistoryKeys(t, { animate: true });
+  const groups = h["history-groups"];
+  const first = rowsIn(groups)[0];
+  h.press("ArrowDown");
+  h.press("Backspace");
+  await settle();                      // the first row is now fading out
+  assert.ok(rowsIn(groups).includes(first), "still in the DOM while it fades");
+
+  h.press("ArrowDown");
+  h.press("ArrowDown");
+  const [mark] = h.selected();
+  assert.ok(mark, "a row is highlighted");
+  assert.notEqual(mark, first, "a fading row can't be selected");
+  h.press("Backspace");
+  await settle();
+  assert.equal(h.deleted[1], keyOf(mark), "the second delete hit the highlighted row");
 });

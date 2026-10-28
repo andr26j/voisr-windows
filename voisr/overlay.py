@@ -18,8 +18,12 @@ from voisr.paths import web_dir as _web_dir
 
 WEB_DIR = _web_dir()
 
-WIDTH, HEIGHT = 232, 52
-BOTTOM_MARGIN = 72
+# 6 px of headroom above and below the 44 px pill for its entrance rise;
+# the margin keeps the pill's centre where it has always been
+WIDTH, HEIGHT = 232, 56
+BOTTOM_MARGIN = 70
+EXIT_S = 0.18  # the pill's 160 ms exit (widget.html), plus a frame
+LEVEL_HZ = 30  # pill bars follow the voice; the page smooths between pushes
 WINDOW_TITLE = "Voisr Recording"
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -96,10 +100,20 @@ class RecordingWidget:
     click-through, and never steals focus — paste-at-cursor stays intact.
     """
 
-    def __init__(self):
+    # every show_*/hide takes if_current, so HotkeyService can apply a state
+    # only while its recording still owns the pill
+    _supports_ownership_action = True
+
+    def __init__(self, level_source=None):
         self._window = None
         self._hwnd = None
         self._shown = False
+        # () -> float | None; polled only while the pill shows "recording"
+        self._level_source = level_source
+        # Bumped by every state change: a running level feed or a pending
+        # post-exit hide from an older state sees the change and stops.
+        self._gen = 0
+        self._gen_lock = threading.Lock()
         self._guard_started = False
         self._visibility_guard_started = False
 
@@ -270,9 +284,56 @@ class RecordingWidget:
         except Exception:
             pass
 
+    def _next_gen(self) -> int:
+        with self._gen_lock:
+            self._gen += 1
+            return self._gen
+
+    def _is_gen(self, gen: int) -> bool:
+        with self._gen_lock:
+            return gen == self._gen
+
+    @staticmethod
+    def level_js(level) -> str | None:
+        """The JS that hands one level to the page, or None for no reading.
+        Only a real number is ever interpolated into the script."""
+        if isinstance(level, bool) or not isinstance(level, (int, float)):
+            return None
+        if level != level:  # NaN
+            return None
+        level = min(1.0, max(0.0, float(level)))
+        return f"window.setLevel && setLevel({level:.3f})"
+
+    def _feed(self, gen: int, sleep=None) -> None:
+        """Push the live level 30 times a second until the state changes.
+        A None reading ends it too: StreamRecorder always reports a float, so
+        None means a capture already over. run_js, not evaluate_js: it does
+        not wait on the page, so a busy WebView2 can't stall the loop."""
+        wait = sleep or threading.Event().wait
+        while self._is_gen(gen):
+            window = self._window
+            if window is None:
+                return
+            try:
+                level = self._level_source()
+            except Exception:
+                level = float("nan")  # a failed read is transient: keep polling
+            if level is None:
+                return
+            js = self.level_js(level)
+            if js is not None:
+                try:
+                    window.run_js(js)
+                except Exception:
+                    pass
+            wait(1 / LEVEL_HZ)
+
     def _apply(self, state: str, theme: str | None, color: str | None) -> None:
         if self._window is None:
             return
+        # first, so a failing JS call below still ends the previous state's
+        # level feed and cancels a pending post-exit hide
+        gen = self._next_gen()
         try:
             if theme is not None:
                 # sanitize_* whitelist both values — config.json content
@@ -284,6 +345,9 @@ class RecordingWidget:
         except Exception:
             pass  # never break the record path
         self._show_window()
+        if state == "recording" and self._level_source is not None:
+            threading.Thread(target=self._feed, args=(gen,),
+                             name="voisr-pill-level", daemon=True).start()
 
     def _show_window(self) -> None:
         self._shown = True
@@ -328,12 +392,29 @@ class RecordingWidget:
     def show_error(self, is_current=None, if_current=None):
         self._set("error", is_current=is_current, if_current=if_current)
 
-    def hide(self, is_current=None, if_current=None):
+    def _hide_window(self, gen: int) -> None:
+        """Hide once the pill's exit animation is over -- and not at all if a
+        new dictation has shown the pill again in the meantime."""
+        if not self._is_gen(gen):
+            return
+        self._shown = False
+        if self._hwnd:
+            try:
+                user32.ShowWindow(self._hwnd, SW_HIDE)
+            except Exception:
+                pass
+
+    def hide(self, is_current=None, if_current=None, timer_factory=threading.Timer):
         def apply():
-            self._shown = False
-            if self._hwnd:
+            gen = self._next_gen()  # first: ends the level feed even if JS fails
+            # Scheduled before the JS call so a dead webview still hides.
+            timer = timer_factory(EXIT_S, lambda: self._hide_window(gen))
+            timer.daemon = True
+            timer.start()
+            window = self._window
+            if window is not None:
                 try:
-                    user32.ShowWindow(self._hwnd, SW_HIDE)
+                    window.run_js("window.hide && hide()")
                 except Exception:
                     pass
 

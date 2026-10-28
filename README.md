@@ -60,13 +60,20 @@ venv\Scripts\python -m voisr.ui
 
 ## Usage
 
-Hold **right Ctrl** to dictate, speak, release — the transcription is cleaned up and pasted at your cursor. A floating pill shows recording/transcribing state near your cursor.
+Hold **right Ctrl** to dictate, speak, release — the transcription is cleaned up and pasted at your cursor. A floating pill shows recording/transcribing state, and its bars follow your voice.
+
+- **Hands-free:** double-tap the key to keep recording without holding it; press it once more to finish.
+- **Tap to nothing:** a quick tap on its own (under half a second) is dropped, so brushing the key never pastes anything.
+- **Esc cancels** a dictation in progress — the audio is dropped and nothing is pasted.
+- **Shortcuts stay shortcuts:** pressing another key within a second of the hotkey (Right Ctrl+C, say) cancels the dictation instead of recording it.
+- **Silence is caught before whisper:** a recording with no speech in it says so instead of pasting `[BLANK_AUDIO]`, a microphone that sends only zeros is reported as one, and leading/trailing silence is trimmed before transcription.
+- **Microphone switched off?** If Windows' microphone privacy switch is off for desktop apps, the press is refused with an error pill and Settings → Privacy & security → Microphone opens (at most once a minute).
 
 The dashboard (Start Menu → Voisr, or the Desktop shortcut) launches to a system tray icon; closing its window leaves Voisr running in the tray. From the tray menu: **Dictate now**, **Open Dashboard**, and **Quit Voisr**.
 
 ### Dashboard
 
-**Home** leads with your push-to-talk key rendered as a keycap (`Hold <key> to dictate`) and a headline stat showing **Time saved** (measured against typing at 40 wpm) with a 14-day sparkline.
+**Home** leads with a one-line push-to-talk status (`Hold <key> to dictate`) whose dot shows whether the key listener is actually live. Three tiles — **Time saved** (against typing at 40 wpm), **Words**, and **Streak** — each carry their own 14-day trend and week-over-week change; numbers count up when they change. If microphone access is off, the whole panel says so and links to the Settings page. A docked recorder at the bottom of Home records from the window itself when the key can't be used, with a live voice meter.
 
 **Ctrl+K command palette** lets you start dictation, jump between views, change the push-to-talk key, toggle appearance, and copy the last dictation.
 
@@ -98,7 +105,9 @@ The dashboard (Start Menu → Voisr, or the Desktop shortcut) launches to a syst
 }
 ```
 
-Add a dictionary entry for **every variant the ASR produces** for a term — dictate the word once, see what comes out, and map it.
+Add a dictionary entry for **every variant the ASR produces** for a term — dictate the word once, see what comes out, and map it. The dictionary's written forms are also passed to whisper as a glossary prompt (most recent 40 terms) to bias spelling.
+
+A hand-edited value of the wrong type falls back to its default (the rest of the file is kept, and a dictionary keeps its valid entries). A file that isn't valid JSON at all is moved aside to `config.json.corrupt-<timestamp>` rather than overwritten, and the dashboard says so once on the next launch. Settings are written atomically.
 
 **Why right Ctrl, not right Alt (Wispr Flow / the macOS build's default):** right Alt is AltGr on many keyboard layouts, and AltGr + V can produce a different character than plain V on those layouts, which corrupts an injected Ctrl+V paste. Right Ctrl avoids that.
 

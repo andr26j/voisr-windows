@@ -30,8 +30,53 @@ def microphone_granted() -> bool:
     return True
 
 
+_CONSENT_KEY = (r"Software\Microsoft\Windows\CurrentVersion"
+                r"\CapabilityAccessManager\ConsentStore\microphone")
+
+
+def _consent_value(hive, subkey):
+    """The "Value" string under a ConsentStore key, or None if absent."""
+    import winreg
+    try:
+        with winreg.OpenKey(hive, subkey) as key:
+            value, _ = winreg.QueryValueEx(key, "Value")
+    except OSError:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def microphone_switch(read=None):
+    """Whether Windows' privacy switches let Voisr use the microphone: False
+    when any of them is off, True when all are on, None when unknown.
+
+    Cheap (three registry reads), so the hotkey checks it on every press.
+    Three switches gate a desktop app: the device-wide one (HKLM), "Let
+    apps access your microphone" (HKCU), and "Let desktop apps access your
+    microphone" (HKCU ...\\NonPackaged). Any one off hands Voisr silence."""
+    import winreg
+    if read is None:
+        read = _consent_value
+    values = [read(winreg.HKEY_LOCAL_MACHINE, _CONSENT_KEY),
+              read(winreg.HKEY_CURRENT_USER, _CONSENT_KEY),
+              read(winreg.HKEY_CURRENT_USER, _CONSENT_KEY + r"\NonPackaged")]
+    if "Deny" in values:
+        return False
+    if all(v == "Allow" for v in values):
+        return True
+    return None
+
+
+def microphone_state():
+    """The privacy switches first: a switched-off one is a known denial, and
+    opening a stream would only hand back silence. Otherwise the stream
+    probe decides."""
+    if microphone_switch() is False:
+        return False
+    return microphone_granted()
+
+
 DEFAULT_PROBES = {
-    "microphone": microphone_granted,
+    "microphone": microphone_state,
 }
 
 
