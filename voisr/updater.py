@@ -71,8 +71,9 @@ def is_newer(remote, local) -> bool:
     return r > l
 
 
-# The public release channel. Source stays in a private repo; a token shipped
-# inside the bundle would be extractable by anyone who installs it.
+# The public release channel: binaries only, fetched without a token (one
+# shipped inside the bundle would be extractable by anyone who installs it).
+# Every installed copy checks this address, so it must not move.
 MANIFEST_URL = (
     "https://github.com/andr26j/voisr-releases/releases/latest/download/latest.json"
 )

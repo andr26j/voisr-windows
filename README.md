@@ -188,7 +188,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 powershell -ExecutionPolicy Bypass -File scripts\publish_release.ps1
 ```
 
-Releases live in [andr26j/voisr-releases](https://github.com/andr26j/voisr-releases) — public so installed copies can fetch updates without a token, while this source repo stays private. It holds only `VoisrSetup.exe` and `latest.json`.
+Releases live in [andr26j/voisr-releases](https://github.com/andr26j/voisr-releases) — a separate public repo that holds only `VoisrSetup.exe` and `latest.json`. Installed copies fetch updates from it without a token. It was split out while this source repo was private; it stays separate because every installed copy already checks that address for updates.
 
 `publish_release.ps1` refuses to publish if the tag exists, if `notes` is empty, or if the installer's SHA256 disagrees with `latest.json`. Installed copies verify that hash before running anything, so a mismatch means every client rejects the update.
 
