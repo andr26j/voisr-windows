@@ -84,3 +84,14 @@ def test_unknown_message_is_ignored(monkeypatch):
     cb = install(monkeypatch, listener, FakeHookStruct(0xA3))
     cb(0, 0x9999, 0)
     assert seen == []
+
+
+def test_a_hook_that_cannot_be_installed_settles_as_failed(monkeypatch):
+    # The watcher respawns on "failed"; a listener stuck in "starting" after
+    # a refused install would never be retried.
+    monkeypatch.setattr(keytap.user32, "SetWindowsHookExW", lambda *a: None)
+    listener = keytap.WindowsKeyListener(lambda vk, kind: None)
+    assert listener.state == "starting"
+    listener.start()
+    assert listener.wait_started(2) == "failed"
+    listener.stop()

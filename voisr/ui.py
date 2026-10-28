@@ -1427,7 +1427,6 @@ class Api:
                 cfg.pop("hotkey_label", None)
             cfg.update(updates)
             self._write_config_atomic(cfg)
-            self._config_stat_cache = None
             # Before anything else can read it back: a stale
             # "check_for_updates" would make the Settings toggle look like it
             # did nothing.

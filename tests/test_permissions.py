@@ -46,3 +46,37 @@ def test_open_pane_survives_opener_failure():
         raise OSError("no shell")
 
     assert open_pane("microphone", opener=explode) is False
+
+
+def _switches(machine, user, desktop):
+    """A fake ConsentStore reader: the device-wide switch (HKLM), "let apps
+    access" (HKCU) and "let desktop apps access" (HKCU NonPackaged)."""
+    import winreg
+
+    def read(hive, subkey):
+        if hive == winreg.HKEY_LOCAL_MACHINE:
+            return machine
+        return desktop if subkey.endswith("NonPackaged") else user
+    return read
+
+
+def test_microphone_switch_is_on_when_every_switch_allows():
+    assert permissions.microphone_switch(_switches("Allow", "Allow", "Allow")) is True
+
+
+def test_any_switch_off_means_the_microphone_is_off():
+    for values in (("Deny", "Allow", "Allow"), ("Allow", "Deny", "Allow"),
+                   ("Allow", "Allow", "Deny")):
+        assert permissions.microphone_switch(_switches(*values)) is False, values
+
+
+def test_a_missing_switch_is_unknown_never_on():
+    assert permissions.microphone_switch(_switches("Allow", None, "Allow")) is None
+
+
+def test_a_switched_off_microphone_is_a_known_denial_without_opening_a_stream(monkeypatch):
+    monkeypatch.setattr(permissions, "microphone_switch", lambda: False)
+    opened = []
+    monkeypatch.setattr(permissions, "microphone_granted", lambda: opened.append(1) or True)
+    assert permissions.microphone_state() is False
+    assert opened == []

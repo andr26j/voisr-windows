@@ -123,3 +123,11 @@ def test_start_hotkey_service_reports_nothing_on_success():
             pass
 
     assert start_hotkey_service(Fine()) is None
+
+
+def test_a_config_saved_by_notepad_with_a_bom_still_loads(tmp_path):
+    # Notepad writes UTF-8 with a byte-order mark; that is not corruption.
+    (tmp_path / "config.json").write_bytes(
+        b"\xef\xbb\xbf" + json.dumps({"dictionary": DICTIONARY}).encode("utf-8"))
+    assert load_config(tmp_path / "config.json")["dictionary"] == DICTIONARY
+    assert quarantined(tmp_path) == []
