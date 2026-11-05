@@ -35,7 +35,8 @@ a = Analysis(
     ],
     # Imported inside functions only, so a frozen build that missed them
     # would fail at the first download or dictation, not at startup.
-    hiddenimports=["certifi", "voisr.models"],
+    hiddenimports=["certifi", "voisr.models", "voisr.whisper_guard",
+                   "voisr.whisper_server"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
