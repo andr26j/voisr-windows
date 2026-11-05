@@ -278,8 +278,18 @@ def _missed(verifier, snapshot) -> bool:
     try:
         return bool(verifier(_old_clipboard_text(snapshot)))
     except Exception as error:
-        print(f"Voisr: paste check skipped ({error.__class__.__name__})", flush=True)
+        _log(f"paste check skipped ({error.__class__.__name__})")
         return False
+
+
+def _log(message: str) -> None:
+    """voisr.log, beside the rest of the paste-check rows: print() is silent
+    in the windowed build. Never raises."""
+    try:
+        from voisr.updater import _log as log
+        log(message)
+    except Exception:
+        pass
 
 
 def _paste_with_adapter(text, *, adapter, post_ctrl_v,
