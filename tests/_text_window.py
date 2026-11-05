@@ -35,7 +35,7 @@ ES_READONLY = 0x0800
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
 WM_APP_HANG = 0x8000 + 1
-VK_MENU = 0x12
+VK_SHIFT = 0x10
 KEYEVENTF_KEYUP = 0x0002
 
 TITLE = "Voisr UIA test window"
@@ -62,6 +62,9 @@ user32.CreateWindowExW.restype = wintypes.HWND
 user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
                                 wintypes.LPARAM]
 user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetFocus.restype = wintypes.HWND
+user32.SetFocus.argtypes = [wintypes.HWND]
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
 
@@ -109,14 +112,16 @@ def main() -> None:
     }
     foreground = False
     if focus:
-        # A process may only take the foreground right after input; a
-        # synthetic Alt press counts, and does nothing on its own.
+        # A process may only take the foreground right after input of its
+        # own; a synthetic Shift press counts and does nothing else. (Alt, the
+        # usual one, opens the window's menu and takes the focus with it.)
         for _ in range(5):
-            user32.keybd_event(VK_MENU, 0, 0, 0)
-            user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(VK_SHIFT, 0, 0, 0)
+            user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
             user32.SetForegroundWindow(main_hwnd)
             user32.SetFocus(hwnds["edit"])
-            if user32.GetForegroundWindow() == main_hwnd:
+            if (user32.GetForegroundWindow() == main_hwnd
+                    and user32.GetFocus() == hwnds["edit"]):
                 foreground = True
                 break
             time.sleep(0.1)
