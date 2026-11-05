@@ -9,6 +9,7 @@ dedicated Windows module is imported rather than re-implemented:
 key), and `voisr.status_item` (the tray icon).
 """
 import functools
+import inspect
 import json
 import os
 import threading
@@ -1043,6 +1044,13 @@ class Api:
         self._hotkey_service = hotkey_service
         self._capture_fn = capture_fn
         self._paste_fn = paste_fn
+        # A paste function that reports when Ctrl+V went out lets the paste
+        # timing stop there, not after the clipboard-restore wait.
+        try:
+            self._paste_reports_sent = "on_sent" in inspect.signature(
+                paste_fn).parameters
+        except (TypeError, ValueError):
+            self._paste_reports_sent = False
         self._clipboard_fn = clipboard_fn
         self._save_dialog_fn = save_dialog_fn or _run_save_dialog
         self._timer_factory = timer_factory
@@ -1086,14 +1094,42 @@ class Api:
         )
 
     def _default_transcribe(self, wav, cfg):
-        """Transcribe with the release-time model and dictionary prompt."""
+        """Transcribe with the release-time model and dictionary prompt.
+        Returns (text, info) like transcriber.transcribe_routed."""
         from voisr.transcriber import resolve_model, transcribe as _transcribe
-        return _transcribe(wav, model_path=resolve_model(cfg.get("model")),
+        text = _transcribe(wav, model_path=resolve_model(cfg.get("model")),
                            prompt=glossary_prompt(cfg.get("dictionary")))
+        return text, {"mode": "cli", "timings": {}}
+
+    def _model_name(self, cfg):
+        """Model that transcribed this clip, or None when a test or caller
+        injected its own transcribe function and no model was involved."""
+        if self._transcribe_fn is not None:
+            return None
+        from voisr.transcriber import resolve_model
+        return resolve_model(cfg.get("model")).stem.removeprefix("ggml-")
+
+    def _record_delivery_timings(self, item, t_start, paste_started, paste_sent=None):
+        """Best effort, after delivery: the paste has already happened and the
+        history line already exists, so a failure here costs only the numbers.
+        paste_sent is when Ctrl+V went out; the clipboard-restore wait after
+        it (inject.PASTE_GRACE_S) is not time the user waited for their text.
+        When the paste function doesn't report it, fall back to now."""
+        if item is None:
+            return
+        now = paste_sent if paste_sent is not None else self._clock()
+        timings = {"total": (now - t_start) * 1000}
+        if paste_started is not None:
+            timings["paste"] = (now - paste_started) * 1000
+        try:
+            self._history.merge_timings(item["id"], timings)
+        except Exception as error:
+            _update_log(f"history: timings not recorded: {error}")
 
     def _transcribe_audio(self, wav, cfg):
+        """(raw text, info) where info has the mode and any extra timings."""
         if self._transcribe_fn is not None:
-            return self._transcribe_fn(wav)
+            return self._transcribe_fn(wav), {"mode": None, "timings": {}}
         return self._default_transcribe(wav, cfg)
 
     def current_level(self):
@@ -1239,9 +1275,12 @@ class Api:
             except Exception as error:
                 # an untrimmed clip still transcribes
                 _update_log(f"audio: trim failed: {error}")
+        t_start = self._clock()
         try:
-            raw = self._transcribe_audio(wav, cfg)
+            raw, info = self._transcribe_audio(wav, cfg)
+            t_transcribed = self._clock()
             text = clean(raw, dictionary=cfg.get("dictionary", {}))
+            t_cleaned = self._clock()
         except Exception as error:
             return SessionResult.failure(
                 session.sequence, "transcription",
@@ -1254,7 +1293,14 @@ class Api:
         item = None
         warning = None
         try:
-            item = self._history.add(text, duration_s=duration)
+            # Written before pasting so the dictation is durable whatever
+            # the paste does. Paste and total are merged in afterwards.
+            item = self._history.add(
+                text, duration_s=duration, model=self._model_name(cfg),
+                mode=info["mode"],
+                timings_ms={"transcribe": (t_transcribed - t_start) * 1000,
+                            "cleanup": (t_cleaned - t_transcribed) * 1000,
+                            **info["timings"]})
             self._notify_dictation()
         except Exception as error:
             warning = f"history failed: {error}"[:250]
@@ -1263,7 +1309,10 @@ class Api:
         paste_error = None
         fallback_safe = True
         typing_generation = None
+        paste_started = None
+        paste_sent = [None]  # clock reading when the paste function sent Ctrl+V
         if session.paste_requested and cfg.get("paste") and not self._quitting:
+            paste_started = self._clock()
             with self._paste_state_lock:
                 typing_generation = self._typing_generation
                 join = (
@@ -1273,7 +1322,10 @@ class Api:
                     and not self._last_paste_text[-1].isspace()
                 )
             try:
-                pasted = self._paste_fn((" " if join else "") + text)
+                pasted = self._paste_fn(
+                    (" " if join else "") + text,
+                    **({"on_sent": lambda: paste_sent.__setitem__(0, self._clock())}
+                       if self._paste_reports_sent else {}))
             except PasteDeliveryError as error:
                 pasted = error.pasted
                 fallback_safe = error.fallback_safe
@@ -1294,6 +1346,8 @@ class Api:
                 copied = True
             except Exception as error:
                 clipboard_error = error
+
+        self._record_delivery_timings(item, t_start, paste_started, paste_sent[0])
 
         fields = {"text": text, "copied": copied, "pasted": pasted}
         if item is not None:
