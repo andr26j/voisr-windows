@@ -34,6 +34,7 @@ DEFAULT_CONFIG = {
     "launch_at_login": False,
     "appearance": "system",
     "check_for_updates": True,
+    "dismissed_banners": [],
 }
 
 
@@ -63,6 +64,10 @@ def _is_dictionary(v):
         isinstance(k, str) and k and isinstance(w, str) for k, w in v.items())
 
 
+def _is_str_list(v):
+    return isinstance(v, list) and all(isinstance(item, str) for item in v)
+
+
 CONFIG_VALIDATORS = {
     "hotkey": _is_str, "paste": _is_bool,
     "dictionary": _is_dictionary, "show_widget": _is_bool,
@@ -70,6 +75,11 @@ CONFIG_VALIDATORS = {
     "appearance": _is_str, "launch_at_login": _is_bool,
     "model": _is_optional_str, "hotkey_vk": _is_vk, "hotkey_label": _is_str,
     "check_for_updates": _is_bool,
+    # the page banners (Dictionary, Snippets) someone closed, by name
+    "dismissed_banners": _is_str_list,
+    # not in DEFAULT_CONFIG: missing means first run hasn't been decided yet
+    # (Api.first_run_pending), which is how an existing install is recognised
+    "first_run_done": _is_bool,
 }
 
 

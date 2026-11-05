@@ -1564,6 +1564,36 @@ class Api:
     def open_settings_pane(self, key):
         return {"ok": permissions.open_pane(key)}
 
+    def first_run_pending(self) -> bool:
+        """Does first run still need showing? A saved first_run_done answers.
+        With none, an existing config.json or history means an install from
+        before first run, which skips it and stays unwritten. Otherwise this is
+        a fresh install: save False now, so a change made during first run can't
+        make it look like an existing install if they quit midway."""
+        with self._config_lock:
+            done = self.get_config().get("first_run_done")
+            if done is None:
+                if self._config_path.exists() or self._has_history():
+                    return False
+                try:
+                    self._update_config({"first_run_done": False})
+                except OSError as error:
+                    _log(f"first run not saved ({error})")
+            elif done:
+                return False
+        return True
+
+    def _has_history(self) -> bool:
+        path = getattr(self._history, "path", None)
+        try:
+            return path is not None and Path(path).stat().st_size > 0
+        except OSError:
+            return False
+
+    def get_first_run(self):
+        """Bridge: whether the page opens on first run rather than Home."""
+        return {"pending": self.first_run_pending()}
+
     def restore_history_item(self, item):
         try:
             self._history.restore(item)
@@ -1780,7 +1810,7 @@ class Api:
 # tests/test_js_bridge_surface.py pins this to the V.api() calls in voisr/web/js.
 BRIDGE_METHODS = (
     "capture_hotkey", "check_for_updates_now", "clear_history", "copy_text",
-    "delete_history_item", "export_history", "get_config", "get_history",
+    "delete_history_item", "export_history", "get_config", "get_first_run", "get_history",
     "get_hotkey_status", "get_level", "get_models", "get_permissions",
     "get_pill_themes", "get_stats", "get_update_status", "hotkey_display",
     "install_update", "open_settings_pane", "restore_history_item",
@@ -1831,6 +1861,12 @@ def main():
     try:
         set_app_user_model_id()
         api = Api(mic_check=permissions.microphone_switch)
+        # settled before anything can write config.json, which would make a
+        # fresh install look like an existing one
+        try:
+            api.first_run_pending()
+        except Exception as e:  # startup must not die over this
+            _log(f"first run not checked ({e})")
         widget = RecordingWidget(level_source=api.current_level)
         service = HotkeyService(api, widget=widget, key_state=hotkey_key_down)
         api.attach_hotkey_service(service)
