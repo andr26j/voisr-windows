@@ -295,3 +295,29 @@ def test_a_capture_of_the_focused_box(focused_window, adapter, worker):
     assert "Invoice for Tareq Haddad" in focus.nearby_texts
     assert focus.trust_absence is True
 
+
+def test_a_real_paste_is_verified(focused_window, adapter):
+    """The real paste path, clipboard and Ctrl+V, into the focused box, with
+    the paste check reading it back."""
+    from voisr import inject
+    from voisr.paste_verify import check_delivery
+
+    edit = focused_window["edit"]
+    type_into(edit, "note: ")
+    tracker = FocusTracker(adapter, lambda: True)
+    try:
+        before = tracker.read_now(BUDGET_S)
+        assert before is not None and before.readable
+        verdicts = []
+
+        def verifier(old_clipboard):
+            after = tracker.read_now(BUDGET_S)
+            verdict = check_delivery(before, after, "dictated words", old_clipboard)
+            verdicts.append(verdict)
+            return verdict.missed
+
+        assert inject.paste_at_cursor("dictated words", verifier=verifier) is True
+        assert text_of(edit) == "note: dictated words"
+        assert [v.status for v in verdicts] == ["verified"]
+    finally:
+        tracker.close()
