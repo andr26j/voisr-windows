@@ -69,6 +69,7 @@ class ClickWatch:
         self._thread_id = None
         self._ready = threading.Event()
         self.listening = False
+        self.reports = 0  # mouse reports read, moves included: for diagnosis
 
     def start(self) -> bool:
         self._thread = threading.Thread(target=self._run, name="voisr-clicks",
@@ -124,6 +125,8 @@ class ClickWatch:
                     size = wintypes.UINT(ctypes.sizeof(report))
                     got = user32.GetRawInputData(msg.lParam, RID_INPUT, ctypes.byref(report),
                                                  ctypes.byref(size), header_size)
+                    if got != 0xFFFFFFFF:
+                        self.reports += 1
                     if got != 0xFFFFFFFF and clicked(report):
                         try:
                             self._on_click()
