@@ -98,11 +98,16 @@ def test_a_failing_callback_does_not_end_the_watch():
                                     None, None, None, None)
     try:
         user32.SetCursorPos(320, 270)
-        for _ in range(2):
+        time.sleep(0.3)
+        for count in (1, 2):
             send_mouse(MOUSEEVENTF_LEFTDOWN)
             send_mouse(MOUSEEVENTF_LEFTUP)
-            time.sleep(0.3)
-        assert len(calls) == 2 and watch.listening
+            deadline = time.monotonic() + 3
+            while len(calls) < count and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert len(calls) == count, f"click {count} wasn't heard"
+            time.sleep(0.6)  # past the double-click time
+        assert watch.listening
     finally:
         user32.SetCursorPos(old.x, old.y)
         if target:
