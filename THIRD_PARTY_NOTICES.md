@@ -39,6 +39,13 @@ assumed.
   open-sourcing the application, provided the PSF copyright notice is
   retained and changes to Python itself (none, here) are documented.
 
+### Webster's Second International word list (`assets/words.gz`)
+- **Licence:** public domain (the 1934 copyright has lapsed)
+- **Verified at:** https://cgit.freebsd.org/src/plain/share/dict/README
+  ("The 1934 copyright has lapsed, according to the supplier"). The copy
+  shipped is the one macOS carries as `/usr/share/dict/web2`, from FreeBSD,
+  gzipped, so the Windows app tells names from words exactly as the Mac does.
+
 ## Fonts and icons in the dashboard (ship inside the installer)
 
 ### Instrument Serif (`voisr/web/fonts/InstrumentSerif-Regular.ttf` and `InstrumentSerif-Italic.ttf`)
@@ -137,6 +144,7 @@ assumed.
 | PortAudio | MIT | None |
 | SDL2 | zlib | None |
 | Python + stdlib | PSF-2.0 | None |
+| web2 word list | Public domain | None |
 | Instrument Serif | SIL OFL 1.1 | None — licence ships beside the fonts |
 | Lucide icons | ISC (some MIT) | None |
 | pywebview | BSD 3-Clause | None |

@@ -866,6 +866,13 @@ def test_old_lines_without_model_or_timings_stay_valid(tmp_path):
     assert store.list()[0]["timings_ms"] == {"total": 12}
 
 
+def test_a_snippet_row_is_marked(tmp_path):
+    store = HistoryStore(tmp_path / "h.jsonl")
+    assert store.add("my address", 1.0, snippet=True)["snippet"] is True
+    assert "snippet" not in store.add("plain words", 1.0)
+    assert [i.get("snippet") for i in store.list()] == [None, True]
+
+
 def test_add_records_model_mode_and_whole_ms_timings(tmp_path):
     store = HistoryStore(tmp_path / "h.jsonl")
     item = store.add("hello", 1.0, model="small.en", mode="warm",
@@ -885,4 +892,39 @@ def test_merge_timings_keeps_earlier_keys_and_does_not_resurrect(tmp_path):
     assert store.list()[0]["timings_ms"] == {"transcribe": 100, "paste": 20, "total": 130}
     store.delete(item["id"])
     assert store.merge_timings(item["id"], {"total": 1}) is False
+    assert store.list() == []
+
+
+def test_merge_fields_adds_app_stages_and_verdict(tmp_path):
+    store = HistoryStore(tmp_path / "h.jsonl")
+    item = store.add("hello", 1.0, timings_ms={"transcribe": 100})
+    assert store.merge_fields(
+        item["id"], timings_ms={"ax_context": 12, "verify": 30},
+        fields={"app": "notepad.exe", "delivery": "verified"})
+    saved = store.list()[0]
+    assert saved["app"] == "notepad.exe"
+    assert saved["delivery"] == "verified"
+    assert saved["timings_ms"] == {"transcribe": 100, "ax_context": 12, "verify": 30}
+
+
+def test_merge_fields_takes_only_known_fields_of_the_right_type(tmp_path):
+    # the one way into History after the record is written: other apps' text
+    # must have no route through it
+    store = HistoryStore(tmp_path / "h.jsonl")
+    item = store.add("hello", 1.0)
+    store.merge_fields(item["id"], fields={
+        "before_text": "secret on screen", "text": "overwritten",
+        "app": 7, "words_corrected": "two", "delivery": "x" * 500})
+    saved = store.list()[0]
+    assert "before_text" not in saved
+    assert saved["text"] == "hello"
+    assert "app" not in saved and "words_corrected" not in saved
+    assert len(saved["delivery"]) == 200
+
+
+def test_merge_fields_does_not_bring_back_a_deleted_record(tmp_path):
+    store = HistoryStore(tmp_path / "h.jsonl")
+    item = store.add("hello", 1.0)
+    store.delete(item["id"])
+    assert store.merge_fields(item["id"], fields={"delivery": "verified"}) is False
     assert store.list() == []
