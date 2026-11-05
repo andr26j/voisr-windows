@@ -443,13 +443,15 @@ def test_a_self_stop_does_not_wait_out_the_limit(tmp_path, io_recorder):
 
 
 def test_a_stream_sending_nothing_is_stopped_from_outside(tmp_path, monkeypatch, wedge, rows):
-    monkeypatch.setattr(StreamRecorder, "SELF_STOP_WAIT_S", 0.05)
+    monkeypatch.setattr(StreamRecorder, "SELF_STOP_WAIT_S", 0.2)
     monkeypatch.setattr(StreamRecorder, "STOP_TIMEOUT_S", SLOW_S)
     rec, streams, _ = make()
     rec.start(tmp_path / "a.wav")
     started = time.monotonic()
     rec.stop()
-    assert time.monotonic() - started >= 0.05
+    # it waited for the stream to stop itself first; Windows' clock ticks in
+    # about 16 ms, so a wait can read a little short of what was asked
+    assert time.monotonic() - started >= 0.2 - 0.032
     assert streams.made[0].stopped and streams.made[0].closed
     assert "from outside" in stop_rows(rows)[0]
 
