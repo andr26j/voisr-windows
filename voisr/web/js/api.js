@@ -8,12 +8,48 @@ window.Voisr = window.Voisr || {};
   setTimeout(() => {
     if (window.pywebview) return;
     const now = Date.now() / 1000;
+    // Preview only: the same sample as the design's boards.
+    const HOUR = 3600, startOfToday = new Date().setHours(0, 0, 0, 0) / 1000;
+    const today = (hours) => startOfToday + hours * HOUR;
+    const yesterday = (hours) => startOfToday - 24 * HOUR + hours * HOUR;
+    /* Preview only, to walk first run: index.html?firstrun=off starts with the
+       microphone switched off. Also =on (already on) and =unchecked (couldn't
+       check). Open Settings switches it on after a moment, and holding Ctrl
+       stands in for holding the key. */
+    const FIRST_RUN = new URLSearchParams((window.location && window.location.search) || "").get("firstrun");
+    const mockPanes = {
+      microphone: FIRST_RUN === "off" ? false : FIRST_RUN === "unchecked" ? null : true,
+    };
+    let holdingKey = false;
+    const grantSoon = (key) => setTimeout(() => { mockPanes[key] = true; }, 1500);
     let mockHistory = [
-      { id: "a1", ts: now - 300, text: "Hello team, please send the invoice to TradeMate by Friday.", words: 10, duration_s: 5 },
-      { id: "a2", ts: now - 7200, text: "Draft a follow-up about the Brunswick site visit next week.", words: 10, duration_s: 6 },
-      { id: "a3", ts: now - 90000, text: "Remember to book the trailer for Saturday morning.", words: 8, duration_s: 4 },
+      { id: "a1", ts: Math.min(today(16.2), now - 120), text: "Running ten minutes late. The 96 has stopped in Brunswick East for reasons nobody has explained.", words: 15, duration_s: 6 },
+      { id: "a2", ts: Math.min(today(14.78), now - 3600), text: "Can you send me the updated quote by Friday? I'll sign it off once Sam has checked the measurements.", words: 18, duration_s: 8 },
+      { id: "a3", ts: Math.min(today(11.05), now - 7200), text: "Move the permission check into the first run, so the reset only shows up when something is actually wrong.", words: 19, duration_s: 8 },
+      { id: "a4", ts: Math.min(today(9.43), now - 10800), text: "my email", words: 2, duration_s: 1, snippet: true },
+      { id: "a5", ts: yesterday(17.52), text: "The drawings are in the shared folder. Page three has the only change that matters.", words: 15, duration_s: 6 },
+      { id: "a6", ts: yesterday(13.13), text: "Tell them Tuesday works, but not before ten.", words: 8, duration_s: 3 },
     ];
-    let mockCfg = { hotkey: "ctrl_r", paste: true, show_widget: true, pill_theme: "classic", pill_color: null, dictionary: { trademake: "TradeMate", "trade mate": "TradeMate" }, model: "small.en", launch_at_login: false, check_for_updates: true };
+    let mockCfg = { hotkey: "ctrl_r", paste: true, show_widget: true, pill_theme: "classic", pill_color: null, dictionary: { trademake: "TradeMate", "trade mate": "TradeMate", voicer: "Voisr", voiser: "Voisr", "voice are": "Voisr", sam: "Sam" }, model: "small.en", launch_at_login: false, check_for_updates: true, model_unload: "min5", use_screen_context: true, learn_from_edits: true, dictionary_auto_add: true, dismissed_banners: [] };
+    // Preview only, to show the page's states. The rules for what may be saved
+    // and what gets a warning are in voisr/snippets.py and are not repeated here.
+    // Save a snippet called "email" to see the warning.
+    const SAMPLE_WARNING = "Sample warning: the real ones come from the app.";
+    if (FIRST_RUN) {
+      mockHistory = [];
+      mockCfg.first_run_done = false;
+      window.addEventListener("keydown", (e) => { if (e.key === "Control") holdingKey = true; });
+      window.addEventListener("keyup", (e) => {
+        if (e.key !== "Control") return;
+        holdingKey = false;
+        mockPanes.microphone = mockPanes.microphone === null ? true : mockPanes.microphone;
+        mockHistory.push({ id: "first", ts: Date.now() / 1000, words: 10, duration_s: 4,
+                           text: "Testing, testing. Is this thing writing down everything I say?" });
+        window.dispatchEvent(new Event("voisr:new-dictation"));
+      });
+    }
+    let mockSnippets = { "my email": "you@example.com", "sign off": "Thanks, Sam", "my address": "12 Example Street, Brunswick East VIC 3057" };
+    let mockSuggestions = [{ id: "s1", heard: "whisper cpp", written: "whisper.cpp", seen: 1 }];
     let recording = false;
     // mirrors voisr/keys.py's hotkey_options(), to resolve a human label for
     // hotkey_display() below.
@@ -26,15 +62,17 @@ window.Voisr = window.Voisr || {};
       { value: "scroll", label: "Scroll Lock" }, { value: "pause", label: "Pause" },
     ];
     window.pywebview = { api: {
+      // mirrors voisr/permissions.py's states(): the microphone switch only
       get_permissions: async () => ({ panes: [
-        { key: "microphone", label: "Microphone", granted: true,
+        { key: "microphone", label: "Microphone", granted: mockPanes.microphone,
           settings_url: "ms-settings:privacy-microphone" },
-      ]}),
-      open_settings_pane: async () => ({ ok: true }),
+      ] }),
+      get_first_run: async () => ({ pending: mockCfg.first_run_done === false }),
+      open_settings_pane: async (key) => { if (FIRST_RUN) grantSoon(key); return { ok: true }; },
       get_history: async () => [...mockHistory].sort((a, b) => b.ts - a.ts),
       get_stats: async () => ({
-        total_words: 12480, dictations: mockHistory.length, avg_wpm: 132,
-        streak_days: 6, total_seconds: 5400, time_saved_seconds: 13320,
+        total_words: 41300, dictations: mockHistory.length, avg_wpm: 132,
+        streak_days: 12, total_seconds: 5400, time_saved_seconds: 11520,
         daily: Array.from({ length: 14 }, (_, i) => ({
           date: `2026-07-${String(12 + i).padStart(2, "0")}`,
           words: [0, 120, 340, 90, 0, 610, 480, 220, 0, 130, 700, 540, 310, 260][i],
@@ -43,6 +81,29 @@ window.Voisr = window.Voisr || {};
       }),
       get_config: async () => JSON.parse(JSON.stringify(mockCfg)),
       set_config: async (u) => Object.assign(mockCfg, u),
+      get_snippets: async () => Object.entries(mockSnippets).map(([trigger, text]) => ({
+        trigger, text, warning: trigger === "email" ? SAMPLE_WARNING : null,
+      })),
+      save_snippet: async (old, trigger, text) => {
+        if (trigger !== old && trigger in mockSnippets) return { error: `“${trigger}” already uses that phrase` };
+        delete mockSnippets[old];
+        mockSnippets[trigger] = text;
+        return { ok: true, trigger, warning: trigger === "email" ? SAMPLE_WARNING : null };
+      },
+      delete_snippet: async (trigger) => { delete mockSnippets[trigger]; return { ok: true }; },
+      // mirrors Api.get_suggestions() and friends in voisr/ui.py
+      get_suggestions: async () => ({ pending: [...mockSuggestions],
+        auto_added: { sam: "Sam" }, used: {} }),
+      accept_suggestion: async (id) => {
+        const hit = mockSuggestions.find((p) => p.id === id);
+        if (hit) mockCfg.dictionary[hit.heard] = hit.written;
+        mockSuggestions = mockSuggestions.filter((p) => p.id !== id);
+        return { ok: true };
+      },
+      dismiss_suggestion: async (id) => {
+        mockSuggestions = mockSuggestions.filter((p) => p.id !== id);
+        return { ok: true };
+      },
       // mirrors Api.take_config_notice() in voisr/ui.py: {} unless a corrupt
       // config.json was moved aside at load.
       take_config_notice: async () => ({}),
@@ -63,14 +124,19 @@ window.Voisr = window.Voisr || {};
         return { ok: true, removed };
       },
       // mirrors Api.get_models() in voisr/ui.py; one model is left
-      // uninstalled here so the mock exercises the disabled-option path.
+      // uninstalled here so the mock exercises the download path.
       get_models: async () => ({
         models: [
-          { value: "small.en", label: "Small — best accuracy", installed: true, bytes: 488 * 1024 * 1024 },
-          { value: "base.en", label: "Base — fastest", installed: false, bytes: 0 },
+          { id: "base.en", label: "Base (English)", description: "The smallest of the four. English only.", bytes: 147964211, installed: false, active: false, custom: false, min_memory_gb: 4, apple_silicon_only: false, license: "MIT", blocked: null, warning: null, benchmark: null },
+          { id: "small.en", label: "Small (English)", description: "A step up in size from Base. English only. The default.", bytes: 487614201, installed: true, active: true, custom: false, min_memory_gb: 4, apple_silicon_only: false, license: "MIT", blocked: null, warning: null, benchmark: null },
         ],
         active: mockCfg.model || "small.en",
+        system: { chip: "Preview", memory_gb: 8 },
+        download: { state: "idle" },
       }),
+      download_model: async () => ({ error: "Downloads are disabled in the browser preview." }),
+      delete_model: async () => ({ error: "Not available in the browser preview." }),
+      get_download_progress: async () => ({ state: "idle" }),
       // mirrors Api.set_launch_at_login() in voisr/ui.py.
       set_launch_at_login: async (enabled) => {
         mockCfg.launch_at_login = !!enabled;
@@ -79,8 +145,7 @@ window.Voisr = window.Voisr || {};
       // mirrors Api.get_update_status()/check_for_updates_now() in
       // voisr/ui.py, i.e. UpdateChecker.status(): same shape either way, so
       // the dashboard renders one shape and never has to guess which fields
-      // exist. "ready" here (rather than "idle") previews the state Task 11's
-      // home banner reacts to.
+      // exist. "ready" here (rather than "idle") previews Home's banner.
       get_update_status: async () => ({
         state: "ready", current_version: "1.0.0", version: "1.1.0",
         notes: "Adds auto-update.", error: null, enabled: mockCfg.check_for_updates !== false,
@@ -89,10 +154,9 @@ window.Voisr = window.Voisr || {};
         state: "ready", current_version: "1.0.0", version: "1.1.0",
         notes: "Adds auto-update.", error: null, enabled: mockCfg.check_for_updates !== false,
       }),
-      // mirrors Api.install_update() in voisr/ui.py. Task 11 wires the button
-      // that calls this; nothing in this preview invokes it yet.
+      // mirrors Api.install_update() in voisr/ui.py
       install_update: async () => ({ ok: true, version: "1.1.0" }),
-      // mirrors Api.set_check_for_updates() in voisr/ui.py.
+      // mirrors Api.set_check_for_updates() in voisr/ui.py
       set_check_for_updates: async (enabled) => {
         mockCfg.check_for_updates = !!enabled;
         return { ok: true, enabled: !!enabled };
@@ -106,7 +170,7 @@ window.Voisr = window.Voisr || {};
         else return { error: `unsupported format: ${fmt}` };
         return { text, suggested_name: `voisr-history-${stamp}.${fmt}` };
       },
-      save_text_file: async (text, suggestedName) => ({ ok: true, path: `/tmp/${suggestedName}` }),
+      save_text_file: async (text, suggestedName) => ({ ok: true, path: `C:\\Users\\you\\Downloads\\${suggestedName}` }),
       copy_text: async () => ({ ok: true }),
       capture_hotkey: async () => {
         await new Promise((r) => setTimeout(r, 1200));
@@ -121,20 +185,17 @@ window.Voisr = window.Voisr || {};
         if (opt) return { display: opt.label };
         return { display: mockCfg.hotkey || "unset" };
       },
-      // mirrors Api.get_hotkey_status(): state drives Home's listener dot
+      // mirrors Api.get_hotkey_status(): state drives Home's status panel
       get_hotkey_status: async () => ({ status: `active on ${mockCfg.hotkey}`,
                                         state: recording ? "busy" : "listening" }),
       get_pill_themes: async () => [
-        { value: "classic", label: "Classic" }, { value: "ember", label: "Ember" },
-        { value: "aurora", label: "Aurora" }, { value: "ocean", label: "Ocean" },
-        { value: "neon", label: "Neon EQ" }, { value: "breathe", label: "Breathe" },
-        { value: "scanner", label: "Scanner" },
+        { value: "classic", label: "Signature" }, { value: "quiet", label: "Quiet" },
       ],
       start_recording: async () => { recording = true; return { recording: true }; },
       // mirrors Api.get_level(): a simulated voice (syllables and pauses)
       // while recording, null otherwise
       get_level: async () => {
-        if (!recording) return null;
+        if (!recording && !holdingKey) return null;
         const t = Date.now() / 1000;
         const syllable = Math.max(0, Math.sin(t * 9.5)) * (Math.sin(t * 1.3) > -0.6 ? 1 : 0);
         return 0.03 + 0.85 * syllable * (0.75 + 0.25 * Math.sin(t * 3.1));

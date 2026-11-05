@@ -85,3 +85,12 @@ def test_the_committed_png_and_svg_are_what_the_script_draws():
     png = Image.open(ASSETS / "icon_1024.png").convert("RGBA")
     assert png.tobytes() == logo.render(1024).tobytes()
 
+
+def test_the_sidebar_mark_is_the_small_ribbon():
+    """index.html's brand mark is drawn from the same curve, at its small size."""
+    import re
+    html = (ROOT / "voisr" / "web" / "index.html").read_text(encoding="utf-8")
+    d = re.search(r'<path id="brand-wave" d="([^"]+)"', html).group(1)
+    first = [float(v) for v in re.findall(r"[\d.]+", d)[:4]]
+    points = logo_wave.wave_points(logo_wave.SMALL, samples=44)
+    assert first == pytest.approx([*points[0], *points[1]], abs=0.01)
