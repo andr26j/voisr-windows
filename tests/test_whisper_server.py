@@ -198,6 +198,38 @@ def test_a_server_that_exits_while_loading_fails_fast(tmp_path):
     assert time.monotonic() - start < 3
 
 
+def test_a_port_taken_before_the_server_binds_it_gets_another(tmp_path):
+    # free_port() lets go of the port before the server binds it; a program
+    # that takes it in between must not cost a cooldown of whisper-cli.
+    rig = Rig(tmp_path)
+    orig = rig._spawn
+
+    def spawn(command):
+        p = orig(command)
+        if len(rig.spawned) == 1:
+            p.code = ws.PORT_IN_USE_EXIT   # couldn't bind: exits at once
+        return p
+
+    rig.server._spawn = spawn
+    text, _ = rig.server.transcribe(rig.wav, rig.model)
+    assert text == "hello world"
+    assert len(rig.spawned) == 2
+    ports = [c.command[c.command.index("--port") + 1] for c in rig.spawned]
+    assert ports[0] != ports[1]
+    assert rig.requests[0][0] == int(ports[1])
+    assert not rig.server._in_cooldown()
+
+
+def test_a_port_that_stays_taken_is_a_failure_after_a_few_tries(tmp_path):
+    rig = Rig(tmp_path)
+    orig = rig._spawn
+    rig.server._spawn = lambda c: (lambda p: (setattr(p, "code", ws.PORT_IN_USE_EXIT), p)[1])(orig(c))
+    with pytest.raises(ServerError):
+        rig.server.transcribe(rig.wav, rig.model)
+    assert len(rig.spawned) == ws.PORT_TRIES
+    assert rig.server._in_cooldown()
+
+
 def test_switching_models_replaces_the_loaded_one(tmp_path):
     rig = Rig(tmp_path)
     other = tmp_path / "ggml-base.en.bin"

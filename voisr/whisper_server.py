@@ -46,6 +46,11 @@ UNLOAD_SECONDS = {
 READY_TIMEOUT_S = 30.0       # model load, bounded
 WAIT_FOR_READY_S = 15.0      # most a release waits for a still-loading server
 FAILURE_COOLDOWN_S = 60.0
+# whisper-server exits 1 when it can't bind its port. free_port() has to let
+# go of the port before the server binds it, so a busy machine can take it in
+# between; a few fresh ports settle that without counting as a failure.
+PORT_IN_USE_EXIT = 1
+PORT_TRIES = 3
 IDLE_POLL_S = 5.0
 # Windows takes about two seconds to refuse a connection to a loopback port
 # nobody listens on yet (it retries the SYN), so a probe that waited that
@@ -441,6 +446,17 @@ class WhisperServer:
         if not binary:
             self._load_failed("whisper-server.exe not found", gen)
             return
+        deadline = self._clock() + self._ready_timeout
+        for attempt in range(1, PORT_TRIES + 1):
+            outcome = self._start_and_wait(binary, model_path, gen, deadline,
+                                           last_try=attempt == PORT_TRIES)
+            if outcome != "port_taken":
+                return
+
+    def _start_and_wait(self, binary, model_path, gen, deadline, last_try):
+        """One server on one port, until it answers or fails. Returns
+        "port_taken" when another program bound the port first and this was
+        not the last try, else None."""
         try:
             port = self._port_fn()
             command = [binary, "-m", model_path, "--host", "127.0.0.1",
@@ -448,7 +464,7 @@ class WhisperServer:
             popen = self._spawn(command)
         except (OSError, ServerError) as error:
             self._load_failed(f"cannot start it: {error}", gen)
-            return
+            return None
         proc = _Process(popen, port, model_path)
         with self._cond:
             stale = not self._current(gen)
@@ -456,22 +472,26 @@ class WhisperServer:
                 self._proc, self._ready = proc, False
         if stale:
             proc.stop()
-            return
-        loading_from = self._clock()
-        deadline = loading_from + self._ready_timeout
+            return None
         while True:
             with self._cond:
                 if self._proc is not proc:   # unloaded or replaced meanwhile
-                    return
+                    return None
             if not proc.alive():
+                code = proc.exit_code()
+                if code == PORT_IN_USE_EXIT and not last_try:
+                    # free_port() can't hold the port for the server: anything
+                    # may bind it between the two. Another port, not a failure.
+                    _log(f"port {port} was taken before it could bind; trying another")
+                    return "port_taken"
                 self._load_failed("it exited while loading "
-                                  f"({_describe_exit(proc.exit_code())})", gen, proc)
-                return
+                                  f"({_describe_exit(code)})", gen, proc)
+                return None
             if self._probe(port, 1.0):
                 break
             if self._clock() >= deadline:
                 self._load_failed("the model load timed out", gen, proc)
-                return
+                return None
             time.sleep(0.05)
         with self._cond:
             if self._proc is not proc:
