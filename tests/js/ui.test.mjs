@@ -13,6 +13,51 @@ register("toast", toastHost);
 const toastText = () =>
   toastHost.children.map((c) => (typeof c === "string" ? c : c.textContent)).join(" ");
 
+/* ---------- the push-to-talk key ---------- */
+
+test("keyLabel reads every label the app can show as a name and a symbol", () => {
+  // voisr/keys.py's labels: the symbol is what a Windows keyboard prints
+  const { keyLabel } = V.ui;
+  assert.deepEqual(keyLabel("Right Ctrl"), { name: "Right Ctrl", symbol: "Ctrl" });
+  assert.deepEqual(keyLabel("Left Ctrl"), { name: "Left Ctrl", symbol: "Ctrl" });
+  assert.deepEqual(keyLabel("Right Alt"), { name: "Right Alt", symbol: "Alt" });
+  assert.deepEqual(keyLabel("Left Shift"), { name: "Left Shift", symbol: "Shift" });
+  assert.deepEqual(keyLabel("Right Win"), { name: "Right Win", symbol: "Win" });
+  assert.deepEqual(keyLabel("Caps Lock"), { name: "Caps Lock", symbol: "Caps" });
+  // a label that names its own symbol keeps it
+  assert.deepEqual(keyLabel("Right Ctrl (Ctrl)"), { name: "Right Ctrl", symbol: "Ctrl" });
+  for (const bare of ["F13", "F15", "Scroll Lock", "Pause", "Menu", "VK 0x5D", "unset", "something_raw"]) {
+    assert.deepEqual(keyLabel(bare), { name: bare, symbol: null });
+  }
+});
+
+test("keyLabel never shows a Mac symbol", () => {
+  const { keyLabel } = V.ui;
+  for (const label of ["Right Ctrl", "Left Alt", "Right Shift", "Right Win", "Caps Lock"]) {
+    assert.doesNotMatch(keyLabel(label).symbol, /[⌘⌥⌃⇧⇪]/, label);
+  }
+});
+
+test("keyLabel: a missing label is 'unset', and stray spaces don't change the answer", () => {
+  const { keyLabel } = V.ui;
+  for (const none of ["", null, undefined, "  "]) {
+    assert.deepEqual(keyLabel(none), { name: "unset", symbol: null });
+  }
+  assert.deepEqual(keyLabel(" Right Ctrl "), { name: "Right Ctrl", symbol: "Ctrl" });
+});
+
+test("captureGuard: only the 300 ms after a capture counts", (t) => {
+  t.mock.timers.enable({ apis: ["Date"] });
+  const guard = V.ui.captureGuard();
+  assert.equal(guard.recent(), false, "nothing captured yet");
+  guard.ended();
+  assert.equal(guard.recent(), true);
+  t.mock.timers.tick(299);
+  assert.equal(guard.recent(), true);
+  t.mock.timers.tick(1);
+  assert.equal(guard.recent(), false);
+});
+
 /* ---------- formatDuration ---------- */
 
 test("formatDuration renders sub-minute durations", () => {

@@ -107,16 +107,23 @@ def test_default_config_includes_pill_theme(tmp_path):
 
 def test_pill_theme_roundtrip(tmp_path):
     api = make_api(tmp_path)
-    api.set_config({"pill_theme": "ember"})
-    assert api.get_config()["pill_theme"] == "ember"
+    api.set_config({"pill_theme": "quiet"})
+    assert api.get_config()["pill_theme"] == "quiet"
 
 
 def test_get_pill_themes_shape(tmp_path):
     api = make_api(tmp_path)
     themes = api.get_pill_themes()
-    assert [t["value"] for t in themes] == [
-        "classic", "ember", "aurora", "ocean", "neon", "breathe", "scanner"]
+    assert [(t["value"], t["label"]) for t in themes] == [
+        ("classic", "Signature"), ("quiet", "Quiet")]
     assert all(set(t) == {"value", "label"} for t in themes)
+
+
+def test_an_old_theme_reads_as_signature_so_the_picker_has_one_to_show(tmp_path):
+    # the seven themes before the redesign are gone; "classic" was the first
+    (tmp_path / "config.json").write_text('{"pill_theme": "aurora"}')
+    api = make_api(tmp_path)
+    assert api.get_config()["pill_theme"] == "classic"
 
 
 def test_default_config_includes_pill_color_none(tmp_path):
@@ -1152,3 +1159,12 @@ def test_a_start_failure_is_logged_even_with_the_pill_disabled(monkeypatch):
     service.press()
     assert widget.calls == []
     assert len(logged) == 1
+
+
+def test_esc_cancels_a_key_capture_instead_of_becoming_the_key(tmp_path):
+    # in the Settings pop-up and first run, Esc means back out
+    api = make_api(tmp_path, capture_fn=lambda timeout: (0x1B, "VK 0x1B"))
+    api.set_config({"hotkey": "ctrl_r"})
+    assert api.capture_hotkey() == {"cancelled": True}
+    cfg = api.get_config()
+    assert "hotkey_vk" not in cfg and cfg["hotkey"] == "ctrl_r"

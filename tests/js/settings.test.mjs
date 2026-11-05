@@ -36,13 +36,13 @@ test("settings.js loads without touching the DOM at parse time", () => {
    (document/window listener recording + dispatch, node.contains/closest,
    parent links) specifically to unlock these. */
 
-// init() also binds the update-toggle checkbox and Check-now button
-// (tests/js/update.test.mjs covers their behaviour) -- both must still be
-// registered here, or getElementById(...) hands init() a null and it throws
-// on the very first addEventListener, taking every test in this file with it.
-const SETTINGS_IDS = ["appearance-grid", "model-select", "launch-toggle",
+// init() also binds the Updates section's switch and Check now button
+// (tests/js/update.test.mjs covers their behaviour), so both are registered
+// here too, or init() throws on its first addEventListener.
+const SETTINGS_IDS = ["appearance-grid", "model-list", "launch-toggle", "settings-scrim", "settings-nav",
+                       "settings-body", "hotkey-capture", "settings-dialog",
                        "color-open", "color-popover", "clear-history", "toast",
-                       "update-toggle", "update-check"];
+                       "unload-select", "update-toggle", "update-check"];
 
 function mountSettings(t, api, apis = ["setTimeout"]) {
   t.mock.timers.enable({ apis });
@@ -51,15 +51,13 @@ function mountSettings(t, api, apis = ["setTimeout"]) {
 
   const nodes = {};
   for (const id of SETTINGS_IDS) {
-    nodes[id] = makeNode(id === "launch-toggle" || id === "update-toggle" ? "input"
-      : id === "model-select" ? "select"
-      : id === "update-check" ? "button" : "div");
+    nodes[id] = makeNode(id === "launch-toggle" ? "input" : "div");
     env.register(id, nodes[id]);
   }
   nodes["color-popover"].hidden = true;
 
   env.V.views.settings.init();
-  return { V: env.V, window: env.window, document: env.document, ...nodes };
+  return { V: env.V, window: env.window, document: env.document, register: env.register, ...nodes };
 }
 
 const settle = () => new Promise((r) => setImmediate(r));
@@ -176,7 +174,6 @@ test("a drag on the colour wheel paints a live preview without saving anything",
   assert.equal(h["color-hex"].textContent, PICKED);
   assert.equal(h["color-swatch"].style.background, PICKED);
   assert.equal(h["color-preview"].style.getPropertyValue("--mb-color"), PICKED);
-  assert.equal(h["color-preview"].style.getPropertyValue("--mb-glow"), "rgba(255, 5, 5, .75)");
   assert.equal(h["wheel-thumb"].hidden, false, "the thumb shows where on the wheel we are");
   assert.equal(h.calls.length, 0, "a drag in progress must not write config -- that happens on release");
 
@@ -259,11 +256,11 @@ test("the colour reset clears the custom colour back to the theme default", asyn
   await settle();
 
   assert.deepEqual(h.calls, [{ pill_color: null }]);
-  assert.equal(h["color-hex"].textContent, "theme default");
-  assert.equal(h["color-swatch"].style.background, "transparent");
+  assert.equal(h["color-hex"].textContent, "Theme default");
+  assert.equal(h["color-swatch"].style.background, undefined,
+    "the swatch goes back to the stylesheet's own colour");
   assert.equal(h["color-preview"].style.getPropertyValue("--mb-color"), "",
     "the custom-colour variable is removed, not set to an empty-looking value");
-  assert.equal("customColor" in h["color-preview"].dataset, false);
   assert.equal(h["wheel-thumb"].hidden, true, "no colour, nothing to point at");
 });
 
@@ -460,8 +457,8 @@ test("the theme picker follows an appearance change made elsewhere (the palette)
     "the highlighted option must be the one actually applied");
 });
 
-test("the push-to-talk status is only green while the key is listening", async (t) => {
-  // L8 (2026-10-12 audit): "push-to-talk not running" used to show in green
+test("the push-to-talk status carries its state, so only a dead key asks for attention", async (t) => {
+  // L8 (2026-10-12 audit): "push-to-talk not running" used to look like "active"
   const s = mountSettings(t, {});
   const node = makeNode("p");
   s.V.ui.$ = ((orig) => (sel) => (sel === "#hotkey-status" ? node : orig(sel)))(s.V.ui.$);
@@ -501,4 +498,616 @@ test("the appearance event doesn't re-render a picker that already shows it", as
   s.V.appearancePref = () => "system";
   globalThis.window.dispatch("voisr:appearance");
   assert.equal(btn.getAttribute("tabindex"), "sentinel");
+});
+
+/* ---------- settings.js: the speech model list ---------- */
+
+const ROW = (over) => ({
+  id: "x", label: "X", description: "desc", bytes: 487614201, installed: false,
+  active: false, custom: false, warning: null, blocked: null, benchmark: null, ...over,
+});
+
+function buttons(node, out = []) {
+  for (const k of node.children || []) {
+    if (!k || typeof k !== "object") continue;
+    if (k.tagName === "BUTTON" || k.tag === "button") out.push(k);
+    buttons(k, out);
+  }
+  return out;
+}
+
+function textOf(node) {
+  return [node.textContent || "", ...(node.children || []).map((k) =>
+    typeof k === "string" ? k : textOf(k))].join(" ");
+}
+
+test("model list shows size and state, and Download only where it applies", (t) => {
+  const s = mountSettings(t, {});
+  s.V.views.settings.renderModels({
+    models: [
+      ROW({ id: "a", label: "Active", installed: true, active: true }),
+      ROW({ id: "b", label: "Spare", installed: true }),
+      ROW({ id: "c", label: "Remote" }),
+      ROW({ id: "d", label: "Mine", installed: true, custom: true }),
+    ],
+    system: { chip: "Apple M1", memory_gb: 8 }, download: { state: "idle" },
+  });
+  const rows = s["model-list"].children;
+  assert.equal(rows.length, 4);
+  const acts = rows.map((r) => buttons(r).map((b) => b.dataset.act));
+  assert.deepEqual(acts, [[], ["use", "delete"], ["download"], ["use", "delete"]]);
+  assert.match(textOf(rows[0]), /465 MB/);
+  assert.match(textOf(rows[0]), /In use/);
+  assert.match(textOf(rows[1]), /Installed/);
+  assert.doesNotMatch(textOf(rows[2]), /Installed/, "Download already says it isn't");
+  assert.match(textOf(rows[3]), /Custom/);
+  assert.notEqual(rows[0].children[0].innerHTML, "", "the model in use carries the tick");
+  assert.equal(rows[1].children[0].innerHTML, "");
+});
+
+test("model list shows warnings, disables blocked downloads, and no invented figures", (t) => {
+  const s = mountSettings(t, {});
+  s.V.views.settings.renderModels({
+    models: [
+      ROW({ id: "w", warning: "Wants about 12 GB" }),
+      ROW({ id: "i", blocked: "Needs an Apple Silicon Mac." }),
+      ROW({ id: "m", benchmark: { wer: 0.082, median_s: 1.25 } }),
+    ],
+    system: {}, download: { state: "idle" },
+  });
+  const [w, i, m] = s["model-list"].children;
+  assert.match(textOf(w), /Wants about 12 GB/);
+  assert.match(textOf(i), /Apple Silicon/);
+  assert.ok(buttons(i)[0].getAttribute("disabled") !== null);
+  assert.ok(!/Measured/.test(textOf(w)), "no figure without a measurement");
+  assert.equal(buttons(w)[0].getAttribute("disabled"), null,
+    "a memory warning only warns: the download stays allowed");
+  assert.match(textOf(m), /Measured: 8\.2% word errors, median 1\.3 s/);
+});
+
+test("a download in progress disables other Download buttons", (t) => {
+  const s = mountSettings(t, { get_download_progress: async () => ({ state: "idle" }) });
+  s.V.views.settings.renderModels({
+    models: [ROW({ id: "a" }), ROW({ id: "b" })],
+    system: {}, download: { state: "downloading", id: "a", done: 100, total: 200 },
+  });
+  const [a, b] = s["model-list"].children;
+  assert.match(textOf(a), /50%/);
+  assert.equal(buttons(a).length, 0, "the percent stands where the button was");
+  assert.ok(buttons(b)[0].getAttribute("disabled") !== null);
+});
+
+test("download progress says how far, in the row, and keeps going on each poll", async (t) => {
+  const MB = 1024 * 1024;
+  let answer = { state: "downloading", id: "a", done: 300 * MB, total: 600 * MB };
+  const s = mountSettings(t, {
+    get_download_progress: async () => answer,
+    get_config: async () => ({}), get_hotkey_status: async () => null,
+    get_models: async () => null, hotkey_display: async () => null,
+    get_pill_themes: async () => [], get_update_status: async () => null,
+  });
+  s.V.views.settings.renderModels({
+    models: [ROW({ id: "a" })], system: {},
+    download: { state: "downloading", id: "a", done: 60 * MB, total: 600 * MB },
+  });
+  const row = s["model-list"].children[0];
+  assert.match(textOf(row), /10%/);
+  assert.match(textOf(row), /60 MB of 600 MB/);
+
+  // $ finds these by class only inside the document, so put the row there
+  s.document.body.append(s["model-list"]);
+  t.mock.timers.tick(1000);
+  await settle();
+  assert.match(textOf(row), /50%/);
+  assert.match(textOf(row), /300 MB of 600 MB/);
+  const fill = (function find(n) {
+    return n.className === "model-bar-fill" ? n
+      : (n.children || []).map((k) => (k && typeof k === "object" ? find(k) : null)).find(Boolean);
+  })(row);
+  assert.equal(fill.style.transform, "scaleX(0.5)");
+
+  answer = { state: "idle" };   // stop the poll from outliving the test
+  t.mock.timers.tick(1000);
+  await settle();
+});
+
+test("a download outcome that arrives before the first render is reported once", (t) => {
+  const toasts = [];
+  const s = mountSettings(t, {});
+  s.V.ui.toast = (m) => toasts.push(m);
+  const view = { models: [ROW({ id: "a" })], system: {},
+    download: { state: "error", error: "Checksum mismatch", seq: 3, id: "a" } };
+  s.V.views.settings.renderModels(view);
+  s.V.views.settings.renderModels(view);
+  assert.deepEqual(toasts, ["Checksum mismatch"]);
+  s.V.views.settings.renderModels({ ...view, download: { state: "done", seq: 4, id: "a" } });
+  assert.deepEqual(toasts, ["Checksum mismatch", "Model downloaded"]);
+});
+
+test("deleting a Custom model needs a second click after a real pause; a registry model does not", async (t) => {
+  const calls = [];
+  const s = mountSettings(t, {
+    delete_model: async (id) => { calls.push(id); return { ok: true }; },
+    get_models: async () => ({ models: [], system: {}, download: { state: "idle" } }),
+    get_config: async () => ({}), get_hotkey_status: async () => null,
+    hotkey_display: async () => ({}), get_update_status: async () => null,
+  }, ["setTimeout", "Date"]);
+  s.V.views.settings.renderModels({
+    models: [ROW({ id: "mine", installed: true, custom: true }),
+             ROW({ id: "reg", installed: true })],
+    system: {}, download: { state: "idle" } });
+  const [mine, reg] = s["model-list"].children;
+  const del = (row) => buttons(row).find((b) => b.dataset.act === "delete");
+  const click = (b) => s["model-list"].dispatch("click", { target: b });
+
+  await click(del(reg));
+  assert.deepEqual(calls, ["reg"]);
+
+  await click(del(mine));                       // arms
+  assert.deepEqual(calls, ["reg"]);
+  await click(del(mine));                       // too soon: ignored
+  assert.deepEqual(calls, ["reg"]);
+  t.mock.timers.tick(700);
+  await click(del(mine));                       // confirmed
+  assert.deepEqual(calls, ["reg", "mine"]);
+});
+
+test("a failed 'keep model loaded' save restores the stored choice, not the HTML default", async (t) => {
+  const s = mountSettings(t, {
+    set_config: async () => { throw new Error("bridge down"); },
+  }, ["setTimeout"]);
+  s["unload-select"].value = "min5";           // what index.html ships
+  s.V.views.settings.showUnload("min10");      // what Settings render() found saved
+  assert.equal(s["unload-select"].value, "min10");
+
+  s["unload-select"].value = "never";          // the user picks another
+  await s["unload-select"].dispatch("change", { target: s["unload-select"] });
+  await settle();
+  assert.equal(s["unload-select"].value, "min10");
+});
+
+test("a successful 'keep model loaded' save becomes the one a later failure restores", async (t) => {
+  let fail = false;
+  const s = mountSettings(t, {
+    set_config: async () => { if (fail) throw new Error("x"); return {}; },
+  }, ["setTimeout"]);
+  s.V.views.settings.showUnload("min10");
+  s["unload-select"].value = "hour1";
+  await s["unload-select"].dispatch("change", { target: s["unload-select"] });
+  await settle();
+  fail = true;
+  s["unload-select"].value = "never";
+  await s["unload-select"].dispatch("change", { target: s["unload-select"] });
+  await settle();
+  assert.equal(s["unload-select"].value, "hour1");
+});
+
+test("context switches show their dependency: off leaves nothing claiming to be on", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const env = loadVoisr(["js/ui.js", "js/api.js", "js/views/settings.js"]);
+  const saved = [];
+  env.window.pywebview = { api: {
+    clear_history: async () => ({ removed: 0 }),
+    set_config: async (u) => { saved.push(u); return { use_screen_context: false }; },
+  } };
+  const nodes = {};
+  for (const id of [...SETTINGS_IDS, "screen-context-toggle", "learn-toggle", "auto-add-toggle"]) {
+    nodes[id] = makeNode(id.endsWith("toggle") ? "input" : "div");
+    env.register(id, nodes[id]);
+  }
+  nodes["color-popover"].hidden = true;
+  env.V.views.settings.init();
+  const show = env.V.views.settings.showContext;
+  const state = () => ["screen-context-toggle", "learn-toggle", "auto-add-toggle"].map(
+    (id) => [nodes[id].checked, !!nodes[id].disabled]);
+
+  show({});   // defaults: all on
+  assert.deepEqual(state(), [[true, false], [true, false], [true, false]]);
+  show({ learn_from_edits: false });
+  assert.deepEqual(state(), [[true, false], [false, false], [false, true]]);
+  show({ use_screen_context: false });
+  assert.deepEqual(state(), [[false, false], [false, true], [false, true]]);
+  show({ dictionary_auto_add: false });
+  assert.deepEqual(state(), [[true, false], [true, false], [false, false]]);
+
+  nodes["screen-context-toggle"].checked = false;
+  nodes["screen-context-toggle"].dispatch("change", { target: nodes["screen-context-toggle"] });
+  await settle();
+  assert.deepEqual(saved, [{ use_screen_context: false }]);
+  assert.deepEqual(state(), [[false, false], [false, true], [false, true]]);
+});
+
+/* ---------- the pop-up ---------- */
+
+const SECTION_NAMES = ["dictation", "models", "key", "appearance", "privacy", "updates"];
+
+function mountPopup(t, api = {}) {
+  const h = mountSettings(t, {
+    get_config: async () => ({}), get_hotkey_status: async () => null,
+    get_models: async () => null, hotkey_display: async () => ({ display: "Right Ctrl" }),
+    get_pill_themes: async () => [], get_update_status: async () => null,
+    ...api,
+  }, ["setTimeout", "Date"]);
+  const rest = {};
+  for (const id of ["paste-toggle", "widget-toggle", "theme-grid", "color-preview", "color-swatch",
+                    "color-hex", "wheel-thumb", "key-control", "hotkey-current", "hotkey-cap",
+                    "hotkey-status"]) {
+    rest[id] = makeNode("div");
+    h.register(id, rest[id]);
+  }
+  const sections = {}, navItems = {};
+  for (const name of SECTION_NAMES) {
+    const section = makeNode("section");
+    section.className = "settings-section";
+    section.dataset.section = name;
+    const item = makeNode("button");
+    item.className = "settings-nav-item";
+    item.dataset.section = name;
+    h["settings-body"].append(section);
+    h["settings-nav"].append(item);
+    sections[name] = section;
+    navItems[name] = item;
+  }
+  h.document.body.append(h["settings-body"], h["settings-nav"]);
+  return { ...h, ...rest, sections, navItems, popup: h.V.views.settings };
+}
+
+test("Tab is walked by hand inside the pop-up, past what can't take focus, and wraps", async (t) => {
+  const h = mountPopup(t);
+  const scrim = h["settings-scrim"];
+  const button = (over) => {
+    const n = makeNode("button");
+    n.focus = () => { h.document.activeElement = n; };
+    n.getClientRects = () => [{}];
+    return Object.assign(n, over);
+  };
+  const first = button();
+  const disabled = button({ disabled: true });
+  const hidden = button({ getClientRects: () => [] });
+  const roving = button();
+  roving.setAttribute("tabindex", "-1");
+  const last = button();
+  scrim.querySelectorAll = () => [first, disabled, hidden, roving, last];
+  const tab = (over = {}) => {
+    const ev = { key: "Tab", target: scrim, stopPropagation() {}, preventDefault() { ev.prevented = true; }, ...over };
+    scrim.dispatch("keydown", ev);
+    return ev;
+  };
+
+  h.document.activeElement = null;
+  assert.equal(tab().prevented, true);
+  assert.equal(h.document.activeElement, first);
+  tab();
+  assert.equal(h.document.activeElement, last);
+  tab();
+  assert.equal(h.document.activeElement, first, "wraps");
+  tab({ shiftKey: true });
+  assert.equal(h.document.activeElement, last, "and backwards");
+});
+
+const pressEscape = (target) => {
+  const ev = { key: "Escape", target, stopPropagation() { ev.stopped = true; } };
+  return ev;
+};
+
+test("opening shows the pop-up on the section asked for, and reopens where it was left", async (t) => {
+  const h = mountPopup(t);
+  const scrim = h["settings-scrim"];
+  scrim.hidden = true;
+
+  h.popup.open({ section: "key" });
+  assert.equal(scrim.hidden, false);
+  assert.ok(scrim.classList.contains("is-open"));
+  assert.equal(h.sections.key.hidden, false);
+  assert.equal(h.sections.dictation.hidden, true);
+  assert.ok(h.navItems.key.classList.contains("active"));
+  assert.equal(h.navItems.key.getAttribute("aria-current"), "page");
+
+  h.popup.close();
+  h.popup.open();
+  assert.equal(h.sections.key.hidden, false, "no section named: the one it was left on");
+
+  h.popup.open({ section: "nonsense" });
+  assert.equal(h.sections.key.hidden, false, "an unknown name can't open onto a blank pane");
+  h.popup.open({ section: "privacy" });
+  assert.equal(h.sections.privacy.hidden, false, "asking while it's open just moves section");
+  assert.equal(h.sections.key.hidden, true);
+});
+
+test("the side menu switches section and starts it from the top", async (t) => {
+  const h = mountPopup(t);
+  h.popup.open();
+  h["settings-body"].scrollTop = 200;
+  h["settings-nav"].dispatch("click", { target: h.navItems.models });
+  assert.equal(h.sections.models.hidden, false);
+  assert.equal(h.sections.dictation.hidden, true);
+  assert.equal(h["settings-body"].scrollTop, 0);
+  assert.equal(h.navItems.dictation.getAttribute("aria-current"), null);
+});
+
+test("closing hides it only once the fade is done, and says so straight away", async (t) => {
+  const h = mountPopup(t);
+  let closed = 0;
+  h.window.addEventListener("voisr:settings-closed", () => { closed += 1; });
+  const scrim = h["settings-scrim"];
+  h.popup.open();
+  h.popup.close();
+  assert.equal(closed, 1);
+  assert.ok(!scrim.classList.contains("is-open"));
+  assert.equal(scrim.hidden, false, "still fading");
+  t.mock.timers.tick(140);
+  assert.equal(scrim.hidden, true);
+  h.popup.close();
+  assert.equal(closed, 1, "closing what's already closed says nothing");
+});
+
+test("reopening mid-close carries on, rather than vanishing when the old timer fires", async (t) => {
+  const h = mountPopup(t);
+  h.popup.open();
+  h.popup.close();
+  t.mock.timers.tick(100);
+  h.popup.open();
+  t.mock.timers.tick(100);
+  assert.equal(h["settings-scrim"].hidden, false);
+  assert.equal(h.popup.isOpen(), true);
+});
+
+test("focus goes into the pop-up and comes back to what opened it", async (t) => {
+  const h = mountPopup(t);
+  const opener = makeNode("button");
+  let onOpener = 0, onItem = 0;
+  opener.focus = () => { onOpener += 1; };
+  h.navItems.dictation.focus = () => { onItem += 1; };
+  h.document.activeElement = opener;
+  h.popup.open();
+  assert.equal(onItem, 1);
+  h.popup.close();
+  assert.equal(onOpener, 1);
+});
+
+test("Esc peels one layer at a time: the colour popover, then the pop-up", async (t) => {
+  const h = mountPopup(t);
+  h.popup.open();
+  h["color-popover"].hidden = false;
+  h["settings-scrim"].dispatch("keydown", pressEscape(h["settings-scrim"]));
+  assert.equal(h["color-popover"].hidden, true);
+  assert.equal(h.popup.isOpen(), true, "the popover took it");
+  h["settings-scrim"].dispatch("keydown", pressEscape(h["settings-scrim"]));
+  assert.equal(h.popup.isOpen(), false);
+});
+
+test("Esc the palette has already handled doesn't close Settings as well", async (t) => {
+  const h = mountPopup(t);
+  h.popup.open();
+  h.document.dispatch("keydown", { key: "Escape", defaultPrevented: true,
+                                   target: h["settings-scrim"], stopPropagation() {} });
+  assert.equal(h.popup.isOpen(), true);
+});
+
+test("keys stop at the pop-up, so History can't delete a row nobody can see", async (t) => {
+  const h = mountPopup(t);
+  h.popup.open();
+  const backspace = { key: "Backspace", target: h["settings-scrim"],
+                      stopPropagation() { this.stopped = true; } };
+  h["settings-scrim"]._listeners.keydown[0](backspace);
+  assert.equal(backspace.stopped, true);
+  const commandK = { key: "k", metaKey: true, target: h["settings-scrim"],
+                     stopPropagation() { this.stopped = true; } };
+  h["settings-scrim"]._listeners.keydown[0](commandK);
+  assert.equal(commandK.stopped, undefined, "the palette opens from anywhere");
+});
+
+test("a key with focus lost to the page is stopped on its way down, and Esc still works", async (t) => {
+  const h = mountPopup(t);
+  const body = makeNode("body");
+  let stopped = 0;
+  const stray = (key) => ({ key, target: body, stopPropagation() { stopped += 1; } });
+  h.document.dispatch("keydown", stray("x"));
+  assert.equal(stopped, 0, "closed: nothing to guard");
+  h.popup.open();
+  h.document.dispatch("keydown", stray("Backspace"));
+  assert.equal(stopped, 1);
+  h.document.dispatch("keydown", stray("Escape"));
+  assert.equal(h.popup.isOpen(), false);
+});
+
+test("a click closes it only if the press started on the scrim too", async (t) => {
+  const h = mountPopup(t);
+  const scrim = h["settings-scrim"];
+  h.popup.open();
+
+  scrim.dispatch("pointerdown", { target: h["color-popover"] });  // a wheel drag let go outside
+  scrim.dispatch("click", { target: scrim });
+  assert.equal(h.popup.isOpen(), true);
+
+  h["color-popover"].hidden = false;
+  scrim.dispatch("pointerdown", { target: scrim });
+  scrim.dispatch("click", { target: scrim });
+  assert.equal(h.popup.isOpen(), true, "the first click out belongs to the open popover");
+
+  h["color-popover"].hidden = true;
+  scrim.dispatch("pointerdown", { target: scrim });
+  scrim.dispatch("click", { target: scrim });
+  assert.equal(h.popup.isOpen(), false);
+});
+
+test("closing or changing section disarms Clear, so a later click only arms it", async (t) => {
+  const h = mountPopup(t);
+  const clear = h["clear-history"];
+  h.popup.open();
+  clear.dispatch("click");
+  await settle();
+  assert.equal(clear.dataset.armed, "1");
+  h["settings-nav"].dispatch("click", { target: h.navItems.models });
+  assert.equal(clear.dataset.armed, "0");
+  assert.match(clear.textContent, /^Clear/);
+
+  clear.dispatch("click");
+  await settle();
+  assert.equal(clear.dataset.armed, "1");
+  h.popup.close();
+  assert.equal(clear.dataset.armed, "0");
+});
+
+/* ---------- capturing the key ---------- */
+
+function mountCapture(t, res) {
+  let release;
+  const h = mountPopup(t, {
+    capture_hotkey: () => new Promise((r) => { release = () => r(res); }),
+  });
+  const toasts = [];
+  h.V.ui.toast = (m) => toasts.push(m);
+  return { ...h, toasts, finish: () => release() };
+}
+
+test("the key's row asks for a key while the app listens, then shows the new one", async (t) => {
+  const h = mountCapture(t, { vk: 0xA3, label: "Right Ctrl" });
+  h.popup.open({ section: "key" });
+  await settle();
+  const btn = h["hotkey-capture"];
+
+  const done = h.popup.captureKey();
+  assert.equal(btn.disabled, true);
+  assert.equal(h["hotkey-current"].textContent, "Press a key…");
+  assert.ok(h["key-control"].classList.contains("is-listening"));
+  assert.equal(h["hotkey-cap"].hidden, true);
+
+  h.finish();
+  await done;
+  await settle();
+  assert.equal(btn.disabled, false);
+  assert.ok(!h["key-control"].classList.contains("is-listening"));
+  assert.equal(h["hotkey-current"].textContent, "Right Ctrl");
+  assert.equal(h["hotkey-cap"].textContent, "Ctrl");
+  assert.equal(h["hotkey-cap"].hidden, false);
+  assert.deepEqual(h.toasts, ["Push-to-talk key set to Right Ctrl"]);
+});
+
+test("while it listens the pop-up stays put, and Esc belongs to the capture", async (t) => {
+  const h = mountCapture(t, { cancelled: true });
+  h.popup.open({ section: "key" });
+  const scrim = h["settings-scrim"];
+  const done = h.popup.captureKey();
+
+  scrim.dispatch("keydown", pressEscape(scrim));
+  assert.equal(h.popup.isOpen(), true, "Esc doesn't close it");
+  scrim.dispatch("pointerdown", { target: scrim });
+  scrim.dispatch("click", { target: scrim });
+  assert.equal(h.popup.isOpen(), true, "nor does a click outside");
+  h["settings-nav"].dispatch("click", { target: h.navItems.models });
+  assert.equal(h.sections.key.hidden, false, "the row asking for a key stays on screen");
+
+  h.finish();
+  await done;
+  assert.deepEqual(h.toasts, [], "cancelling isn't news");
+});
+
+test("the Esc that cancelled a capture can't reach the page late and close the pop-up", async (t) => {
+  const h = mountCapture(t, { cancelled: true });
+  h.popup.open({ section: "key" });
+  const scrim = h["settings-scrim"];
+  const done = h.popup.captureKey();
+  h.finish();
+  await done;
+
+  scrim.dispatch("keydown", pressEscape(scrim));
+  assert.equal(h.popup.isOpen(), true, "this is the same key press, arriving late");
+  t.mock.timers.tick(300);
+  scrim.dispatch("keydown", pressEscape(scrim));
+  assert.equal(h.popup.isOpen(), false, "a later Esc is a new one");
+});
+
+test("no key in time says so, and the row comes back", async (t) => {
+  const h = mountCapture(t, { error: "no key detected — click Change and press a key" });
+  h.popup.open({ section: "key" });
+  const done = h.popup.captureKey();
+  h.finish();
+  await done;
+  await settle();
+  assert.deepEqual(h.toasts, ["no key detected — click Change and press a key"]);
+  assert.equal(h["hotkey-current"].textContent, "Right Ctrl");
+  assert.equal(h["hotkey-capture"].disabled, false);
+});
+
+test("a key without a symbol is just its name, with no blank keycap", (t) => {
+  const h = mountCapture(t, {});
+  h.popup.showKey("F13");
+  assert.equal(h["hotkey-current"].textContent, "F13");
+  assert.equal(h["hotkey-cap"].hidden, true);
+  h.popup.showKey("Right Alt");
+  assert.equal(h["hotkey-current"].textContent, "Right Alt");
+  assert.equal(h["hotkey-cap"].textContent, "Alt", "the same keycap first run shows");
+  assert.equal(h["hotkey-cap"].hidden, false);
+  h.popup.showKey("Caps Lock");
+  assert.equal(h["hotkey-cap"].textContent, "Caps");
+  h.popup.showKey("Scroll Lock");
+  assert.equal(h["hotkey-cap"].hidden, true);
+  h.popup.showKey("Menu");
+  assert.equal(h["hotkey-current"].textContent, "Menu");
+  assert.equal(h["hotkey-cap"].hidden, true);
+});
+
+/* ---------- pill pictures ---------- */
+
+test("the pill picker's two pictures look like the two real pills", async (t) => {
+  const h = mountSettings(t, {
+    get_config: async () => ({ pill_theme: "quiet" }),
+    get_pill_themes: async () => [{ value: "classic", label: "Signature" }, { value: "quiet", label: "Quiet" }],
+  });
+  const grid = makeNode("div");
+  const preview = (b) => b.children[0].children[0];
+  h.document.querySelector = ((orig) => (x) => (x === "#theme-grid" ? grid : orig(x)))(h.document.querySelector);
+  await h.V.views.settings.renderThemes();
+  const [signature, quiet] = grid.children;
+  assert.deepEqual(preview(signature).children.map((n) => n.className),
+    Array(15).fill("pp-bar"), "bars only, with no dot");
+  assert.deepEqual(preview(quiet).children.map((n) => n.className), ["pp-live"],
+    "the live dot only");
+  assert.equal(activeOf(grid), "quiet");
+});
+
+test("on Quiet the popover previews the dots a colour changes, not the live dot it leaves alone", async (t) => {
+  const h = mountColorWheel(t, { get_config: async () => ({ pill_theme: "quiet", pill_color: "#00FF00" }) });
+  await h.V.views.settings.renderColorWheel();
+  assert.deepEqual(h["color-preview"].children.map((n) => n.className), ["pp-dot", "pp-dot", "pp-dot"]);
+  assert.equal(h["color-preview"].style.getPropertyValue("--mb-color"), "#00FF00");
+});
+
+test("a tap still starting isn't shown as needing you, and is looked at again until it decides", async (t) => {
+  let answer = { status: "active on F13", state: "listening", health: "active" };
+  const h = mountPopup(t, { get_hotkey_status: async () => answer });
+  h.popup.open({ section: "key" });
+  await settle();
+  const node = h["hotkey-status"];
+
+  h.popup.renderHotkeyStatus({ status: "starting push-to-talk on F13…", state: "off", health: "starting" });
+  assert.equal(node.dataset.state, "busy");
+
+  t.mock.timers.tick(1000);
+  await settle();
+  assert.equal(node.textContent, "active on F13");
+  assert.equal(node.dataset.state, "listening");
+});
+
+test("re-rendering the model list disarms a custom Delete, so its plain new button can't delete at once", async (t) => {
+  const calls = [];
+  const s = mountSettings(t, {
+    delete_model: async (id) => { calls.push(id); return { ok: true }; },
+    get_models: async () => null, get_config: async () => null,
+    get_hotkey_status: async () => null, hotkey_display: async () => null,
+    get_update_status: async () => null,
+  }, ["setTimeout", "Date"]);
+  const view = { models: [ROW({ id: "mine", installed: true, custom: true })], system: {},
+                 download: { state: "idle" } };
+  const del = () => buttons(s["model-list"].children[0]).find((b) => b.dataset.act === "delete");
+  const click = (b) => s["model-list"]._listeners.click[0]({ target: b });
+
+  s.V.views.settings.renderModels(view);
+  await click(del());                          // arms
+  s.V.views.settings.renderModels(view);       // a download finishing, say
+  t.mock.timers.tick(700);
+  await click(del());
+  assert.deepEqual(calls, [], "this click only arms again");
+  assert.match(del().textContent, /Click again/);
 });

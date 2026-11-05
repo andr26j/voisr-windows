@@ -41,7 +41,7 @@ from voisr.updater import UpdateChecker
 # sys.stdout is None and print() is a silent no-op. Shared with updater.py
 # so both halves of an update failure land in the same file.
 from voisr.updater import _log as _update_log
-from voisr.window_chrome import apply_chrome
+from voisr.window_chrome import apply_chrome, launch_background
 
 WEB_DIR = _web_dir()
 WINDOW_TITLE = "Voisr"
@@ -62,18 +62,14 @@ def set_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> bool:
     except Exception:
         return False
 
-# Adding a theme? Also update: widget.html (theme CSS + THEME_VALUES),
-# style.css (mini-pill rule + keyframes), api.js's dev-mock get_pill_themes,
-# and voisr.overlay._PILL_THEME_VALUES. test_widget_html_covers_all_pill_themes
-# guards widget.html.
+# Adding a theme? Also update: widget.html (theme CSS + THEME_VALUES), the
+# Settings picker's preview (.pill-preview in css/views.css), the
+# get_pill_themes mock in js/api.js, and voisr.overlay._PILL_THEME_VALUES.
+# test_widget_html_covers_all_pill_themes guards widget.html.
 PILL_THEMES = [
-    {"value": "classic", "label": "Classic"},
-    {"value": "ember", "label": "Ember"},
-    {"value": "aurora", "label": "Aurora"},
-    {"value": "ocean", "label": "Ocean"},
-    {"value": "neon", "label": "Neon EQ"},
-    {"value": "breathe", "label": "Breathe"},
-    {"value": "scanner", "label": "Scanner"},
+    # Saved as "classic" in every existing config, so the value stays
+    {"value": "classic", "label": "Signature"},
+    {"value": "quiet", "label": "Quiet"},
 ]
 
 
@@ -244,6 +240,17 @@ def _system_prefers_dark() -> bool:
         return True
 
 
+def _window_background(api):
+    """The window's colour before the page's first paint: the sidebar's, so
+    nothing flashes white in dark mode. Cosmetic, so a config that can't be
+    read must not stop startup."""
+    try:
+        appearance = api.get_config().get("appearance", "system")
+    except Exception:
+        appearance = "system"
+    return launch_background(appearance, _system_prefers_dark)
+
+
 def _run_save_dialog(suggested_name: str):
     """Native Win32 "Save As" dialog. Returns the chosen path, or None if
     the user cancelled."""
@@ -359,6 +366,7 @@ class HotkeyService:
         self._target_vk = None
         self._state_lock = threading.RLock()
         self._epoch = 0  # bumped per recording; stale _finish threads must not touch the widget
+        self._pill_up = False  # shown, with no hide run since; see _take_pill_down
         # Key events are handed to this serial worker instead of being acted
         # on inside the hook callback: press() can wait on the previous
         # recorder's stop(), and Windows silently unregisters a
@@ -423,18 +431,29 @@ class HotkeyService:
     def _widget_enabled(self) -> bool:
         return self._widget is not None and bool(self._api.get_config().get("show_widget", True))
 
-    def _run_widget_action(self, epoch: int, action) -> None:
+    def _run_widget_action(self, epoch: int, action, name: str | None = None) -> None:
         with self._state_lock:
             if epoch == self._epoch:
                 action()
+                if name == "hide":
+                    self._pill_up = False  # only now: a newer epoch drops a queued hide
 
     def _widget_action(self, name: str, epoch: int, *args, **kwargs) -> None:
+        """Caller holds _state_lock."""
         method = getattr(self._widget, name)
+        if name != "hide":
+            self._pill_up = True
         if getattr(self._widget, "_supports_ownership_action", False):
             method(*args, **kwargs,
-                   if_current=lambda action: self._run_widget_action(epoch, action))
+                   if_current=lambda action: self._run_widget_action(epoch, action, name))
         else:
-            method(*args, **kwargs)
+            self._run_widget_action(epoch, lambda: method(*args, **kwargs), name)
+
+    def _take_pill_down(self, epoch: int) -> None:
+        """Hide the pill if one is up; caller holds _state_lock. This goes by
+        what was shown, not by the setting, which may have changed since."""
+        if self._pill_up:
+            self._widget_action("hide", epoch)
 
     def press(self, latched=False, at=None) -> None:
         at = self._clock() if at is None else at
@@ -509,6 +528,10 @@ class HotkeyService:
                             "show_recording", epoch,
                             theme=sanitize_pill_theme(cfg.get("pill_theme")),
                             color=sanitize_pill_color(cfg.get("pill_color")))
+                    else:
+                        # the setting went off under an older pill, and the
+                        # new epoch orphans that pill's own hide
+                        self._take_pill_down(epoch)
                     if released:
                         # a toggle ends at once; a held key goes through the gate
                         finish = (self._end_recording() if self._latched
@@ -602,6 +625,16 @@ class HotkeyService:
         self._pane_opened_at = now
         return key
 
+    def _dress_widget(self) -> None:
+        """Only a recording sets the pill's theme. A state with no dictation
+        behind it would otherwise wear the last dictation's, or Signature
+        straight after launch."""
+        set_look = getattr(self._widget, "set_look", None)
+        if set_look is None:
+            return
+        cfg = self._api.get_config()
+        set_look(cfg.get("pill_theme"), cfg.get("pill_color"))
+
     def _flash_error(self) -> None:
         """Error pill, then hide; caller holds _state_lock. The timed hide
         runs on its own thread: nothing here may wait."""
@@ -609,6 +642,7 @@ class HotkeyService:
             return
         self._epoch += 1
         epoch = self._epoch
+        self._dress_widget()
         self._widget_action("show_error", epoch)
 
         def hide_later():
@@ -658,9 +692,11 @@ class HotkeyService:
         passes the result to _spawn_finish after letting go of it."""
         self._pressed = False
         epoch = self._epoch
-        show = self._widget_enabled()
+        show = self._pill_up and self._widget_enabled()
         if show:
             self._widget_action("show_processing", epoch)
+        else:
+            self._take_pill_down(epoch)
         future = self._api._release_recording(paste=True)
         return future, show, epoch
 
@@ -860,7 +896,8 @@ class HotkeyService:
         recording after letting go of it: closing a mic can block, and the
         pill's callbacks take the lock."""
         self._pressed = False
-        if self._widget_enabled():
+        # a pill that's up comes down even if the setting went off since
+        if self._pill_up or self._widget_enabled():
             self._widget_action("hide", epoch)
 
     def _spawn_listener(self) -> None:
@@ -1177,8 +1214,9 @@ class Api:
 
     def capture_hotkey(self):
         """'Press any key' flow: suspend the live listener (so the pressed
-        key doesn't trigger a dictation), capture the next key, persist it,
-        and restart the listener on it."""
+        key doesn't trigger a dictation), capture the next key -- any key
+        except Esc, which cancels, since in the Settings pop-up Esc means back
+        out -- persist it, and restart the listener on it."""
         svc = self._hotkey_service
         if svc is not None:
             svc.stop()
@@ -1187,6 +1225,8 @@ class Api:
             if not got:
                 return {"error": "no key detected — click Change and press a key"}
             vk, label = got
+            if vk == ESC_VK:
+                return {"cancelled": True}
             self._update_config({"hotkey_vk": vk, "hotkey_label": label})
             return {"vk": vk, "label": label}
         finally:
@@ -1390,6 +1430,9 @@ class Api:
             return copy.deepcopy(cached[1])
         cfg = load_config(self._config_path,
                           on_corrupt=self._note_corrupt_config)
+        # the theme the pill will really show, so the Settings picker has one
+        # to highlight after a theme this version no longer has was saved
+        cfg["pill_theme"] = sanitize_pill_theme(cfg.get("pill_theme"))
         self._config_stat_cache = (key, copy.deepcopy(cfg))
         return cfg
 
@@ -1564,6 +1607,36 @@ class Api:
 
     def open_settings_pane(self, key):
         return {"ok": permissions.open_pane(key)}
+
+    def first_run_pending(self) -> bool:
+        """Does first run still need showing? A saved first_run_done answers.
+        With none, an existing config.json or history means an install from
+        before first run, which skips it and stays unwritten. Otherwise this is
+        a fresh install: save False now, so a change made during first run can't
+        make it look like an existing install if they quit midway."""
+        with self._config_lock:
+            done = self.get_config().get("first_run_done")
+            if done is None:
+                if self._config_path.exists() or self._has_history():
+                    return False
+                try:
+                    self._update_config({"first_run_done": False})
+                except OSError as error:
+                    _log(f"first run not saved ({error})")
+            elif done:
+                return False
+        return True
+
+    def _has_history(self) -> bool:
+        path = getattr(self._history, "path", None)
+        try:
+            return path is not None and Path(path).stat().st_size > 0
+        except OSError:
+            return False
+
+    def get_first_run(self):
+        """Bridge: whether the page opens on first run rather than Home."""
+        return {"pending": self.first_run_pending()}
 
     def restore_history_item(self, item):
         try:
@@ -1781,7 +1854,7 @@ class Api:
 # tests/test_js_bridge_surface.py pins this to the V.api() calls in voisr/web/js.
 BRIDGE_METHODS = (
     "capture_hotkey", "check_for_updates_now", "clear_history", "copy_text",
-    "delete_history_item", "export_history", "get_config", "get_history",
+    "delete_history_item", "export_history", "get_config", "get_first_run", "get_history",
     "get_hotkey_status", "get_level", "get_models", "get_permissions",
     "get_pill_themes", "get_stats", "get_update_status", "hotkey_display",
     "install_update", "open_settings_pane", "restore_history_item",
@@ -1832,6 +1905,12 @@ def main():
     try:
         set_app_user_model_id()
         api = Api(mic_check=permissions.microphone_switch)
+        # settled before anything can write config.json, which would make a
+        # fresh install look like an existing one
+        try:
+            api.first_run_pending()
+        except Exception as e:  # startup must not die over this
+            _log(f"first run not checked ({e})")
         widget = RecordingWidget(level_source=api.current_level)
         service = HotkeyService(api, widget=widget, key_state=hotkey_key_down)
         api.attach_hotkey_service(service)
@@ -1845,7 +1924,8 @@ def main():
         # No js_api: see bridge_functions
         window = webview.create_window(
             WINDOW_TITLE, str(WEB_DIR / "index.html"),
-            width=1060, height=700, min_size=(900, 620))
+            width=1060, height=700, min_size=(900, 620),
+            background_color=_window_background(api))
         window.expose(*bridge_functions(api))
         api.attach_window(window)
 

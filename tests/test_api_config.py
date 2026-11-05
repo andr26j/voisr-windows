@@ -75,7 +75,7 @@ def test_concurrent_set_config_calls_keep_every_update(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ui_mod, "load_config", slow_load)
     api = make_api(tmp_path)
-    updates = [("pill_theme", "ember"), ("pill_color", "#112233"),
+    updates = [("pill_theme", "quiet"), ("pill_color", "#112233"),
                ("appearance", "dark"), ("model", "base.en"),
                ("hotkey_label", "X"), ("paste", False), ("show_widget", False),
                ("check_for_updates", False)]

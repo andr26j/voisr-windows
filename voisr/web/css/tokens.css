@@ -1,7 +1,6 @@
 /* Voisr design tokens.
-
-   The warm base is the pill's own colour family, so the floating pill and
-   the dashboard read as one application rather than two.
+   Near-white and near-black, with one signal colour that means "needs you":
+   ultramarine in light, periwinkle in dark. Nothing else is coloured.
 
    There is no colour-scheme media query here on purpose. main.js resolves
    the "system" preference to a concrete light/dark via matchMedia and always
@@ -11,213 +10,128 @@
 
 :root,
 :root[data-appearance="light"] {
-  /* --- surfaces, low to high ------------------------------------------ */
-  --bg: #F4F1EC;
-  --surface: #FFFFFF;
-  --surface-2: #FAF8F4;
-  --surface-3: #F1EDE6;
-  --sunken: #EDE9E1;
+  /* surfaces */
+  --bg: #F5F4F1;            /* sidebar, and the window behind the panel */
+  --panel: #FDFDFC;         /* the inset panel */
+  --surface: #FFFFFF;       /* row cards */
+  --surface-2: #F5F4F1;     /* grey groups */
+  --wash: #F5F4F1;          /* a hovered row */
+  --active: #EBE9E3;        /* the active nav item */
+  --chip: #EBE9E3;          /* quiet buttons */
+  --border: #E8E6E1;
 
-  /* --- text ------------------------------------------------------------ */
-  --ink: #1B1917;
-  --ink-2: #4A453E;
-  --muted: #79736A;
-  /* 3.87:1 on white, 3.44:1 on --bg. Clears the 3:1 floor for the graphical
-     and placeholder roles it fills while staying clearly quieter than
-     --muted; the previous #A39C91 was 2.72:1 and read as disabled. */
-  --faint: #8A8074;
+  /* text */
+  --ink: #191918;
+  --muted: #6B6A65;
+  --on-ink: #FDFDFC;        /* text on a primary button, which is ink */
 
-  /* --- lines ----------------------------------------------------------- */
-  --border: #E4DFD5;
-  --border-strong: #D2CBBE;
-  /* the highlight along a raised surface's top edge -- the single cheapest
-     trick for making a card read as lit rather than drawn */
-  --edge-hi: rgba(255, 255, 255, .9);
+  /* needs you */
+  --accent: #2A2FE0;
+  --accent-hover: #2328C2;
+  --accent-text: #2A2FE0;
+  --accent-soft: #ECECFF;
+  --on-accent: #FDFDFC;
 
-  /* --- brand ----------------------------------------------------------- */
-  /* Deep enough that white button text clears AA (4.68:1); the brighter
-     #E05B32 it replaced was 3.68:1 under a label. */
-  --accent: #C94A25;
-  --accent-hover: #B8401E;
-  --accent-press: #A63A1C;
-  /* Accent used AS TEXT on a light surface: 5.48:1 on white and 4.86:1 on
-     --bg, a step darker than the fill so small accent labels keep margin. */
-  --accent-text: #B8421C;
-  --accent-soft: #FCEDE7;
-  --accent-line: #F3C9B8;
-  --on-accent: #FFFFFF;
-  --accent-grad: linear-gradient(180deg, #CB4D27 0%, #BA4220 100%);
+  /* status: a warning is something that needs you, so it isn't a second hue */
+  --success: #2B6E44;
+  --success-soft: #E6F1EA;
+  --warning: #2A2FE0;
+  --warning-soft: #ECECFF;
+  --destructive: #B92F26;
+  --destructive-soft: #FBECEA;
+  --ring: #191918;          /* keyboard focus: blue is taken */
 
-  /* --- status ---------------------------------------------------------- */
-  --success: #2F6B41;
-  --success-soft: #E6F1E9;
-  --warning: #8A5709;
-  --warning-soft: #FBF0DE;
-  --destructive: #C0362A;
-  --destructive-soft: #FBEAE8;
+  /* banner */
+  --hero: #191918;
+  --hero-2: #2B2A27;
+  --hero-ink: #FDFDFC;
+  --hero-muted: #C4C2BB;
+  --hero-wave: #B8BAFF;
+  --hero-chip: rgba(255, 255, 255, .14);
 
-  --ring: rgba(224, 91, 50, .45);
-  --scrim: rgba(27, 25, 23, .32);
-  --sidebar-bg: rgba(244, 241, 236, .72);
+  /* command palette: dark raises it one step, see below */
+  --palette-bg: #FDFDFC;
+  --palette-edge: transparent;
+  --palette-active: #F5F4F1;
 
-  /* --- elevation -------------------------------------------------------
-     Layered rather than single: a tight contact shadow for the edge plus a
-     wide ambient one for depth. A lone blurred shadow reads as a drop
-     shadow; two read as a lit object. */
-  --shadow-sm:
-    0 1px 2px rgba(27, 25, 23, .05),
-    0 1px 1px rgba(27, 25, 23, .04);
-  --shadow:
-    0 1px 2px rgba(27, 25, 23, .05),
-    0 4px 12px -2px rgba(27, 25, 23, .06),
-    0 12px 28px -8px rgba(27, 25, 23, .07);
-  --shadow-lg:
-    0 2px 4px rgba(27, 25, 23, .06),
-    0 10px 24px -4px rgba(27, 25, 23, .10),
-    0 28px 56px -12px rgba(27, 25, 23, .14);
-  --shadow-pop:
-    0 4px 8px rgba(27, 25, 23, .08),
-    0 16px 32px -6px rgba(27, 25, 23, .14),
-    0 40px 80px -16px rgba(27, 25, 23, .22);
-  --shadow-accent: 0 6px 16px -4px rgba(201, 74, 37, .42);
+  --switch-knob-off: #FFFFFF;
+  --toast-action-bg: rgba(255, 255, 255, .14);
+  --scrim: rgba(25, 25, 24, .42);
+  --shadow: none;
+  --shadow-pop: 0 24px 70px rgba(25, 25, 24, .32);
 
-  /* Keycap's lit inner top edge -- white reads as a physical key on the
-     light cream surface. */
-  --keycap-hi: rgba(255, 255, 255, .7);
+  /* the logo tile, the same in both themes */
+  --tile-from: #2A2926;
+  --tile-to: #101010;
+  --tile-edge: rgba(255, 255, 255, .4);
+
+  /* Segoe UI Variable is Windows 11's optical-size family, Segoe UI covers
+     Windows 10. A macOS-only stack falls through to Arial on Windows. */
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-serif: "Instrument Serif", Georgia, serif;
+  --font-mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+
+  --radius-sm: 8px;         /* buttons, nav, inputs */
+  --radius-md: 14px;        /* cards and groups */
+  --radius-lg: 16px;        /* the panel and banners */
+  --radius-xl: 20px;        /* the command palette */
+  /* Windows draws its own titlebar above the page (window_chrome.py colours
+     it like the sidebar), so the panel's top inset matches its other sides. */
+  --titlebar-h: 8px;
+
+  --fast: 120ms;
+  --base: 180ms;
+  --slow: 240ms;
+  --ease: cubic-bezier(.2, .8, .2, 1);
 
   color-scheme: light;
 }
 
 :root[data-appearance="dark"] {
-  --bg: #16140F;
-  --surface: #201D17;
-  --surface-2: #272319;
-  --surface-3: #2F2A20;
-  --sunken: #100E0A;
+  --bg: #141413;
+  --panel: #1B1B19;
+  --surface: #201F1D;
+  --surface-2: #252422;
+  --wash: #262523;
+  --active: #2D2C29;
+  --chip: #32312E;
+  --border: #302F2C;
 
-  --ink: #F4F1EA;
-  --ink-2: #CFC8BC;
-  --muted: #9A9285;
-  --faint: #6E675C;
+  --ink: #F2F1EC;
+  --muted: #A5A49D;
+  --on-ink: #191918;
 
-  --border: #332E24;
-  --border-strong: #443E31;
-  --edge-hi: rgba(255, 255, 255, .055);
+  --accent: #B8BAFF;
+  --accent-hover: #CBCCFF;
+  --accent-text: #B8BAFF;
+  --accent-soft: #27284F;
+  --on-accent: #1B1B19;
 
-  --accent: #F2794F;
-  --accent-hover: #FF8C63;
-  --accent-press: #E06438;
-  /* On the dark base the brand orange already clears AA (6.10:1), so text
-     uses the brighter hover tone rather than a darkened one. */
-  --accent-text: #FF8C63;
-  --accent-soft: #38221A;
-  --accent-line: #5A3524;
-  --on-accent: #1A1006;
-  --accent-grad: linear-gradient(180deg, #F58457 0%, #E7683C 100%);
+  --success: #6FBF85;
+  --success-soft: #1F3325;
+  --warning: #B8BAFF;
+  --warning-soft: #27284F;
+  --destructive: #EE7C6E;
+  --destructive-soft: #3A211D;
+  --ring: #F2F1EC;
 
-  --success: #74C48A;
-  --success-soft: #1C2E21;
-  --warning: #E0A85A;
-  --warning-soft: #33270F;
-  --destructive: #F08375;
-  --destructive-soft: #37201C;
+  --hero: #2B2A27;
+  --hero-2: #201F1D;
+  --hero-ink: #F2F1EC;
+  --hero-muted: #BDBBB4;
+  --hero-wave: #B8BAFF;
+  --hero-chip: rgba(255, 255, 255, .14);
 
-  --ring: rgba(242, 121, 79, .5);
-  --scrim: rgba(0, 0, 0, .58);
-  --sidebar-bg: rgba(22, 20, 15, .6);
+  /* shadows barely read on dark, so the palette is lifted by colour and edge */
+  --palette-bg: #201F1D;
+  --palette-edge: #302F2C;
+  --palette-active: #2D2C29;
 
-  /* Dark UIs still need shadows -- the previous palette replaced them with a
-     hairline, which is why every panel sat flat on the background. Real
-     shadows plus the --edge-hi top highlight restore depth. */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .35);
-  --shadow:
-    0 1px 2px rgba(0, 0, 0, .4),
-    0 4px 12px -2px rgba(0, 0, 0, .45),
-    0 12px 28px -8px rgba(0, 0, 0, .5);
-  --shadow-lg:
-    0 2px 4px rgba(0, 0, 0, .45),
-    0 10px 24px -4px rgba(0, 0, 0, .5),
-    0 28px 56px -12px rgba(0, 0, 0, .6);
-  --shadow-pop:
-    0 4px 8px rgba(0, 0, 0, .5),
-    0 16px 32px -6px rgba(0, 0, 0, .55),
-    0 40px 80px -16px rgba(0, 0, 0, .7);
-  --shadow-accent: 0 6px 18px -4px rgba(242, 121, 79, .38);
-
-  /* Far fainter than the light theme's: a .7 white inset on a dark keycap
-     would read as a blown-out edge rather than a lit one. */
-  --keycap-hi: rgba(255, 255, 255, .06);
+  --switch-knob-off: #FFFFFF;
+  --toast-action-bg: rgba(25, 25, 24, .1);
+  --scrim: rgba(25, 25, 24, .42);
+  --shadow: none;
+  --shadow-pop: 0 24px 70px rgba(0, 0, 0, .55);
 
   color-scheme: dark;
-}
-
-/* ---------------------------------------------------------------------- */
-/* Shared, appearance-independent                                          */
-/* ---------------------------------------------------------------------- */
-
-:root {
-  /* Type. Segoe UI Variable is Windows 11's optical-size family; Segoe UI
-     covers Windows 10. The old stack listed only macOS faces, so every
-     glyph fell through to generic sans-serif (Arial) -- the single largest
-     reason the app read as unpolished on Windows. */
-  --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system,
-             "Inter", "Helvetica Neue", Arial, sans-serif;
-  --font-display: "Segoe UI Variable Display", "Segoe UI Variable Text",
-                  "Segoe UI", system-ui, -apple-system, "Inter", Arial, sans-serif;
-  --font-mono: "Cascadia Code", "Cascadia Mono", Consolas,
-               ui-monospace, "SF Mono", Menlo, monospace;
-
-  --text-xs: 11.5px;
-  --text-sm: 12.5px;
-  --text-base: 14px;
-  --text-md: 15px;
-  --text-lg: 17px;
-  --text-xl: 21px;
-  --text-2xl: 27px;
-  --text-3xl: 34px;
-
-  /* Segoe's 600 is a genuine semibold; the old 650 fell back to a synthesised
-     weight on Windows and smeared. */
-  --weight-normal: 400;
-  --weight-medium: 500;
-  --weight-semi: 600;
-  --weight-bold: 700;
-
-  --track-tight: -0.021em;
-  --track-snug: -0.012em;
-  --track-wide: 0.045em;
-
-  /* 4px rhythm */
-  --s1: 4px;   --s2: 8px;   --s3: 12px;  --s4: 16px;
-  --s5: 20px;  --s6: 24px;  --s7: 32px;  --s8: 40px;
-  --s9: 48px;  --s10: 64px;
-
-  --radius-xs: 6px;
-  --radius-sm: 9px;
-  --radius-md: 13px;
-  --radius-lg: 18px;
-  --radius-xl: 24px;
-  --titlebar-h: 52px;
-
-  --fast: 110ms;
-  --base: 170ms;
-  --slow: 240ms;
-  --ease: cubic-bezier(.2, .8, .2, 1);
-  --ease-out: cubic-bezier(.16, 1, .3, 1);
-
-  /* --- fixed, appearance-independent tints -----------------------------
-     These sit on surfaces that have their own fixed chrome (a physical
-     white switch thumb, the recording pill's dark body, the toast's
-     inverted chip), so they deliberately do NOT flip with the theme.
-     Declared here rather than inline so the "no literal colours outside
-     tokens.css" guard in tests/test_web_assets.py stays meaningful. */
-  --thumb-face: #FFFFFF;
-  --thumb-shadow: 0 1px 2px rgba(0, 0, 0, .28), 0 2px 6px rgba(0, 0, 0, .16);
-  --track-inset: inset 0 1px 2px rgba(0, 0, 0, .12);
-  --on-destructive: #FFFFFF;
-  --btn-inset-hi: inset 0 1px 0 rgba(255, 255, 255, .18);
-  --pill-chrome: rgba(28, 26, 23, .96);
-  --pill-inset-hi: inset 0 1px 0 rgba(255, 255, 255, .07);
-  --overlay-soft: rgba(255, 255, 255, .1);
-  --overlay-soft-hover: rgba(255, 255, 255, .18);
 }

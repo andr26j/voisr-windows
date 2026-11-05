@@ -22,7 +22,14 @@ def widget_with_window():
 
 
 def test_sanitize_theme_passes_known_values():
-    assert sanitize_pill_theme("ember") == "ember"
+    assert sanitize_pill_theme("classic") == "classic"
+    assert sanitize_pill_theme("quiet") == "quiet"
+
+
+def test_the_seven_old_themes_land_on_signature():
+    # saved by an older Voisr, and gone in the redesign
+    for old in ("ember", "aurora", "ocean", "neon", "breathe", "scanner"):
+        assert sanitize_pill_theme(old) == "classic", old
 
 
 def test_sanitize_theme_rejects_unknown():
@@ -48,9 +55,9 @@ def test_show_recording_sets_state():
 
 def test_show_recording_applies_theme_and_color():
     widget = widget_with_window()
-    widget.show_recording(theme="ember", color="#FF0080")
+    widget.show_recording(theme="quiet", color="#FF0080")
     joined = " ".join(widget._window.evaluated)
-    assert 'setTheme("ember")' in joined
+    assert 'setTheme("quiet")' in joined
     assert 'setColor("#FF0080")' in joined
 
 
@@ -64,7 +71,7 @@ def test_unsafe_theme_never_reaches_js():
 
 def test_unsafe_color_becomes_null():
     widget = widget_with_window()
-    widget.show_recording(theme="ember", color='"); alert(1); //')
+    widget.show_recording(theme="quiet", color='"); alert(1); //')
     joined = " ".join(widget._window.evaluated)
     assert "alert" not in joined
     assert "setColor(null)" in joined
@@ -86,6 +93,50 @@ def test_show_error_sets_state():
     widget = widget_with_window()
     widget.show_error()
     assert any('setState("error")' in s for s in widget._window.evaluated)
+
+
+def test_the_window_has_room_for_the_pills_shadow_with_its_centre_kept():
+    # widget.html's 196x44 pill casts 0 8px 24px; the old 232x56 window cut it
+    assert (overlay.WIDTH, overlay.HEIGHT) == (248, 120)
+    assert overlay.BOTTOM_MARGIN + overlay.HEIGHT / 2 == 98
+
+
+def test_a_notice_shows_its_words_as_a_js_string():
+    widget = widget_with_window()
+    widget.show_notice('Added "Voisr" to Dictionary </script>')
+    joined = " ".join(widget._window.evaluated)
+    assert 'setLabel("Added \\"Voisr\\" to Dictionary </script>")' in joined
+    assert widget._window.evaluated[-1] == 'setState("label")'
+
+
+def test_copied_says_ctrl_v_not_the_macs_key():
+    widget = widget_with_window()
+    widget.show_copied()
+    joined = " ".join(widget._window.evaluated)
+    assert "Ctrl+V" in joined and "⌘" not in joined
+    assert 'setState("label")' in joined
+
+
+def test_set_look_dresses_the_pill_without_showing_it():
+    widget = RecordingWidget()
+    widget._window = FakeWindow()
+    widget.set_look("quiet", None)
+    assert widget._window.evaluated == ['setTheme("quiet")', "setColor(null)"]
+    assert widget._shown is False
+    widget.set_look("ember", "#123456")
+    assert widget._window.evaluated[-2:] == ['setTheme("classic")', 'setColor("#123456")']
+
+
+def test_set_look_before_create_and_on_a_dead_webview_never_raises():
+    RecordingWidget().set_look("quiet", None)
+
+    class Dead(FakeWindow):
+        def evaluate_js(self, script):
+            raise RuntimeError("webview gone")
+
+    widget = RecordingWidget()
+    widget._window = Dead()
+    widget.set_look("quiet", None)
 
 
 def test_calls_before_create_are_dropped_not_raised():
