@@ -62,18 +62,14 @@ def set_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> bool:
     except Exception:
         return False
 
-# Adding a theme? Also update: widget.html (theme CSS + THEME_VALUES),
-# style.css (mini-pill rule + keyframes), api.js's dev-mock get_pill_themes,
-# and voisr.overlay._PILL_THEME_VALUES. test_widget_html_covers_all_pill_themes
-# guards widget.html.
+# Adding a theme? Also update: widget.html (theme CSS + THEME_VALUES), the
+# Settings picker's preview (.pill-preview in css/views.css), the
+# get_pill_themes mock in js/api.js, and voisr.overlay._PILL_THEME_VALUES.
+# test_widget_html_covers_all_pill_themes guards widget.html.
 PILL_THEMES = [
-    {"value": "classic", "label": "Classic"},
-    {"value": "ember", "label": "Ember"},
-    {"value": "aurora", "label": "Aurora"},
-    {"value": "ocean", "label": "Ocean"},
-    {"value": "neon", "label": "Neon EQ"},
-    {"value": "breathe", "label": "Breathe"},
-    {"value": "scanner", "label": "Scanner"},
+    # Saved as "classic" in every existing config, so the value stays
+    {"value": "classic", "label": "Signature"},
+    {"value": "quiet", "label": "Quiet"},
 ]
 
 
@@ -1390,6 +1386,9 @@ class Api:
             return copy.deepcopy(cached[1])
         cfg = load_config(self._config_path,
                           on_corrupt=self._note_corrupt_config)
+        # the theme the pill will really show, so the Settings picker has one
+        # to highlight after a theme this version no longer has was saved
+        cfg["pill_theme"] = sanitize_pill_theme(cfg.get("pill_theme"))
         self._config_stat_cache = (key, copy.deepcopy(cfg))
         return cfg
 

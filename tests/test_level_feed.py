@@ -378,10 +378,12 @@ def test_exit_outlasts_the_pill_animation():
     assert overlay.EXIT_S >= 0.16  # widget.html's exit runs 160 ms
 
 
-def test_window_leaves_room_for_the_entrance_rise():
+def test_window_leaves_room_for_the_entrance_rise_and_the_shadow():
     import voisr.overlay as overlay
-    assert overlay.HEIGHT == 56  # 44 px pill + 6 px above and below
-    assert overlay.BOTTOM_MARGIN == 70  # the pill's centre stays where it was
+    # 44 px pill, its 0 8px 24px shadow, and 6 px below for the rise
+    assert overlay.HEIGHT >= 44 + 2 * 24 + 6
+    # the pill's centre stays where it was: 98 px up the screen
+    assert overlay.BOTTOM_MARGIN + overlay.HEIGHT / 2 == 98
 
 
 def test_get_level_is_the_dock_bridge_to_the_live_level(tmp_path):
