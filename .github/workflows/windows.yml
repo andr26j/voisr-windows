@@ -43,6 +43,26 @@ jobs:
       - name: Tests
         run: python -m pytest -m "not slow" -q -p no:cacheprovider -rs --durations=15
 
+      # The kept-loaded server for real: whisper-server.exe from the release
+      # zip, the base.en model (shared cache with the build job) and
+      # whisper.cpp's own speech sample.
+      - name: Cache the Whisper model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: whisper-models-base-en-v1
+
+      - name: Real whisper-server tests
+        run: |
+          .\scripts\fetch_whisper.ps1 -Destination bin
+          if (-not (Test-Path models\ggml-base.en.bin)) {
+            New-Item -ItemType Directory -Force models | Out-Null
+            Invoke-WebRequest -Uri https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin -OutFile models\ggml-base.en.bin
+          }
+          $env:VOISR_TEST_WAV = "$env:RUNNER_TEMP\jfk.wav"
+          Invoke-WebRequest -Uri https://raw.githubusercontent.com/ggml-org/whisper.cpp/v1.9.1/samples/jfk.wav -OutFile $env:VOISR_TEST_WAV
+          python -m pytest tests/test_whisper_server_real.py -q -p no:cacheprovider -rs -s
+
   build:
     needs: test
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
@@ -80,10 +100,14 @@ jobs:
 
       - name: Smoke test the frozen app
         run: |
-          # The frozen app must at least import every module it ships with.
-          # --help exits before any window, hook or microphone is touched.
-          $p = Start-Process -FilePath build\dist\Voisr\Voisr.exe -ArgumentList "--help" -PassThru -Wait -NoNewWindow
-          if ($p.ExitCode -ne 0) { throw "Voisr.exe --help exited $($p.ExitCode)" }
+          # build/entry.py's --self-test imports every module the frozen app
+          # ships and checks its bundled files, then exits without opening a
+          # window, hooking the keyboard or touching the microphone.
+          $report = Join-Path $env:RUNNER_TEMP "selftest.txt"
+          $p = Start-Process -FilePath build\dist\Voisr\Voisr.exe -ArgumentList "--self-test", "`"$report`"" -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw "Voisr.exe --self-test hung for 2 minutes" }
+          if (Test-Path $report) { Get-Content $report }
+          if ($p.ExitCode -ne 0) { throw "Voisr.exe --self-test exited $($p.ExitCode)" }
 
       - uses: actions/upload-artifact@v4
         with:

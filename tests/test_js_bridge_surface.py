@@ -24,7 +24,7 @@ DEFINITION = "V.api = () => window.pywebview.api;"
 
 
 def _js_sources():
-    return {path: path.read_text() for path in JS_DIR.rglob("*.js")}
+    return {path: path.read_text(encoding="utf-8") for path in JS_DIR.rglob("*.js")}
 
 
 def _js_calls():

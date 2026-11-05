@@ -1,11 +1,11 @@
 """The Dictionary and Snippets pages call these by the Mac's names and
-signatures. They join BRIDGE_METHODS with the pages' JS, which pins that
-tuple to what the page calls (tests/test_js_bridge_surface.py)."""
+signatures (tests/test_js_bridge_surface.py pins BRIDGE_METHODS to what the
+page calls)."""
 import inspect
 
 import pytest
 
-from voisr.ui import Api
+from voisr.ui import BRIDGE_METHODS, Api
 
 PAGE_METHODS = {
     "get_suggestions": [],
@@ -21,4 +21,5 @@ PAGE_METHODS = {
 def test_the_pages_methods_have_the_macs_names_and_signatures(name, params):
     method = getattr(Api, name)
     assert not name.startswith("_") and callable(method)
+    assert name in BRIDGE_METHODS
     assert list(inspect.signature(method).parameters)[1:] == params

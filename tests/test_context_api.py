@@ -273,30 +273,53 @@ def test_cancel_drops_the_capture(tmp_path):
     api.close()
 
 
-def test_on_screen_terms_reach_whisper_cli(tmp_path, monkeypatch):
+def test_on_screen_terms_reach_whisper_cli_and_the_server(tmp_path, monkeypatch):
+    # both transcribers take the same prompt, through transcribe_routed
     from voisr import transcriber
 
-    prompts = []
+    prompts = {}
+
+    class Server:
+        def configure(self, unload):
+            pass
+
+        def set_busy(self, busy):
+            pass
+
+        def prewarm(self, *a, **k):
+            pass
+
+        def shutdown(self):
+            pass
+
+        def unload(self):
+            pass
+
+        def transcribe(self, wav, model, prompt=None):
+            prompts["server"] = prompt
+            return "hello world", {}
 
     def cli(wav, model_path=None, prompt=None):
-        prompts.append(prompt)
+        prompts["cli"] = prompt
         return "hello world"
 
     monkeypatch.setattr(transcriber, "transcribe", cli)
     box = textbox("say hi to Priya about Zedwick soon", caret=10)
-    api = make_api(tmp_path, FakeAX(box), transcribe_fn=None)
-    api.set_config({"dictionary": {"voiser": "Voisr"}})
-    out = dictate(api)
-    assert "error" not in out, out
-    assert prompts[0].startswith("Glossary: Voisr, ")
-    assert "Priya" in prompts[0] and "Zedwick" in prompts[0]
-    api.close()
+    for server, unload, key in ((Server(), "min5", "server"), (None, "min5", "cli")):
+        api = make_api(tmp_path, FakeAX(box), transcribe_fn=None, warm_server=server)
+        api.set_config({"model_unload": unload,
+                        "dictionary": {"voiser": "Voisr"}})
+        out = dictate(api)
+        assert "error" not in out, out
+        assert prompts[key].startswith("Glossary: Voisr, ")
+        assert "Priya" in prompts[key] and "Zedwick" in prompts[key]
+        api.close()
 
 
 def test_terms_only_bias_they_never_rewrite_the_text(tmp_path, monkeypatch):
     api = make_api(tmp_path, FakeAX(textbox("meet Priya today")), transcribe_fn=None)
     monkeypatch.setattr(api, "_default_transcribe",
-                        lambda wav, cfg, terms=(): "priya said hi")
+                        lambda wav, cfg, terms=(): ("priya said hi", {"mode": "cli", "timings": {}}))
     assert dictate(api)["text"] == "Priya said hi"  # first-word capital, not a term
     api.close()
 
@@ -305,7 +328,7 @@ def test_off_sends_no_terms(tmp_path, monkeypatch):
     seen = []
     api = make_api(tmp_path, FakeAX(textbox("meet Priya today")), transcribe_fn=None)
     monkeypatch.setattr(api, "_default_transcribe",
-                        lambda wav, cfg, terms=(): seen.append(list(terms)) or "ok")
+                        lambda wav, cfg, terms=(): seen.append(list(terms)) or ("ok", {"mode": "cli", "timings": {}}))
     api.set_config({"use_screen_context": False})
     dictate(api)
     assert seen == [[]]
@@ -319,7 +342,7 @@ def test_a_failure_with_terms_retries_without_and_loses_nothing(tmp_path, monkey
         calls.append(list(terms))
         if terms:
             raise RuntimeError("prompt rejected")
-        return "kept it"
+        return "kept it", {"mode": "cli", "timings": {}}
 
     api = make_api(tmp_path, FakeAX(textbox("meet Priya today")), transcribe_fn=None)
     monkeypatch.setattr(api, "_default_transcribe", fake)
@@ -335,7 +358,8 @@ def test_an_echoed_glossary_is_redone_without_terms(tmp_path, monkeypatch):
 
     def fake(wav, cfg, terms=()):
         calls.append(list(terms))
-        return "Glossary: Priya." if terms else "real speech"
+        return (("Glossary: Priya." if terms else "real speech"),
+                {"mode": "cli", "timings": {}})
 
     api = make_api(tmp_path, FakeAX(textbox("meet Priya today")), transcribe_fn=None)
     monkeypatch.setattr(api, "_default_transcribe", fake)
@@ -350,7 +374,7 @@ def test_a_capture_that_has_not_finished_is_not_waited_for(tmp_path, monkeypatch
     ax = HungAX(textbox("meet Priya today"))
     api = make_api(tmp_path, ax, capture_first=False, transcribe_fn=None)
     monkeypatch.setattr(api, "_default_transcribe",
-                        lambda wav, cfg, terms=(): seen.append(list(terms)) or "ok")
+                        lambda wav, cfg, terms=(): seen.append(list(terms)) or ("ok", {"mode": "cli", "timings": {}}))
     api.start_recording(prewarm=False)
     api.prewarm_now()
     assert ax.entered.wait(2)
@@ -1140,7 +1164,7 @@ def test_no_screen_text_reaches_the_log_even_when_things_fail(tmp_path, capsys, 
     def bad_transcribe(wav, cfg, terms=()):
         if terms:
             raise RuntimeError(f"failed with prompt {terms}")
-        return "ok"
+        return "ok", {"mode": "cli", "timings": {}}
 
     def bad_paste(text, on_sent=None, verifier=None):
         verifier("OLD")
@@ -1224,9 +1248,39 @@ def test_a_secure_press_capture_yields_no_terms_even_with_a_good_release(tmp_pat
     api.close()
 
 
-def test_a_mixed_term_never_reaches_the_cli_command_line(tmp_path, monkeypatch):
-    # whisper-cli takes the prompt as an argument, which other processes of
-    # this user can read while it runs
+class _Server:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.prompts = []
+
+    def configure(self, unload):
+        pass
+
+    def set_busy(self, busy):
+        pass
+
+    def prewarm(self, *a, **k):
+        pass
+
+    def shutdown(self):
+        pass
+
+    def unload(self):
+        pass
+
+    def transcribe(self, wav, model, prompt=None):
+        self.prompts.append(prompt)
+        if self.fail:
+            raise RuntimeError("server down")
+        return "hello world", {}
+
+
+@pytest.mark.parametrize("server, cli_runs", [
+    (_Server(), False),            # kept loaded: mixed term over loopback only
+    (_Server(fail=True), True),    # its fallback must not leak it
+    (None, True),                  # whisper-cli by choice
+])
+def test_a_mixed_term_never_reaches_the_cli_command_line(tmp_path, monkeypatch, server, cli_runs):
     from voisr import transcriber
 
     argv = []
@@ -1247,10 +1301,12 @@ def test_a_mixed_term_never_reaches_the_cli_command_line(tmp_path, monkeypatch):
     monkeypatch.setattr(transcriber, "resolve_model", lambda *a, **k: tmp_path / "m.bin")
     (tmp_path / "m.bin").write_bytes(b"x")
     box = textbox("ask about gpt4x with Priya today", caret=0)
-    api = make_api(tmp_path, FakeAX(box), transcribe_fn=None)
+    api = make_api(tmp_path, FakeAX(box), transcribe_fn=None, warm_server=server)
     out = dictate(api)
     assert "error" not in out, out
-    assert argv
+    if server is not None:
+        assert "gpt4x" in server.prompts[0]
+    assert bool(argv) is cli_runs
     for cmd in argv:
         joined = " ".join(cmd)
         assert "gpt4x" not in joined
@@ -1267,7 +1323,7 @@ def test_only_unsupported_term_soup_is_redone(tmp_path, monkeypatch, raw, retrie
 
     def fake(wav, cfg, terms=()):
         calls.append(list(terms))
-        return raw if terms else "the real words"
+        return (raw if terms else "the real words"), {"mode": "cli", "timings": {}}
 
     box = textbox("x Priya met Zedwick and Mina with Raman", caret=0)
     api = make_api(tmp_path, FakeAX(box), transcribe_fn=None)

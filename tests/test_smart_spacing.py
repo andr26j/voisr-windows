@@ -5,7 +5,6 @@ import pytest
 from voisr.ax_context import FocusContext
 from voisr.history import HistoryStore
 from voisr.snippets import dictation_wants_space
-from voisr.transcriber import resolve_model
 from voisr.ui import Api, install_click_watch
 
 
@@ -72,17 +71,6 @@ def test_history_and_clipboard_store_text_without_lead_space(tmp_path):
     out = dictate(api)
     assert out["text"] == "Second"                    # api result unpadded
     assert api.get_history()[0]["text"] == "Second"   # history unpadded
-
-
-def test_resolve_model_prefers_configured_then_small_then_base(tmp_path):
-    models = tmp_path / "models"
-    models.mkdir()
-    (models / "ggml-base.en.bin").write_bytes(b"x")
-    assert resolve_model(models_dir=models).name == "ggml-base.en.bin"
-    (models / "ggml-small.en.bin").write_bytes(b"x")
-    assert resolve_model(models_dir=models).name == "ggml-small.en.bin"
-    (models / "ggml-medium.en.bin").write_bytes(b"x")
-    assert resolve_model("medium.en", models_dir=models).name == "ggml-medium.en.bin"
 
 
 # ---- going by the field, and what happens where it can't be read

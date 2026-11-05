@@ -86,9 +86,10 @@ def test_a_meter_failure_never_loses_audio(tmp_path, monkeypatch):
     assert rec._frames == [block]
 
 
-def test_stop_resets_level_after_the_stream_has_closed(tmp_path):
+def test_stop_resets_level_after_the_stream_has_closed(tmp_path, monkeypatch):
     """A callback still in flight when stop() begins must not leave a
     stale level behind: the reset comes after the stream is closed."""
+    monkeypatch.setattr(StreamRecorder, "SELF_STOP_WAIT_S", 0.01)
     rec = StreamRecorder()
     rec._recording = True
     rec._out = str(tmp_path / "z.wav")
@@ -97,7 +98,8 @@ def test_stop_resets_level_after_the_stream_has_closed(tmp_path):
     class LateCallbackStream:
         def stop(self):
             rec._recording = True   # simulate a callback that already passed
-            rec._on_audio(loud, len(loud) // 2, None, None)  # the check
+            rec._stop_requested = False
+            rec._on_audio(loud, len(loud) // 2, None, None)  # the checks
             rec._recording = False
 
         def close(self):
@@ -378,10 +380,12 @@ def test_exit_outlasts_the_pill_animation():
     assert overlay.EXIT_S >= 0.16  # widget.html's exit runs 160 ms
 
 
-def test_window_leaves_room_for_the_entrance_rise():
+def test_window_leaves_room_for_the_entrance_rise_and_the_shadow():
     import voisr.overlay as overlay
-    assert overlay.HEIGHT == 56  # 44 px pill + 6 px above and below
-    assert overlay.BOTTOM_MARGIN == 70  # the pill's centre stays where it was
+    # 44 px pill, its 0 8px 24px shadow, and 6 px below for the rise
+    assert overlay.HEIGHT >= 44 + 2 * 24 + 6
+    # the pill's centre stays where it was: 98 px up the screen
+    assert overlay.BOTTOM_MARGIN + overlay.HEIGHT / 2 == 98
 
 
 def test_get_level_is_the_dock_bridge_to_the_live_level(tmp_path):

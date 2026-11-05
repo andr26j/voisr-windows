@@ -314,11 +314,11 @@ def test_a_bad_value_through_set_config_changes_nothing(tmp_path):
 def test_whisper_gets_the_triggers_and_never_the_text(tmp_path, monkeypatch):
     seen = {}
 
-    def cli(wav, model_path=None, prompt=None):
-        seen.update(prompt=prompt)
-        return "My email."
+    def routed(wav, model, prompt=None, server=None, unload="min5", cli_prompt=None):
+        seen.update(prompt=prompt, cli_prompt=cli_prompt)
+        return "My email.", {"mode": "cli", "timings": {}}
 
-    monkeypatch.setattr("voisr.transcriber.transcribe", cli)
+    monkeypatch.setattr("voisr.transcriber.transcribe_routed", routed)
     pasted = []
     from voisr.history import HistoryStore
     from voisr.ui import Api
@@ -327,7 +327,7 @@ def test_whisper_gets_the_triggers_and_never_the_text(tmp_path, monkeypatch):
               paste_fn=lambda text: pasted.append(text) or True)
     api.set_config({"snippets": {"my email": SECRET}})
     dictate(api)
-    assert seen == {"prompt": "Glossary: my email."}
+    assert seen == {"prompt": "Glossary: my email.", "cli_prompt": "Glossary: my email."}
     assert pasted == [SECRET]
     api.close()
 

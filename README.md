@@ -28,7 +28,7 @@ Two things are outside the installer's reach:
 ## What it does
 
 1. **Capture** — records your mic while you hold the hotkey
-2. **Transcribe** — on-device speech-to-text via whisper.cpp (`ggml-base.en`), CPU/BLAS
+2. **Transcribe** — on-device speech-to-text via whisper.cpp (`ggml-base.en` by default; bigger models download from Settings), CPU/BLAS. The model stays loaded for a few minutes between dictations so the next one doesn't wait for it (see [Speech models](#speech-models))
 3. **Clean up** — strips filler words (um, uh, hmm…), normalizes spacing/punctuation, capitalizes, and applies your custom dictionary (e.g. `"trademake" → "TradeMate"` for names the ASR mishears)
 4. **Insert** — pastes the result at the cursor of the frontmost window (Ctrl+V via `SendInput`), restoring your clipboard afterwards. If the paste is blocked, your original clipboard is preserved and the failure is reported, not silent. The dictation is recorded to history either way.
 
@@ -89,7 +89,7 @@ The dashboard (Start Menu → Voisr, or the Desktop shortcut) launches to a syst
 
 On by default (`use_screen_context`). Once a press is a real dictation (an accidental tap reads nothing), Voisr reads the field you are typing in, the window title and nearby labels through UI Automation, and does three things with them:
 
-- **Names on screen are spelled right.** Names and identifiers near your cursor are added to the glossary whisper is given, after your dictionary terms. They only bias recognition; they never replace anything. whisper-cli takes the glossary on its command line, so letter-and-digit tokens (what a one-time code looks like) are never put there.
+- **Names on screen are spelled right.** Names and identifiers near your cursor are added to the glossary whisper is given, after your dictionary terms. They only bias recognition; they never replace anything. The kept-loaded `whisper-server` gets them over its loopback connection; `whisper-cli` takes the glossary on its command line, where other processes of your user could see it while it runs, so letter-and-digit tokens from the screen (what a one-time code looks like) are never put there, and from terminals and browsers they aren't used at all.
 - **A paste that didn't land is caught.** After the paste, the field is read again. If the text isn't there, the dictation stays on the clipboard (instead of your old clipboard coming back) and the pill says so. Browsers, Electron apps and terminals can show a field as unchanged when it isn't, so there a missing paste is never called a miss.
 - **It learns from your corrections** (`learn_from_edits`). For up to a minute after a verified paste, Voisr re-reads that field (at 3, 10, 30 and 60 seconds; it does not watch your keystrokes) to find words you fixed, and suggests them in Dictionary. With `dictionary_auto_add` on, a capitalization or close spelling fix of a single uncommon word made in two separate dictations is added without asking, and the pill says so.
 
@@ -121,7 +121,8 @@ Screen text stays in memory for that dictation and is never written to history, 
   "use_screen_context": true,
   "learn_from_edits": true,
   "dictionary_auto_add": true,
-  "snippets": {"my email": "andre@example.com"}
+  "snippets": {"my email": "andre@example.com"},
+  "model_unload": "min5"
 }
 ```
 
@@ -131,6 +132,35 @@ A hand-edited value of the wrong type falls back to its default (the rest of the
 
 **Why right Ctrl, not right Alt (Wispr Flow / the macOS build's default):** right Alt is AltGr on many keyboard layouts, and AltGr + V can produce a different character than plain V on those layouts, which corrupts an injected Ctrl+V paste. Right Ctrl avoids that.
 
+### Speech models
+
+`ggml-base.en` ships inside Voisr and is the default. Settings → Models
+lists three more — `small.en`, `medium.en-q5_0` and `large-v3-turbo-q5_0`
+(multilingual, but always run in English) — with their size and a warning when
+one wants more memory than the PC has. **Download** fetches one from
+[huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp)
+into `%LOCALAPPDATA%\Voisr\models`, where updates never touch it. The file is
+checked against its published size and SHA-256 before it is used, and nothing
+half-downloaded is ever loaded; a download the connection drops, or that Quit
+interrupts, carries on where it left off when you click Download again. A
+downloaded model is used only once you click **Use**. `"model"` in the config
+holds that choice (`null` = the default).
+
+**Keep model loaded** (`"model_unload"`) keeps the model in memory between
+dictations, which saves loading it each time. Voisr starts `whisper-server.exe`
+(from the same whisper.cpp release as `whisper-cli.exe`) once a press is a real
+dictation, in parallel with your speech, and stops it after that many idle
+minutes: `"min2"`, `"min5"` (default), `"min10"`, `"min15"`, `"hour1"` or
+`"never"`. `"immediately"` loads the model for each dictation instead, the old
+behaviour. The server listens on `127.0.0.1` only, so Windows Firewall never
+asks about it, and it runs inside a job object Voisr holds: if Voisr crashes or
+is ended from Task Manager, Windows ends the server too. If it ever fails, that
+dictation goes through `whisper-cli.exe` instead and nothing is lost.
+
+Each dictation's history line records the model, whether it ran warm, and how
+long each stage took; `scripts\bench_models.py` and `scripts\bench_warm.py`
+measure models and the warm mode on your own PC.
+
 ### Updating
 
 Voisr checks for a new release 10 seconds after launch and every 24 hours,
@@ -139,10 +169,11 @@ dashboard. Nothing installs until you click it, and the update needs no admin
 rights. Turn checking off in Settings → Privacy & data, where **Check now**
 also works on demand.
 
-This version check is the only network call Voisr makes. It sends no audio, no
-text, and nothing identifying — it fetches a small JSON file describing the
-latest release. Downloads are verified against a published SHA256 before
-anything is executed.
+This version check, and a speech model download you start yourself, are the
+only network calls Voisr makes. Neither sends audio, text, or anything
+identifying: the check fetches a small JSON file describing the latest release,
+and a model download fetches the one file from Hugging Face. Downloads are
+verified against a published SHA256 before anything is executed or loaded.
 
 ## Uninstall
 
@@ -156,7 +187,7 @@ Removes the shortcuts, the launch-at-login registry entry, and `%LOCALAPPDATA%\V
 
 - **Dictation does not work over elevated windows** (Task Manager, an admin terminal, etc.). Windows' UIPI blocks input injection from an unelevated process into an elevated one. The failure is reported and your clipboard is preserved — not silent.
 - **No Mica/acrylic backdrop on Windows 10** — the dashboard falls back to a flat background there. (Windows 11 gets the translucent effect.)
-- **English-only by default** (`ggml-base.en`). Swap in a multilingual `ggml-*.bin` in `models\` and update `voisr\transcriber.py` if you need another language.
+- **English only.** Every model runs with `-l en`, the multilingual `large-v3-turbo-q5_0` included. Another language needs a change in `voisr\transcriber.py` and `voisr\whisper_server.py`.
 - **No GPU acceleration.** Transcription is CPU-only on every install; see [Download](#download) for the measured timing.
 - **Windows Defender false positive.** Signature 1.455.474.0 (2 Aug 2026) flags Inno Setup-built executables as `Trojan:Win32/Wacatac.C!ml` — it fired even on a minimal probe installer, not just Voisr's ~155 MB payload. Employees downloading `VoisrSetup.exe` may see it quarantined outright, not merely warned about (compare the SmartScreen warning above, which the user can click through). Code signing (see "Possible future work") would likely resolve this along with the SmartScreen warning.
 

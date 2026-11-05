@@ -866,22 +866,23 @@ def test_old_lines_without_model_or_timings_stay_valid(tmp_path):
     assert store.list()[0]["timings_ms"] == {"total": 12}
 
 
-def test_add_records_model_and_whole_ms_timings(tmp_path):
-    store = HistoryStore(tmp_path / "h.jsonl")
-    item = store.add("hello", 1.0, model="small.en",
-                     timings_ms={"transcribe": 812.6, "cleanup": 0.4,
-                                 "bad": float("nan"), "neg": -1})
-    assert item["model"] == "small.en"
-    assert item["timings_ms"] == {"transcribe": 813, "cleanup": 0}
-    assert store.list()[0]["timings_ms"] == item["timings_ms"]
-    assert "model" not in store.add("x", 1.0) and "timings_ms" not in store.add("y", 1.0)
-
-
 def test_a_snippet_row_is_marked(tmp_path):
     store = HistoryStore(tmp_path / "h.jsonl")
     assert store.add("my address", 1.0, snippet=True)["snippet"] is True
     assert "snippet" not in store.add("plain words", 1.0)
     assert [i.get("snippet") for i in store.list()] == [None, True]
+
+
+def test_add_records_model_mode_and_whole_ms_timings(tmp_path):
+    store = HistoryStore(tmp_path / "h.jsonl")
+    item = store.add("hello", 1.0, model="small.en", mode="warm",
+                     timings_ms={"transcribe": 812.6, "cleanup": 0.4,
+                                 "bad": float("nan"), "neg": -1})
+    assert item["model"] == "small.en" and item["mode"] == "warm"
+    assert item["timings_ms"] == {"transcribe": 813, "cleanup": 0}
+    assert store.list()[0]["timings_ms"] == item["timings_ms"]
+    plain = store.add("x", 1.0)
+    assert not {"model", "mode", "timings_ms"} & set(plain)
 
 
 def test_merge_timings_keeps_earlier_keys_and_does_not_resurrect(tmp_path):

@@ -213,7 +213,8 @@ class HistoryStore:
             snippet: bool = False) -> dict:
         """`model` and `timings_ms` are optional: lines written before they
         existed stay valid and readers must treat both as possibly absent.
-        `mode` is how it was transcribed, when the transcriber says.
+        `mode` is how it was transcribed: "warm" (kept-loaded server), "cli"
+        (whisper-cli) or "cli-fallback" (the server failed, whisper-cli ran).
         `snippet`: `text` is the trigger that was said, not what was pasted."""
         if not _finite_number(duration_s) or duration_s < 0:
             raise ValueError("duration_s must be a finite, nonnegative number")

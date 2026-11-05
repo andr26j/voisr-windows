@@ -43,6 +43,16 @@ def tap_then_hold(seed=1):
     return samples
 
 
+def typing(seed=1):
+    """Room noise and a stream of made-up key thumps: too many to be a press of
+    the hotkey, so it passes the gate on its total, with no steady stretch."""
+    rng = random.Random(seed)
+    samples = noise(5.0, rng)
+    for key in range(20):
+        add_thump(samples, 0.05 + key * 0.24, rng)
+    return samples
+
+
 def spoken(seconds=1.0, seed=2):
     """Made-up voiced speech: a noise bed with a steady buzz well above it."""
     rng = random.Random(seed)
@@ -94,9 +104,10 @@ def dictate(api):
 
 
 @pytest.mark.parametrize("seed", range(8))
-def test_tap_then_hold_clips_pass_the_gate_but_never_fire_a_snippet(tmp_path, seed):
-    samples = tap_then_hold(seed)
-    assert analyze(array.array("h", (max(-32768, min(32767, int(s))) for s in samples))).verdict == "speech"
+def test_thumps_that_pass_the_gate_never_fire_a_snippet(tmp_path, seed):
+    samples = typing(seed)
+    span = analyze(array.array("h", (max(-32768, min(32767, int(s))) for s in samples)))
+    assert span.verdict == "speech" and span.sustained_ms < 240
     api, pasted = guard_api(tmp_path, samples)
     out = dictate(api)
     assert pasted == ["My email."] and "error" not in out
@@ -148,7 +159,7 @@ def test_steady_room_noise_is_not_sustained_speech():
 
 
 def test_a_held_back_snippet_is_logged_without_naming_it(tmp_path, capsys):
-    api, _ = guard_api(tmp_path, tap_then_hold())
+    api, _ = guard_api(tmp_path, typing())
     dictate(api)
     api.close()
     out = capsys.readouterr().out
@@ -171,10 +182,14 @@ def test_no_gate_reading_means_no_evidence(tmp_path, monkeypatch):
     api.close()
 
 
-def test_the_gate_itself_is_unchanged_for_other_dictation(tmp_path):
-    api, pasted = guard_api(tmp_path, tap_then_hold(), raw="Subs by someone.")
-    dictate(api)
-    assert pasted == ["Subs by someone."]
+@pytest.mark.parametrize("seed", range(8))
+def test_most_made_up_tap_then_holds_stop_at_the_gate(tmp_path, seed):
+    heard = []
+    api, pasted = guard_api(tmp_path, tap_then_hold(seed))
+    api._transcribe_fn = lambda wav: heard.append(wav) or "Subs by someone."
+    out = dictate(api)
+    assert "didn't catch that" in out["error"]
+    assert heard == [] and pasted == [] and api.get_history() == []
     api.close()
 
 
@@ -193,11 +208,11 @@ def prompts_for(tmp_path, monkeypatch, samples, replies):
     sent = []
     replies = iter(replies)
 
-    def cli(wav, model_path=None, prompt=None):
-        sent.append(prompt)
-        return next(replies)
+    def routed(wav, model, prompt=None, server=None, unload="min5", cli_prompt=None):
+        sent.append((prompt, cli_prompt))
+        return next(replies), {"mode": "cli", "timings": {}}
 
-    monkeypatch.setattr("voisr.transcriber.transcribe", cli)
+    monkeypatch.setattr("voisr.transcriber.transcribe_routed", routed)
     from voisr.history import HistoryStore
     from voisr.ui import Api
     recorder = type("R", (ClipRecorder,), {"samples": samples})
@@ -212,7 +227,7 @@ def prompts_for(tmp_path, monkeypatch, samples, replies):
 def test_a_long_dictation_is_sent_no_triggers_on_either_prompt(tmp_path, monkeypatch):
     api, sent, _ = prompts_for(tmp_path, monkeypatch, spoken(seconds=12.0), ["A long thought."])
     dictate(api)
-    assert sent == ["Glossary: Tareq."]
+    assert sent == [("Glossary: Tareq.", "Glossary: Tareq.")]
     api.close()
 
 
@@ -220,7 +235,7 @@ def test_a_short_clip_is_sent_them_on_both_prompts(tmp_path, monkeypatch):
     api, sent, pasted = prompts_for(tmp_path, monkeypatch, spoken(), ["My email."])
     dictate(api)
     wanted = "Glossary: Tareq, my email, review prompt."
-    assert sent == [wanted] and pasted == [SECRET]
+    assert sent == [(wanted, wanted)] and pasted == [SECRET]
     assert wav_seconds is not None
     api.close()
 
@@ -236,7 +251,7 @@ def test_a_recited_list_is_redone_without_triggers(tmp_path, monkeypatch, recita
     api, sent, pasted = prompts_for(tmp_path, monkeypatch, spoken(), [recital, "Hello there."])
     dictate(api)
     assert len(sent) == 2
-    assert "my email" not in sent[1]
+    assert "my email" not in sent[1][0] and "my email" not in sent[1][1]
     assert pasted == ["Hello there."]
     assert "review prompt" not in (tmp_path / "history.jsonl").read_text()
     api.close()
@@ -288,7 +303,7 @@ def test_ordinary_words_are_not_a_recital(tmp_path, monkeypatch, said):
     api.close()
 
 
-@pytest.mark.parametrize("samples,expands", [(spoken(), True), (tap_then_hold(), False)])
+@pytest.mark.parametrize("samples,expands", [(spoken(), True), (typing(), False)])
 def test_one_lookup_decides_the_expansion_and_the_log_line(tmp_path, monkeypatch, capsys, samples, expands):
     import voisr.snippets
     import voisr.ui
@@ -301,7 +316,8 @@ def test_one_lookup_decides_the_expansion_and_the_log_line(tmp_path, monkeypatch
     monkeypatch.setattr(voisr.snippets, "find_snippet", counted)
     monkeypatch.setattr(voisr.ui, "find_snippet", counted)
     api, pasted = guard_api(tmp_path, samples)
-    monkeypatch.setattr(api, "_transcribe_with_terms", lambda wav, cfg, terms: "My email.")
+    monkeypatch.setattr(api, "_transcribe_with_terms", lambda wav, cfg, terms: (
+        "My email.", {"mode": None, "timings": {}}))
     dictate(api)
     api.close()
     assert len(calls) == 1

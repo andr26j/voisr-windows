@@ -26,11 +26,9 @@ def test_recording_glyph_differs_from_idle():
 
 
 def test_glyph_ignores_taskbar_theme():
-    """The tray now shows the full-colour Voisr mark, which carries its own
-    rounded background and reads on a light or dark taskbar alike. The old
-    monochrome glyph had to invert (emulating macOS template images);
-    inverting a brand mark would corrupt its colour, so the theme argument
-    is deliberately accepted and ignored."""
+    """The tray shows the Ribbon tile, which carries its own dark background
+    and reads on a light or dark taskbar alike, so the theme argument is
+    deliberately accepted and ignored."""
     light = glyph_image(recording=False, size=32, dark_taskbar=False).tobytes()
     dark = glyph_image(recording=False, size=32, dark_taskbar=True).tobytes()
     assert light == dark
@@ -50,12 +48,30 @@ def test_glyph_is_opaque_where_the_mark_sits():
     assert img.getpixel((16, 16))[3] == 255
 
 
-def test_recording_badge_survives_small_sizes():
+def test_recording_state_survives_small_sizes():
     """16px is what the notification area actually asks for; the state has
     to still be distinguishable there."""
     idle = glyph_image(recording=False, size=16).tobytes()
     rec = glyph_image(recording=True, size=16).tobytes()
     assert idle != rec
+
+
+def test_live_is_the_signal_colour_with_the_same_shape():
+    """Like the Mac's menu-bar wave: the shape stays, colour tells live from
+    idle. Here the tile takes the colour, ultramarine, not the old red badge."""
+    idle = glyph_image(recording=False, size=32)
+    live = glyph_image(recording=True, size=32)
+    r, g, b, a = live.getpixel((3, 16))  # tile, clear of the wave
+    assert b > 150 and r < 80 and g < 80, (r, g, b)
+    assert idle.getchannel("A").tobytes() == live.getchannel("A").tobytes(), \
+        "same tile outline, so nothing shifts in the tray"
+
+
+def test_the_tray_never_gets_a_drawing_it_could_spoil():
+    # voisr.logo caches each size; a caller drawing on its copy mustn't change it
+    first = glyph_image(recording=False, size=32)
+    first.putpixel((16, 16), (255, 0, 0, 255))
+    assert glyph_image(recording=False, size=32).getpixel((16, 16)) != (255, 0, 0, 255)
 
 
 def test_dispatch_routes_each_action():

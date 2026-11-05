@@ -110,3 +110,12 @@ def test_app_data_dir_is_unaffected_by_freezing(monkeypatch, tmp_path):
     monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\x\AppData\Local")
     assert "Voisr" in str(paths.app_data_dir())
     assert str(tmp_path) not in str(paths.app_data_dir())
+
+
+def test_downloaded_models_live_with_user_data_not_the_bundle(monkeypatch, tmp_path):
+    """An update replaces the install folder; a 500 MB download must survive it."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "bundle"), raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    assert paths.user_models_dir() == tmp_path / "local" / "Voisr" / "models"
+    assert paths.user_models_dir() != paths.models_dir()
