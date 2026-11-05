@@ -580,9 +580,9 @@ class HotkeyService:
             self._schedule_preload(*preload)
 
     def _schedule_preload(self, epoch, wait, toggle) -> None:
-        """Start what a dictation needs once this recording is known to be
-        one: at once for a toggle (hands-free from the start), else when the
-        held key outlives the tap gate. Called outside _state_lock."""
+        """Load the model once this recording is known to be a dictation: at
+        once for a toggle (hands-free from the start), else when the held key
+        outlives the tap gate. Called outside _state_lock."""
         if toggle or wait <= 0:
             self._preload_if_current(epoch)
             return
@@ -601,7 +601,7 @@ class HotkeyService:
     def _preload(self) -> None:
         if self._can_prewarm:
             try:
-                self._api.prewarm_now()   # never waits
+                self._api.prewarm_now()   # spawns its own thread
             except Exception:
                 pass
 
@@ -681,7 +681,7 @@ class HotkeyService:
 
     def _dress_widget(self) -> None:
         """Only a recording sets the pill's theme. A state with no dictation
-        behind it would otherwise wear the last dictation's, or the default
+        behind it would otherwise wear the last dictation's, or Signature
         straight after launch."""
         set_look = getattr(self._widget, "set_look", None)
         if set_look is None:
@@ -772,7 +772,7 @@ class HotkeyService:
                 hold = self._hide_delay
                 if "error" in result:
                     self._widget_action("show_error", epoch)
-                elif result.get("manual_paste") and hasattr(self._widget, "show_copied"):
+                elif result.get("manual_paste"):
                     self._widget_action("show_copied", epoch)
                     hold = hold and hold * self.COPIED_HOLD
                 else:

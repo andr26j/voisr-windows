@@ -1061,6 +1061,45 @@ def test_the_notice_waits_while_a_dictation_is_in_flight(tmp_path):
     api.close()
 
 
+def test_a_waiting_notice_is_dropped_when_the_setting_went_off(tmp_path):
+    calls = []
+
+    class Widget:
+        def show_recording(self, theme="classic", color=None):
+            calls.append("recording")
+
+        def show_processing(self):
+            calls.append("processing")
+
+        def show_done(self):
+            calls.append("done")
+
+        def show_error(self):
+            calls.append("error")
+
+        def show_notice(self, text):
+            calls.append("notice")
+
+        def hide(self):
+            calls.append("hide")
+
+    api = make_api(tmp_path)
+    before = set(threading.enumerate())
+    svc = HotkeyService(api, widget=Widget(), hide_delay=0)
+    svc.NOTICE_RETRY_S = 0.01
+    svc.NOTICE_HOLD_S = 0
+    svc.press()
+    svc.show_notice("Suggested: Voisr")   # waits: a dictation has the pill
+    api.set_config({"show_widget": False})
+    svc.release()
+    for thread in set(threading.enumerate()) - before:
+        if thread.name.startswith(("voisr-widget-", "voisr-notice")):
+            thread.join(5)
+    api.close()
+    assert "notice" not in calls
+    assert calls[0] == "recording"
+
+
 def test_a_word_cannot_break_out_of_the_dashboard_event(tmp_path):
     from voisr.suggestions import Pair
 
