@@ -13,10 +13,11 @@ def test_resolve_model_prefers_named(tmp_path):
     assert resolve_model("base.en", tmp_path) == tmp_path / "ggml-base.en.bin"
 
 
-def test_resolve_model_prefers_small_when_unnamed(tmp_path):
+def test_resolve_model_prefers_the_bundled_default_when_unnamed(tmp_path):
+    # base.en ships with Voisr; a downloaded small.en waits for "Use"
     (tmp_path / "ggml-small.en.bin").write_bytes(b"")
     (tmp_path / "ggml-base.en.bin").write_bytes(b"")
-    assert resolve_model(None, tmp_path) == tmp_path / "ggml-small.en.bin"
+    assert resolve_model(None, tmp_path) == tmp_path / "ggml-base.en.bin"
 
 
 def test_resolve_model_falls_back_to_base_path(tmp_path):
@@ -53,6 +54,8 @@ def test_transcribe_reads_output_and_cleans_up(tmp_path, monkeypatch):
     assert transcribe(wav, model_path=model) == "hello world"
     assert not Path(str(wav) + ".out.txt").exists()
     assert "--beam-size" in recorded["cmd"]
+    # English only, even with a multilingual model
+    assert recorded["cmd"][recorded["cmd"].index("-l") + 1] == "en"
 
 
 def test_transcribe_passes_prompt(tmp_path, monkeypatch):

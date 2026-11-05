@@ -1036,8 +1036,18 @@ class Api:
                  save_dialog_fn=None,
                  timer_factory=threading.Timer,
                  exit_fn=None,
-                 mic_check=None):
+                 mic_check=None,
+                 models_dir=None, model_downloader=None, system_info_fn=None,
+                 bundled_models_dir=None):
         self._config_path = Path(config_path) if config_path else default_config_path()
+        # None = the per-user downloads folder plus the models that ship with
+        # Voisr (models.MODELS_DIR, models.BUNDLED_DIR). A test passes its own
+        # folder, and only that folder (and bundled_models_dir) is used.
+        self._models_dir = models_dir
+        self._bundled_models_dir = bundled_models_dir
+        self._model_downloader = model_downloader
+        self._model_downloader_lock = threading.Lock()
+        self._system_info_fn = system_info_fn
         self._history = history or HistoryStore(self._config_path.parent / "history.jsonl")
         self._transcribe_fn = transcribe_fn
         self._clock = clock
@@ -1097,7 +1107,8 @@ class Api:
         """Transcribe with the release-time model and dictionary prompt.
         Returns (text, info) like transcriber.transcribe_routed."""
         from voisr.transcriber import resolve_model, transcribe as _transcribe
-        text = _transcribe(wav, model_path=resolve_model(cfg.get("model")),
+        text = _transcribe(wav, model_path=resolve_model(cfg.get("model"),
+                                                         *self._model_dirs()),
                            prompt=glossary_prompt(cfg.get("dictionary")))
         return text, {"mode": "cli", "timings": {}}
 
@@ -1106,8 +1117,9 @@ class Api:
         injected its own transcribe function and no model was involved."""
         if self._transcribe_fn is not None:
             return None
+        from voisr.models import id_from_path
         from voisr.transcriber import resolve_model
-        return resolve_model(cfg.get("model")).stem.removeprefix("ggml-")
+        return id_from_path(resolve_model(cfg.get("model"), *self._model_dirs()))
 
     def _record_delivery_timings(self, item, t_start, paste_started, paste_sent=None):
         """Best effort, after delivery: the paste has already happened and the
@@ -1416,6 +1428,8 @@ class Api:
         # words and go to History), but nothing may paste or touch the
         # clipboard after the user has left the app.
         self._quitting = True
+        if self._model_downloader is not None:
+            self._model_downloader.cancel()  # its .part stays, to resume
         self._recordings.close()
         if self._status_item is not None:
             self._status_item.release()
@@ -1640,18 +1654,74 @@ class Api:
             return {"error": str(e)}
         return {"ok": True, "removed": removed}
 
+    def _model_dirs(self):
+        """(downloads folder, bundled folder or None), read at call time so a
+        test can point models.MODELS_DIR elsewhere."""
+        if self._models_dir is None:
+            from voisr import models
+            return models.MODELS_DIR, models.BUNDLED_DIR
+        bundled = self._bundled_models_dir
+        return Path(self._models_dir), Path(bundled) if bundled else None
+
+    def _downloader(self):
+        from voisr.models import ModelDownloader
+        with self._model_downloader_lock:
+            if self._model_downloader is None:
+                models_dir, bundled = self._model_dirs()
+                self._model_downloader = ModelDownloader(models_dir,
+                                                         bundled_dir=bundled)
+            return self._model_downloader
+
+    def _system_info(self):
+        from voisr.models import system_info
+        return (self._system_info_fn or system_info)()
+
+    def _active_model_id(self):
+        from voisr.models import id_from_path
+        from voisr.transcriber import resolve_model
+        p = resolve_model(self.get_config().get("model"), *self._model_dirs())
+        return id_from_path(p) if p.is_file() else None
+
     def get_models(self):
-        from voisr.transcriber import MODELS_DIR, PREFERRED_MODELS
-        labels = {"small.en": "Small — best accuracy",
-                  "base.en": "Base — fastest"}
-        models = []
-        for name in PREFERRED_MODELS:
-            path = MODELS_DIR / f"ggml-{name}.bin"
-            installed = path.exists()
-            models.append({"value": name, "label": labels.get(name, name),
-                           "installed": installed,
-                           "bytes": path.stat().st_size if installed else 0})
-        return {"models": models, "active": self.get_config().get("model")}
+        """Settings' model list: every registry model and any custom file,
+        what's installed and in use, this PC's processor and memory, and the
+        current or last download. Rows with "bundled" ship with Voisr."""
+        from voisr.models import list_models
+        system = self._system_info()
+        active = self._active_model_id()
+        models_dir, bundled = self._model_dirs()
+        return {"models": list_models(models_dir, system, active, bundled_dir=bundled),
+                "active": active, "system": system,
+                "download": self._downloader().progress()}
+
+    def download_model(self, model_id):
+        return self._downloader().start(model_id, self._system_info())
+
+    def get_download_progress(self):
+        return self._downloader().progress()
+
+    def delete_model(self, model_id):
+        from voisr.models import delete_file, installed_paths, is_bundled
+        models_dir, bundled = self._model_dirs()
+        installed = installed_paths(models_dir, bundled)
+        path = installed.get(model_id)
+        if path is None:
+            return {"error": "That model isn't installed."}
+        if is_bundled(path, bundled):
+            return {"error": "That model comes with Voisr, so it can't be deleted."}
+        if len(installed) <= 1:
+            return {"error": "It's the only model installed; "
+                             "dictation needs at least one."}
+        if model_id == self._active_model_id():
+            return {"error": "That model is in use. Pick another one first."}
+        try:
+            delete_file(path)
+        except PermissionError:
+            return {"error": "Windows says that file is in use. "
+                             "Try again in a moment."}
+        except OSError as e:
+            return {"error": str(e)}
+        return {"ok": True}
 
     def set_launch_at_login(self, enabled):
         try:

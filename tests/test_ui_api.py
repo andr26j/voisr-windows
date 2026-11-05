@@ -591,12 +591,159 @@ def test_restore_history_item_puts_it_back(tmp_path):
     assert api.get_history()[0]["id"] == item["id"]
 
 
-def test_get_models_lists_known_models_with_installed_flags(tmp_path):
-    api = make_api(tmp_path)
+PC_16 = {"memory_gb": 16, "chip": "Intel(R) Core(TM) i7-1260P"}
+
+
+def _models_api(tmp_path, installed=("small.en", "base.en"), model=None,
+                bundled=(), **kw):
+    mdir = tmp_path / "models"
+    mdir.mkdir()
+    for n in installed:
+        (mdir / f"ggml-{n}.bin").write_bytes(b"x")
+    if bundled:
+        bdir = tmp_path / "bundled"
+        bdir.mkdir()
+        for n in bundled:
+            (bdir / f"ggml-{n}.bin").write_bytes(b"x")
+        kw["bundled_models_dir"] = bdir
+    api = make_api(tmp_path, models_dir=mdir, system_info_fn=lambda: PC_16, **kw)
+    if model:
+        api.set_config({"model": model})
+    return api, mdir
+
+
+def test_get_models_returns_registry_with_install_state(tmp_path):
+    api, _ = _models_api(tmp_path, installed=("small.en",))
     out = api.get_models()
-    values = [m["value"] for m in out["models"]]
-    assert values == ["small.en", "base.en"]
-    assert all(isinstance(m["installed"], bool) for m in out["models"])
+    rows = {m["id"]: m for m in out["models"]}
+    assert list(rows) == ["base.en", "small.en", "medium.en-q5_0",
+                          "large-v3-turbo-q5_0"]
+    assert rows["small.en"]["installed"] and rows["small.en"]["active"]
+    assert not rows["base.en"]["installed"]
+    assert out["active"] == "small.en" and out["system"] == PC_16
+    assert out["download"] == {"state": "idle"}
+    assert all(m["benchmark"] is None for m in out["models"])
+
+
+def test_the_bundled_base_model_is_the_default_and_in_use(tmp_path):
+    api, _ = _models_api(tmp_path, installed=(), bundled=("base.en",))
+    out = api.get_models()
+    rows = {m["id"]: m for m in out["models"]}
+    assert out["active"] == "base.en"
+    assert rows["base.en"]["installed"] and rows["base.en"]["bundled"]
+
+
+def test_a_download_is_not_used_until_chosen(tmp_path):
+    api, _ = _models_api(tmp_path, installed=("small.en",), bundled=("base.en",))
+    assert api.get_models()["active"] == "base.en"
+    api.set_config({"model": "small.en"})
+    assert api.get_models()["active"] == "small.en"
+
+
+def test_get_models_warns_when_memory_is_short(tmp_path):
+    api, _ = _models_api(tmp_path)
+    api._system_info_fn = lambda: {"memory_gb": 8, "chip": None}
+    rows = {m["id"]: m for m in api.get_models()["models"]}
+    assert rows["medium.en-q5_0"]["warning"] and not rows["small.en"]["warning"]
+
+
+def test_old_config_naming_a_missing_model_falls_back(tmp_path):
+    api, _ = _models_api(tmp_path, installed=("base.en",), model="small.en")
+    assert api.get_models()["active"] == "base.en"
+
+
+def test_delete_model_refuses_the_active_one(tmp_path):
+    api, mdir = _models_api(tmp_path, model="small.en")
+    assert "in use" in api.delete_model("small.en")["error"]
+    assert (mdir / "ggml-small.en.bin").exists()
+
+
+def test_delete_model_refuses_the_last_one(tmp_path):
+    api, mdir = _models_api(tmp_path, installed=("small.en",))
+    assert "only model" in api.delete_model("small.en")["error"]
+    assert (mdir / "ggml-small.en.bin").exists()
+
+
+def test_delete_model_refuses_the_one_that_ships_with_voisr(tmp_path):
+    api, _ = _models_api(tmp_path, installed=("small.en",), bundled=("base.en",),
+                         model="small.en")
+    assert "comes with Voisr" in api.delete_model("base.en")["error"]
+    assert (tmp_path / "bundled" / "ggml-base.en.bin").exists()
+
+
+def test_delete_model_removes_an_inactive_one(tmp_path):
+    api, mdir = _models_api(tmp_path, model="small.en")
+    assert api.delete_model("base.en") == {"ok": True}
+    assert not (mdir / "ggml-base.en.bin").exists()
+    assert "isn't installed" in api.delete_model("base.en")["error"]
+
+
+def test_delete_model_works_on_a_custom_file(tmp_path):
+    api, mdir = _models_api(tmp_path, installed=("small.en", "mine"))
+    assert api.delete_model("mine") == {"ok": True}
+    assert not (mdir / "ggml-mine.bin").exists()
+
+
+def test_delete_model_reports_a_file_windows_keeps_open(tmp_path, monkeypatch):
+    from voisr import models
+
+    def in_use(path):
+        raise PermissionError(32, "in use")
+    monkeypatch.setattr(models, "delete_file", in_use)
+    api, mdir = _models_api(tmp_path, model="small.en")
+    assert "in use" in api.delete_model("base.en")["error"]
+
+
+def test_download_model_refuses_when_disk_is_full(tmp_path):
+    from voisr.models import ModelDownloader
+    mdir = tmp_path / "models"
+    mdir.mkdir()
+    dl = ModelDownloader(mdir, "http://127.0.0.1:9", free_bytes_fn=lambda: 10)
+    api = make_api(tmp_path, models_dir=mdir, model_downloader=dl,
+                   system_info_fn=lambda: PC_16)
+    assert "Not enough disk space" in api.download_model("small.en")["error"]
+    assert api.get_download_progress() == {"state": "idle"}
+
+
+def test_close_cancels_a_download_in_flight(tmp_path):
+    class Spy:
+        cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    spy = Spy()
+    api, _ = _models_api(tmp_path, model_downloader=spy)
+    api.close()
+    assert spy.cancelled
+
+
+def test_downloader_creation_is_shared_across_threads(tmp_path):
+    api, _ = _models_api(tmp_path)
+    seen, barrier = [], threading.Barrier(8)
+
+    def grab():
+        barrier.wait()
+        seen.append(api._downloader())
+
+    threads = [threading.Thread(target=grab) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert len({id(d) for d in seen}) == 1
+
+
+def test_model_name_uses_the_registry_id(tmp_path):
+    api, mdir = _models_api(tmp_path, installed=("medium.en-q5_0",))
+    api._transcribe_fn = None
+    assert api._model_name({"model": "medium.en-q5_0"}) == "medium.en-q5_0"
+
+
+def test_the_default_folders_are_the_downloads_then_the_bundle(tmp_path, monkeypatch):
+    from voisr import models
+    monkeypatch.setattr(models, "MODELS_DIR", tmp_path / "user")
+    monkeypatch.setattr(models, "BUNDLED_DIR", tmp_path / "bundled")
+    api = make_api(tmp_path)
+    assert api._model_dirs() == (tmp_path / "user", tmp_path / "bundled")
 
 
 def test_set_launch_at_login_round_trips(tmp_path, monkeypatch):

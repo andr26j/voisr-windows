@@ -1,14 +1,17 @@
 import subprocess
 from pathlib import Path
 
+from voisr.models import BUNDLED_DIR, MODELS_DIR, filename_for, search_dirs
 from voisr.paths import find_binary
-from voisr.paths import models_dir as _models_dir
 
-MODELS_DIR = _models_dir()
-MODEL_PATH = MODELS_DIR / "ggml-base.en.bin"
+# The model that ships with Voisr; the default (kept for compat).
+MODEL_PATH = BUNDLED_DIR / "ggml-base.en.bin"
 
-# best available first: small.en is a large accuracy jump over base.en
-PREFERRED_MODELS = ["small.en", "base.en"]
+# Fallback order when the configured model is missing. base.en ships with
+# Voisr, so an install always finds it first; small.en only covers a
+# checkout set up with it alone. A model downloaded from Settings is never
+# chosen automatically: the person picks it with "Use".
+FALLBACK_MODELS = ["base.en", "small.en"]
 
 # Without this every dictation flashes a console window over the user's app.
 CREATE_NO_WINDOW = 0x08000000
@@ -20,8 +23,8 @@ class TranscriptionError(RuntimeError):
 
 def _timeout_for(wav_path) -> float:
     """A hung whisper-cli held the queue (and Quit) forever. Allow two
-    minutes plus twice the audio length: real CUDA runs take a
-    fraction of the audio length, so this only ever catches a hang."""
+    minutes plus twice the audio length: real CPU runs take a fraction of
+    the audio length, so this only ever catches a hang."""
     try:
         seconds = Path(wav_path).stat().st_size / 32000   # 16 kHz mono int16
     except OSError:
@@ -29,14 +32,25 @@ def _timeout_for(wav_path) -> float:
     return 120 + 2 * seconds
 
 
-def resolve_model(name: str | None = None, models_dir: Path = MODELS_DIR) -> Path:
-    """Best model on disk: the configured one, else small.en, else base.en."""
-    candidates = ([name] if name else []) + PREFERRED_MODELS
+def resolve_model(name: str | None = None, models_dir: Path | None = None,
+                  bundled_dir: Path | None = None) -> Path:
+    """Best model on disk: the configured one (a registry id or the name of a
+    custom ggml-<name>.bin), else base.en, else small.en.
+
+    With no models_dir, looks in the per-user downloads folder and then in
+    the models that ship with Voisr. With one, looks there (and in
+    bundled_dir, when given) only."""
+    if models_dir is None:
+        models_dir, bundled_dir = MODELS_DIR, BUNDLED_DIR
+    dirs = search_dirs(models_dir, bundled_dir)
+    candidates = ([name] if name else []) + FALLBACK_MODELS
     for n in candidates:
-        p = Path(models_dir) / f"ggml-{n}.bin"
-        if p.exists():
-            return p
-    return Path(models_dir) / f"ggml-{PREFERRED_MODELS[-1]}.bin"
+        for d in dirs:
+            p = d / filename_for(n)
+            if p.is_file():
+                return p
+    # Nothing at all: name where the default should be, for the error.
+    return dirs[-1] / filename_for(FALLBACK_MODELS[0])
 
 
 def transcribe(wav_path, model_path=None, whisper_bin=None, prompt=None) -> str:
@@ -54,7 +68,10 @@ def transcribe(wav_path, model_path=None, whisper_bin=None, prompt=None) -> str:
     out_prefix = str(wav_path) + ".out"
     cmd = [whisper, "-m", str(model), "-f", str(wav_path),
            "--output-txt", "--output-file", out_prefix, "--no-prints",
-           "--beam-size", "5"]
+           "--beam-size", "5",
+           # English only. A multilingual model (large-v3-turbo) would
+           # otherwise auto-detect and can transcribe in another language.
+           "-l", "en"]
     if prompt:
         cmd += ["--prompt", prompt]
     timeout = _timeout_for(wav_path)
