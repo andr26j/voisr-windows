@@ -1395,3 +1395,21 @@ def test_a_paste_function_that_cannot_report_still_gets_timings(tmp_path):
     api.start_recording()
     api.stop_recording(paste=True)
     assert {"paste", "total"} <= set(api._history.list()[0]["timings_ms"])
+
+
+def test_hooks_reach_a_paste_function_that_passes_keywords_on(tmp_path):
+    # a wrapper written as paste(text, **kwargs) must still get the paste
+    # check and the Ctrl+V timing, not lose them without a word
+    from voisr.ui import takes_keyword
+
+    def wrapper(text, **kwargs):
+        return True
+
+    def plain(text):
+        return True
+
+    assert takes_keyword(wrapper, "verifier") and takes_keyword(wrapper, "on_sent")
+    assert not takes_keyword(plain, "verifier")
+    assert not takes_keyword(None, "verifier")
+    api = make_api(tmp_path, paste_fn=wrapper)
+    assert api._paste_takes_verifier and api._paste_reports_sent

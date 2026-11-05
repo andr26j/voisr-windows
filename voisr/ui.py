@@ -144,6 +144,21 @@ def glossary_prompt(dictionary, context_terms=(), triggers=()) -> str | None:
     return _glossary_text(seen) if seen else None
 
 
+def takes_keyword(fn, name: str) -> bool:
+    """Can `fn` be called with `name=...`? A parameter of that name or a
+    **kwargs (how a wrapper passes keywords on) both count. A signature that
+    can't be read counts as no: the call then goes without the keyword, as
+    it did before the keyword existed."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.kind is p.VAR_KEYWORD
+               or (p.name == name and p.kind in (p.POSITIONAL_OR_KEYWORD,
+                                                 p.KEYWORD_ONLY))
+               for p in params)
+
+
 def capture_next_key(timeout: float = 8.0):
     """Block until the user presses any key; return (vk, label) or None."""
     vk = capture_next_vk(timeout)
@@ -351,11 +366,7 @@ class HotkeyService:
         self._api = api
         # Preloading the model is decided here, where the tap gate is known:
         # only a recording that is really a dictation loads it.
-        try:
-            takes_flag = "prewarm" in inspect.signature(
-                api.start_recording).parameters
-        except (TypeError, ValueError, AttributeError):
-            takes_flag = False
+        takes_flag = takes_keyword(getattr(api, "start_recording", None), "prewarm")
         self._start_kwargs = {"prewarm": False} if takes_flag else {}
         self._can_prewarm = callable(getattr(api, "prewarm_now", None))
         self._widget = widget
@@ -1212,14 +1223,12 @@ class Api:
         self._paste_fn = paste_fn
         # A paste function that reports when Ctrl+V went out lets the paste
         # timing stop there, not after the clipboard-restore wait.
-        try:
-            self._paste_reports_sent = "on_sent" in inspect.signature(
-                paste_fn).parameters
-            self._paste_takes_verifier = "verifier" in inspect.signature(
-                paste_fn).parameters
-        except (TypeError, ValueError):
-            self._paste_reports_sent = False
-            self._paste_takes_verifier = False
+        self._paste_reports_sent = takes_keyword(paste_fn, "on_sent")
+        self._paste_takes_verifier = takes_keyword(paste_fn, "verifier")
+        if ax_adapter is not None and not self._paste_takes_verifier:
+            # the screen can be read but the paste can't be checked: a missed
+            # paste would restore the old clipboard instead of keeping the text
+            _update_log("paste check off: the paste function takes no verifier")
         self._clipboard_fn = clipboard_fn
         self._save_dialog_fn = save_dialog_fn or _run_save_dialog
         self._timer_factory = timer_factory
