@@ -24,8 +24,10 @@ def self_test(report_path):
         import voisr.models  # noqa: F401
         import voisr.whisper_guard  # noqa: F401
         import voisr.whisper_server  # noqa: F401
+        import voisr.click_watch  # noqa: F401
+        import voisr.uia  # noqa: F401
         import certifi
-        from voisr.paths import app_icon, find_binary, models_dir, web_dir
+        from voisr.paths import app_icon, assets_dir, find_binary, models_dir, web_dir
 
         checks = {
             "whisper-cli": find_binary("whisper-cli"),
@@ -35,6 +37,8 @@ def self_test(report_path):
             "widget.html": (web_dir() / "widget.html").is_file(),
             "model": (models_dir() / "ggml-base.en.bin").is_file(),
             "icon": app_icon(),
+            # names on screen are told from words with it (voisr.common_words)
+            "word list": (assets_dir() / "words.gz").is_file(),
         }
         server = checks["whisper-server"]
         if server:
