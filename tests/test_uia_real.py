@@ -268,10 +268,14 @@ def test_a_hung_app_costs_the_read_within_the_budget(window, adapter, worker):
     except Exception:
         fields = None  # still waiting: unknown all the same
     elapsed = time.monotonic() - started
-    print(f"read during a hang: {fields!r} after {elapsed * 1000:.0f} ms")
     assert elapsed < 1.0
     assert fields is None or not fields.get("readable")
-    time.sleep(3.2)  # the window answers again for the tests after this
+    # and UIA's own timeouts ended the call, so the worker isn't wedged
+    finished = future.result(timeout=5)
+    took = time.monotonic() - started
+    assert not finished.get("readable"), finished
+    assert took < 1.5, f"the read itself took {took:.2f} s: UIA's timeouts didn't end it"
+    time.sleep(max(0.0, 3.3 - (time.monotonic() - started)))  # the window answers again
 
 
 @pytest.fixture
