@@ -1159,3 +1159,12 @@ def test_a_start_failure_is_logged_even_with_the_pill_disabled(monkeypatch):
     service.press()
     assert widget.calls == []
     assert len(logged) == 1
+
+
+def test_esc_cancels_a_key_capture_instead_of_becoming_the_key(tmp_path):
+    # in the Settings pop-up and first run, Esc means back out
+    api = make_api(tmp_path, capture_fn=lambda timeout: (0x1B, "VK 0x1B"))
+    api.set_config({"hotkey": "ctrl_r"})
+    assert api.capture_hotkey() == {"cancelled": True}
+    cfg = api.get_config()
+    assert "hotkey_vk" not in cfg and cfg["hotkey"] == "ctrl_r"

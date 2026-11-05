@@ -1214,8 +1214,9 @@ class Api:
 
     def capture_hotkey(self):
         """'Press any key' flow: suspend the live listener (so the pressed
-        key doesn't trigger a dictation), capture the next key, persist it,
-        and restart the listener on it."""
+        key doesn't trigger a dictation), capture the next key -- any key
+        except Esc, which cancels, since in the Settings pop-up Esc means back
+        out -- persist it, and restart the listener on it."""
         svc = self._hotkey_service
         if svc is not None:
             svc.stop()
@@ -1224,6 +1225,8 @@ class Api:
             if not got:
                 return {"error": "no key detected — click Change and press a key"}
             vk, label = got
+            if vk == ESC_VK:
+                return {"cancelled": True}
             self._update_config({"hotkey_vk": vk, "hotkey_label": label})
             return {"vk": vk, "label": label}
         finally:
