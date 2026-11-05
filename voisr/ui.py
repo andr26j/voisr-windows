@@ -41,7 +41,7 @@ from voisr.updater import UpdateChecker
 # sys.stdout is None and print() is a silent no-op. Shared with updater.py
 # so both halves of an update failure land in the same file.
 from voisr.updater import _log as _update_log
-from voisr.window_chrome import apply_chrome
+from voisr.window_chrome import apply_chrome, launch_background
 
 WEB_DIR = _web_dir()
 WINDOW_TITLE = "Voisr"
@@ -238,6 +238,17 @@ def _system_prefers_dark() -> bool:
         return value == 0
     except Exception:
         return True
+
+
+def _window_background(api):
+    """The window's colour before the page's first paint: the sidebar's, so
+    nothing flashes white in dark mode. Cosmetic, so a config that can't be
+    read must not stop startup."""
+    try:
+        appearance = api.get_config().get("appearance", "system")
+    except Exception:
+        appearance = "system"
+    return launch_background(appearance, _system_prefers_dark)
 
 
 def _run_save_dialog(suggested_name: str):
@@ -1880,7 +1891,8 @@ def main():
         # No js_api: see bridge_functions
         window = webview.create_window(
             WINDOW_TITLE, str(WEB_DIR / "index.html"),
-            width=1060, height=700, min_size=(900, 620))
+            width=1060, height=700, min_size=(900, 620),
+            background_color=_window_background(api))
         window.expose(*bridge_functions(api))
         api.attach_window(window)
 
