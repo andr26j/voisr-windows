@@ -43,6 +43,26 @@ jobs:
       - name: Tests
         run: python -m pytest -m "not slow" -q -p no:cacheprovider -rs --durations=15
 
+      # The kept-loaded server for real: whisper-server.exe from the release
+      # zip, the base.en model (shared cache with the build job) and
+      # whisper.cpp's own speech sample.
+      - name: Cache the Whisper model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: whisper-models-base-en-v1
+
+      - name: Real whisper-server tests
+        run: |
+          .\scripts\fetch_whisper.ps1 -Destination bin
+          if (-not (Test-Path models\ggml-base.en.bin)) {
+            New-Item -ItemType Directory -Force models | Out-Null
+            Invoke-WebRequest -Uri https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin -OutFile models\ggml-base.en.bin
+          }
+          $env:VOISR_TEST_WAV = "$env:RUNNER_TEMP\jfk.wav"
+          Invoke-WebRequest -Uri https://raw.githubusercontent.com/ggml-org/whisper.cpp/v1.9.1/samples/jfk.wav -OutFile $env:VOISR_TEST_WAV
+          python -m pytest tests/test_whisper_server_real.py -q -p no:cacheprovider -rs -s
+
   build:
     needs: test
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')

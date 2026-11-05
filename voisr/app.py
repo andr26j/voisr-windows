@@ -35,6 +35,7 @@ DEFAULT_CONFIG = {
     "appearance": "system",
     "check_for_updates": True,
     "dismissed_banners": [],
+    "model_unload": "min5",
 }
 
 
@@ -59,6 +60,11 @@ def _is_vk(v):
     return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 0xFFFF
 
 
+def _is_unload(v):
+    from voisr.whisper_server import valid_unload
+    return valid_unload(v)
+
+
 def _is_dictionary(v):
     return isinstance(v, dict) and all(
         isinstance(k, str) and k and isinstance(w, str) for k, w in v.items())
@@ -74,7 +80,7 @@ CONFIG_VALIDATORS = {
     "pill_theme": _is_str, "pill_color": _is_optional_str,
     "appearance": _is_str, "launch_at_login": _is_bool,
     "model": _is_optional_str, "hotkey_vk": _is_vk, "hotkey_label": _is_str,
-    "check_for_updates": _is_bool,
+    "check_for_updates": _is_bool, "model_unload": _is_unload,
     # the page banners (Dictionary, Snippets) someone closed, by name
     "dismissed_banners": _is_str_list,
     # not in DEFAULT_CONFIG: missing means first run hasn't been decided yet

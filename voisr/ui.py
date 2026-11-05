@@ -8,7 +8,9 @@ dedicated Windows module is imported rather than re-implemented:
 `voisr.window_chrome` (DWM dark titlebar), `voisr.launch_agent` (per-user Run
 key), and `voisr.status_item` (the tray icon).
 """
+import atexit
 import functools
+import inspect
 import json
 import os
 import threading
@@ -318,6 +320,15 @@ class HotkeyService:
                  timer_factory=None, key_state=None,
                  stale_interval=STALE_CHECK_S):
         self._api = api
+        # Preloading the model is decided here, where the tap gate is known:
+        # only a recording that is really a dictation loads it.
+        try:
+            takes_flag = "prewarm" in inspect.signature(
+                api.start_recording).parameters
+        except (TypeError, ValueError, AttributeError):
+            takes_flag = False
+        self._start_kwargs = {"prewarm": False} if takes_flag else {}
+        self._can_prewarm = callable(getattr(api, "prewarm_now", None))
         self._widget = widget
         self._hide_delay = hide_delay
         self._permissions_check = permissions_check
@@ -484,7 +495,7 @@ class HotkeyService:
             self._spawn_finish(*finish)
             return
         try:
-            result = self._api.start_recording()
+            result = self._api.start_recording(**self._start_kwargs)
         except Exception as error:
             result = {"error": str(error)}
         except BaseException:
@@ -497,6 +508,7 @@ class HotkeyService:
         pane = None
         refused = False
         learn = False
+        preload = None   # (epoch, seconds until the press outlives the gate, toggle)
         with self._state_lock:
             self._starting = False
             released, cancelled = self._start_released, self._start_cancelled
@@ -538,6 +550,12 @@ class HotkeyService:
                                   else self._release_held(self._start_released_at))
                     else:
                         learn = not self._latched
+                        if self._can_prewarm:
+                            wait = 0.0
+                            if not self._latched and self._tap_gate_s:
+                                wait = max(0.0, (self._pressed_at or 0)
+                                           + self._tap_gate_s - self._clock())
+                            preload = (epoch, wait, self._latched)
         if refused:
             if pane is not None:
                 try:
@@ -551,6 +569,34 @@ class HotkeyService:
             self._spawn_finish(*finish)
         elif learn:
             self._learn_key_state()
+        if preload is not None and finish is None and not cancelled:
+            self._schedule_preload(*preload)
+
+    def _schedule_preload(self, epoch, wait, toggle) -> None:
+        """Load the model once this recording is known to be a dictation: at
+        once for a toggle (hands-free from the start), else when the held key
+        outlives the tap gate. Called outside _state_lock."""
+        if toggle or wait <= 0:
+            self._preload_if_current(epoch)
+            return
+        timer = self._timer_factory(wait, lambda: self._preload_if_current(epoch))
+        timer.start()
+
+    def _preload_if_current(self, epoch) -> None:
+        """Timer thread. Skips a press that was released, dropped as a tap,
+        or is still a pending tap; asks the Api outside _state_lock."""
+        with self._state_lock:
+            real = (self._pressed and self._epoch == epoch
+                    and self._pending is None and not self._starting)
+        if real:
+            self._preload()
+
+    def _preload(self) -> None:
+        if self._can_prewarm:
+            try:
+                self._api.prewarm_now()   # spawns its own thread
+            except Exception:
+                pass
 
     def _settle_pending(self, at) -> bool:
         """A press while a quick tap waits. Within the tap gate it makes the
@@ -570,6 +616,7 @@ class HotkeyService:
                 self._drop_chord(self._epoch)
         if latched:
             _log("hands-free on (double-tap)")
+            self._preload()   # a real hands-free dictation: load the model now
             return True
         self._api._cancel_recording()
         return False
@@ -1072,14 +1119,34 @@ class Api:
                  save_dialog_fn=None,
                  timer_factory=threading.Timer,
                  exit_fn=None,
-                 mic_check=None):
+                 mic_check=None,
+                 models_dir=None, model_downloader=None, system_info_fn=None,
+                 bundled_models_dir=None, warm_server=None):
         self._config_path = Path(config_path) if config_path else default_config_path()
+        # Kept-loaded whisper-server; None = every dictation uses whisper-cli
+        # (tests and the CLI paths that don't set one up).
+        self._warm = warm_server
+        # None = the per-user downloads folder plus the models that ship with
+        # Voisr (models.MODELS_DIR, models.BUNDLED_DIR). A test passes its own
+        # folder, and only that folder (and bundled_models_dir) is used.
+        self._models_dir = models_dir
+        self._bundled_models_dir = bundled_models_dir
+        self._model_downloader = model_downloader
+        self._model_downloader_lock = threading.Lock()
+        self._system_info_fn = system_info_fn
         self._history = history or HistoryStore(self._config_path.parent / "history.jsonl")
         self._transcribe_fn = transcribe_fn
         self._clock = clock
         self._hotkey_service = hotkey_service
         self._capture_fn = capture_fn
         self._paste_fn = paste_fn
+        # A paste function that reports when Ctrl+V went out lets the paste
+        # timing stop there, not after the clipboard-restore wait.
+        try:
+            self._paste_reports_sent = "on_sent" in inspect.signature(
+                paste_fn).parameters
+        except (TypeError, ValueError):
+            self._paste_reports_sent = False
         self._clipboard_fn = clipboard_fn
         self._save_dialog_fn = save_dialog_fn or _run_save_dialog
         self._timer_factory = timer_factory
@@ -1087,6 +1154,7 @@ class Api:
         # None = no check, so tests never probe the machine's real privacy
         # settings
         self._mic_check = mic_check
+        self._mic_heard = False  # a clip this launch held real audio
         # Both None until the matching attach_*(): a headless or test Api has
         # no updater and no window, and every method below tolerates that.
         self._updates = None
@@ -1123,14 +1191,89 @@ class Api:
         )
 
     def _default_transcribe(self, wav, cfg):
-        """Transcribe with the release-time model and dictionary prompt."""
-        from voisr.transcriber import resolve_model, transcribe as _transcribe
-        return _transcribe(wav, model_path=resolve_model(cfg.get("model")),
-                           prompt=glossary_prompt(cfg.get("dictionary")))
+        """Transcribe with the release-time model and dictionary prompt.
+        Returns (text, info): see transcriber.transcribe_routed."""
+        from voisr.transcriber import resolve_model, transcribe_routed
+        unload = self.get_config().get("model_unload", "min5")
+        if self._warm is not None:
+            self._warm.configure(unload)
+        return transcribe_routed(
+            wav, resolve_model(cfg.get("model"), *self._model_dirs()),
+            prompt=glossary_prompt(cfg.get("dictionary")),
+            server=self._warm,
+            # the setting now, not the one the dictation began under: a
+            # queued dictation must not undo a change made in Settings since
+            unload=unload)
+
+    PREWARM_DELAY_S = 0.3   # for callers with no tap gate (the dashboard)
+
+    def prewarm_now(self):
+        """Start loading the model in the background, without waiting. Called
+        once a recording is known to be a real dictation: HotkeyService does
+        so when a press outlives its tap gate, when a double-tap latches
+        hands-free, and at a toggle start. Own thread, so the hotkey path
+        never waits for it and it can never raise into it."""
+        warm = self._warm
+        if warm is None:
+            return
+
+        def go():
+            try:
+                from voisr.transcriber import resolve_model
+                cfg = self.get_config()
+                warm.prewarm(resolve_model(cfg.get("model"), *self._model_dirs()),
+                             unload=cfg.get("model_unload", "min5"))
+            except Exception as error:
+                _update_log(f"model preload skipped: {error}")
+
+        threading.Thread(target=go, name="voisr-prewarm", daemon=True).start()
+
+    def _prewarm_later(self, sequence):
+        """A recording started with no hotkey gate in front of it: preload
+        after PREWARM_DELAY_S unless it has ended by then."""
+        if self._warm is None:
+            return
+
+        def wait_then_go():
+            if self.PREWARM_DELAY_S:
+                time.sleep(self.PREWARM_DELAY_S)
+            if self._active_sequence != sequence:
+                return   # released or cancelled meanwhile
+            self.prewarm_now()
+
+        threading.Thread(target=wait_then_go, name="voisr-prewarm-wait",
+                         daemon=True).start()
+
+    def _model_name(self, cfg):
+        """Model that transcribed this clip, or None when a test or caller
+        injected its own transcribe function and no model was involved."""
+        if self._transcribe_fn is not None:
+            return None
+        from voisr.models import id_from_path
+        from voisr.transcriber import resolve_model
+        return id_from_path(resolve_model(cfg.get("model"), *self._model_dirs()))
+
+    def _record_delivery_timings(self, item, t_start, paste_started, paste_sent=None):
+        """Best effort, after delivery: the paste has already happened and the
+        history line already exists, so a failure here costs only the numbers.
+        paste_sent is when Ctrl+V went out; the clipboard-restore wait after
+        it (inject.PASTE_GRACE_S) is not time the user waited for their text.
+        When the paste function doesn't report it, fall back to now."""
+        if item is None:
+            return
+        now = paste_sent if paste_sent is not None else self._clock()
+        timings = {"total": (now - t_start) * 1000}
+        if paste_started is not None:
+            timings["paste"] = (now - paste_started) * 1000
+        try:
+            self._history.merge_timings(item["id"], timings)
+        except Exception as error:
+            _update_log(f"history: timings not recorded: {error}")
 
     def _transcribe_audio(self, wav, cfg):
+        """(raw text, info) where info has the mode and any extra timings."""
         if self._transcribe_fn is not None:
-            return self._transcribe_fn(wav)
+            return self._transcribe_fn(wav), {"mode": None, "timings": {}}
         return self._default_transcribe(wav, cfg)
 
     def current_level(self):
@@ -1186,6 +1329,9 @@ class Api:
             else:
                 self._sessions_in_flight.discard(sequence)
             busy = bool(self._sessions_in_flight)
+            if self._warm is not None:
+                # holds off the idle unload from key down to the last paste
+                self._warm.set_busy(busy)
             status = self._status_item
             if status is None or busy == self._glyph_busy:
                 return
@@ -1248,20 +1394,28 @@ class Api:
         duration = max((session.released_at - session.started_at), 0.1)
         # Some audio but too little is a tap, not a mic fault. No audio at
         # all still falls through to the permission message below.
-        if 0 < wav_seconds(wav) < MIN_SPEECH_S:
+        seconds = wav_seconds(wav)
+        if 0 < seconds < MIN_SPEECH_S:
+            _update_log(f"audio: clip {seconds:.2f} s, too short")
             return SessionResult.failure(
                 session.sequence, "audio",
                 "too short — hold the key while you speak")
         if not wav.exists() or wav.stat().st_size < 1000:
+            _update_log("audio: no usable recording")
             detail = session.capture_stderr.strip()[:120]
             return SessionResult.failure(
                 session.sequence, "audio",
                 f"recording failed (mic permission?) {detail}".rstrip())
         span = speech_gate.gate_wav(wav)  # None: unreadable, skip the gate
+        # Measurements only, never what was said: the evidence the gate's
+        # limits are tuned from. voisr.log, since print() is silent in the
+        # windowed build.
+        _update_log(f"audio: {speech_gate.describe(span, seconds)}")
         if span is not None:
             if span.verdict == "all_zeros":
                 return SessionResult.failure(
                     session.sequence, "audio", MIC_SILENT_MESSAGE)
+            self._mic_heard = True
             if span.verdict == "no_speech":
                 return SessionResult.failure(
                     session.sequence, "audio", NO_SPEECH_MESSAGE)
@@ -1272,9 +1426,12 @@ class Api:
             except Exception as error:
                 # an untrimmed clip still transcribes
                 _update_log(f"audio: trim failed: {error}")
+        t_start = self._clock()
         try:
-            raw = self._transcribe_audio(wav, cfg)
+            raw, info = self._transcribe_audio(wav, cfg)
+            t_transcribed = self._clock()
             text = clean(raw, dictionary=cfg.get("dictionary", {}))
+            t_cleaned = self._clock()
         except Exception as error:
             return SessionResult.failure(
                 session.sequence, "transcription",
@@ -1287,7 +1444,14 @@ class Api:
         item = None
         warning = None
         try:
-            item = self._history.add(text, duration_s=duration)
+            # Written before pasting so the dictation is durable whatever
+            # the paste does. Paste and total are merged in afterwards.
+            item = self._history.add(
+                text, duration_s=duration, model=self._model_name(cfg),
+                mode=info["mode"],
+                timings_ms={"transcribe": (t_transcribed - t_start) * 1000,
+                            "cleanup": (t_cleaned - t_transcribed) * 1000,
+                            **info["timings"]})
             self._notify_dictation()
         except Exception as error:
             warning = f"history failed: {error}"[:250]
@@ -1296,7 +1460,10 @@ class Api:
         paste_error = None
         fallback_safe = True
         typing_generation = None
+        paste_started = None
+        paste_sent = [None]  # clock reading when the paste function sent Ctrl+V
         if session.paste_requested and cfg.get("paste") and not self._quitting:
+            paste_started = self._clock()
             with self._paste_state_lock:
                 typing_generation = self._typing_generation
                 join = (
@@ -1306,7 +1473,10 @@ class Api:
                     and not self._last_paste_text[-1].isspace()
                 )
             try:
-                pasted = self._paste_fn((" " if join else "") + text)
+                pasted = self._paste_fn(
+                    (" " if join else "") + text,
+                    **({"on_sent": lambda: paste_sent.__setitem__(0, self._clock())}
+                       if self._paste_reports_sent else {}))
             except PasteDeliveryError as error:
                 pasted = error.pasted
                 fallback_safe = error.fallback_safe
@@ -1328,6 +1498,8 @@ class Api:
             except Exception as error:
                 clipboard_error = error
 
+        self._record_delivery_timings(item, t_start, paste_started, paste_sent[0])
+
         fields = {"text": text, "copied": copied, "pasted": pasted}
         if item is not None:
             fields["item"] = item
@@ -1345,7 +1517,8 @@ class Api:
                 f"delivery failed: {detail}"[:250], **fields)
         return SessionResult.success(session.sequence, **fields)
 
-    def start_recording(self):
+    def start_recording(self, prewarm=True):
+        """prewarm=False: the caller (HotkeyService) decides when to preload."""
         if self._mic_check is not None:
             try:
                 mic = self._mic_check()
@@ -1361,6 +1534,8 @@ class Api:
         self._active_sequence = session.sequence
         self._is_recording = True
         self._mark_session(session.sequence, True)
+        if prewarm:
+            self._prewarm_later(session.sequence)
         return {"recording": True, "session_id": session.sequence}
 
     def _release_recording(self, paste=False):
@@ -1395,7 +1570,11 @@ class Api:
         # words and go to History), but nothing may paste or touch the
         # clipboard after the user has left the app.
         self._quitting = True
+        if self._model_downloader is not None:
+            self._model_downloader.cancel()  # its .part stays, to resume
         self._recordings.close()
+        if self._warm is not None:
+            self._warm.shutdown()
         if self._status_item is not None:
             self._status_item.release()
 
@@ -1545,12 +1724,28 @@ class Api:
         if errors:
             return {"error": "; ".join(errors)}
         with self._config_lock:
-            old_hotkey = self.get_config().get("hotkey")
+            old_cfg = self.get_config()
+            old_hotkey = old_cfg.get("hotkey")
             cfg = self._update_config(updates)
+        self._apply_warm_settings(old_cfg, cfg)
         new_hotkey = cfg.get("hotkey")
         if self._hotkey_service and new_hotkey != old_hotkey:
             self._hotkey_service.restart(new_hotkey)
         return cfg
+
+    def _apply_warm_settings(self, old_cfg, cfg):
+        """A different model must not stay loaded (it holds hundreds of MB
+        and the next dictation would use the wrong one); a new unload choice
+        takes effect now."""
+        if self._warm is None:
+            return
+        try:
+            if cfg.get("model") != old_cfg.get("model"):
+                self._warm.unload()
+            if cfg.get("model_unload") != old_cfg.get("model_unload"):
+                self._warm.configure(cfg.get("model_unload", "min5"))
+        except Exception as error:
+            _update_log(f"warm model settings not applied: {error}")
 
     def get_hotkey_options(self):
         # voisr.keys.hotkey_options() returns {"name", "label"}; the JS
@@ -1603,7 +1798,18 @@ class Api:
                 "health": getattr(svc, "health", "off")}
 
     def get_permissions(self):
-        return {"panes": permissions.states()}
+        return {"panes": self._with_mic_heard(permissions.states())}
+
+    def _with_mic_heard(self, panes):
+        """The probe can't always tell: the registry switches may be unset
+        and opening a stream can fail while the device is busy. Real audio
+        settles it, since a switched-off or dead mic sends only zeros. Only
+        an unknown is overruled, never a known refusal."""
+        if self._mic_heard:
+            for pane in panes:
+                if pane["key"] == "microphone" and pane["granted"] is None:
+                    pane["granted"] = True
+        return panes
 
     def open_settings_pane(self, key):
         return {"ok": permissions.open_pane(key)}
@@ -1652,18 +1858,76 @@ class Api:
             return {"error": str(e)}
         return {"ok": True, "removed": removed}
 
+    def _model_dirs(self):
+        """(downloads folder, bundled folder or None), read at call time so a
+        test can point models.MODELS_DIR elsewhere."""
+        if self._models_dir is None:
+            from voisr import models
+            return models.MODELS_DIR, models.BUNDLED_DIR
+        bundled = self._bundled_models_dir
+        return Path(self._models_dir), Path(bundled) if bundled else None
+
+    def _downloader(self):
+        from voisr.models import ModelDownloader
+        with self._model_downloader_lock:
+            if self._model_downloader is None:
+                models_dir, bundled = self._model_dirs()
+                self._model_downloader = ModelDownloader(models_dir,
+                                                         bundled_dir=bundled)
+            return self._model_downloader
+
+    def _system_info(self):
+        from voisr.models import system_info
+        return (self._system_info_fn or system_info)()
+
+    def _active_model_id(self):
+        from voisr.models import id_from_path
+        from voisr.transcriber import resolve_model
+        p = resolve_model(self.get_config().get("model"), *self._model_dirs())
+        return id_from_path(p) if p.is_file() else None
+
     def get_models(self):
-        from voisr.transcriber import MODELS_DIR, PREFERRED_MODELS
-        labels = {"small.en": "Small — best accuracy",
-                  "base.en": "Base — fastest"}
-        models = []
-        for name in PREFERRED_MODELS:
-            path = MODELS_DIR / f"ggml-{name}.bin"
-            installed = path.exists()
-            models.append({"value": name, "label": labels.get(name, name),
-                           "installed": installed,
-                           "bytes": path.stat().st_size if installed else 0})
-        return {"models": models, "active": self.get_config().get("model")}
+        """Settings' model list: every registry model and any custom file,
+        what's installed and in use, this PC's processor and memory, and the
+        current or last download. Rows with "bundled" ship with Voisr."""
+        from voisr.models import list_models
+        system = self._system_info()
+        active = self._active_model_id()
+        models_dir, bundled = self._model_dirs()
+        return {"models": list_models(models_dir, system, active, bundled_dir=bundled),
+                "active": active, "system": system,
+                "download": self._downloader().progress()}
+
+    def download_model(self, model_id):
+        return self._downloader().start(model_id, self._system_info())
+
+    def get_download_progress(self):
+        return self._downloader().progress()
+
+    def delete_model(self, model_id):
+        from voisr.models import delete_file, installed_paths, is_bundled
+        models_dir, bundled = self._model_dirs()
+        installed = installed_paths(models_dir, bundled)
+        path = installed.get(model_id)
+        if path is None:
+            return {"error": "That model isn't installed."}
+        if is_bundled(path, bundled):
+            return {"error": "That model comes with Voisr, so it can't be deleted."}
+        if len(installed) <= 1:
+            return {"error": "It's the only model installed; "
+                             "dictation needs at least one."}
+        if model_id == self._active_model_id():
+            return {"error": "That model is in use. Pick another one first."}
+        if self._warm is not None:
+            self._warm.forget_model(path)  # a loaded copy would outlive the file
+        try:
+            delete_file(path)
+        except PermissionError:
+            return {"error": "Windows says that file is in use. "
+                             "Try again in a moment."}
+        except OSError as e:
+            return {"error": str(e)}
+        return {"ok": True}
 
     def set_launch_at_login(self, enabled):
         try:
@@ -1854,7 +2118,8 @@ class Api:
 # tests/test_js_bridge_surface.py pins this to the V.api() calls in voisr/web/js.
 BRIDGE_METHODS = (
     "capture_hotkey", "check_for_updates_now", "clear_history", "copy_text",
-    "delete_history_item", "export_history", "get_config", "get_first_run", "get_history",
+    "delete_history_item", "delete_model", "download_model", "export_history",
+    "get_config", "get_download_progress", "get_first_run", "get_history",
     "get_hotkey_status", "get_level", "get_models", "get_permissions",
     "get_pill_themes", "get_stats", "get_update_status", "hotkey_display",
     "install_update", "open_settings_pane", "restore_history_item",
@@ -1891,6 +2156,20 @@ def start_hotkey_service(service):
     return None
 
 
+def make_warm_server():
+    """The kept-loaded whisper-server manager. Never raises: without it Voisr
+    just uses whisper-cli. Nothing to clean up from an earlier run: a server
+    can't outlive the Voisr that started it (voisr.whisper_guard)."""
+    try:
+        from voisr.whisper_server import WhisperServer
+        server = WhisperServer()
+        atexit.register(server.shutdown)  # normal interpreter exits
+        return server
+    except Exception as error:
+        _update_log(f"kept-loaded model unavailable: {error}")
+        return None
+
+
 def main():
     import webview
 
@@ -1904,7 +2183,8 @@ def main():
     updates = None
     try:
         set_app_user_model_id()
-        api = Api(mic_check=permissions.microphone_switch)
+        api = Api(mic_check=permissions.microphone_switch,
+                  warm_server=make_warm_server())
         # settled before anything can write config.json, which would make a
         # fresh install look like an existing one
         try:

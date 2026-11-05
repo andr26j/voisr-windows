@@ -1,6 +1,7 @@
 """PyInstaller entry point. A separate script (not voisr/ui.py itself) so
 the frozen build imports voisr as a package rather than running ui.py as a
 bare top-level script."""
+import os
 import sys
 
 
@@ -18,15 +19,32 @@ def self_test(report_path):
         import webview  # noqa: F401
         import voisr.ui  # noqa: F401 -- pulls in every runtime module
         import voisr.updater  # noqa: F401
+        # imported inside functions only: a missing one would fail at the
+        # first download or dictation, not at startup
+        import voisr.models  # noqa: F401
+        import voisr.whisper_guard  # noqa: F401
+        import voisr.whisper_server  # noqa: F401
+        import certifi
         from voisr.paths import app_icon, find_binary, models_dir, web_dir
 
         checks = {
             "whisper-cli": find_binary("whisper-cli"),
+            "whisper-server": find_binary("whisper-server"),
+            "certifi": os.path.isfile(certifi.where()) and certifi.where(),
             "index.html": (web_dir() / "index.html").is_file(),
             "widget.html": (web_dir() / "widget.html").is_file(),
             "model": (models_dir() / "ggml-base.en.bin").is_file(),
             "icon": app_icon(),
         }
+        server = checks["whisper-server"]
+        if server:
+            # loads its DLLs from bin\ and exits 0: a DLL missing from the
+            # bundle would show here as 0xc0000135
+            import subprocess
+            code = subprocess.run([server, "--help"], capture_output=True,
+                                  timeout=60, creationflags=0x08000000).returncode
+            lines.append(f"whisper-server --help: exit code {code:#x}")
+            checks["whisper-server starts"] = code == 0
         for name, value in checks.items():
             lines.append(f"{name}: {value}")
             ok = ok and bool(value)

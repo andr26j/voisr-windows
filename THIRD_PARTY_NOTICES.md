@@ -7,10 +7,13 @@ assumed.
 
 ## Bundled binaries / weights (ship inside the installer)
 
-### whisper.cpp (`whisper-cli.exe` and the `whisper-blas-bin-x64` build)
+### whisper.cpp (`whisper-cli.exe`, `whisper-server.exe` and the `whisper-blas-bin-x64` build)
 - **Licence:** MIT
 - **Verified at:** https://raw.githubusercontent.com/ggml-org/whisper.cpp/master/LICENSE
   ("MIT License / Copyright (c) 2023-2026 The ggml authors")
+- **Use:** both programs come from the same v1.9.1 release zip and run as
+  separate processes. `whisper-server.exe` (the kept-loaded model) is reached
+  only over 127.0.0.1.
 
 ### ggml-base.en.bin (Whisper `base.en` model weights)
 - **Licence:** MIT
@@ -68,6 +71,16 @@ assumed.
   > ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
   > OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+## Downloaded on request (not in the installer)
+
+### ggml-small.en.bin, ggml-medium.en-q5_0.bin, ggml-large-v3-turbo-q5_0.bin
+- **Licence:** MIT, as `ggml-base.en.bin` above: the same repository and the
+  same OpenAI Whisper weights, converted (and for the last two, quantized to
+  5 bits) by the whisper.cpp author.
+- **Verified at:** https://huggingface.co/ggerganov/whisper.cpp (`license: mit`,
+  checked 2026-11-03). Downloaded from there only when the user clicks
+  Download in Settings → Models, into `%LOCALAPPDATA%\Voisr\models`.
+
 ## Python packages (runtime dependencies, importable in the frozen build)
 
 ### pywebview
@@ -106,6 +119,15 @@ assumed.
 - **Verified at:** `pip show pillow` in the project venv
   (`License-Expression: MIT-CMU`).
 
+### certifi (2026.1.4)
+- **Licence:** MPL-2.0
+- **Verified at:** https://github.com/certifi/python-certifi (LICENSE) and the
+  package metadata of the pinned version.
+- **Use:** its CA bundle (`cacert.pem`) is added to the Windows certificate
+  store for model downloads. Shipped unmodified; MPL-2.0 is file-level
+  copyleft and asks only that the source of the covered files stay available,
+  which it is at the address above.
+
 ## Summary
 
 | Component | Licence | Redistribution concern |
@@ -122,7 +144,10 @@ assumed.
 | sounddevice | MIT | None |
 | pystray | LGPLv3 | None — LGPL permits bundling; source link provided above |
 | Pillow | MIT-CMU | None |
+| certifi | MPL-2.0 | None — unmodified; source link provided above |
+| small.en / medium.en-q5_0 / large-v3-turbo-q5_0 (downloaded) | MIT | None — not redistributed by Voisr |
 
 No component blocks distribution to a company. All licences are permissive
-(MIT/BSD/zlib/PSF/ISC, and the OFL for the font), and the one copyleft component (pystray, LGPLv3) is used
-in a way LGPL explicitly allows for proprietary applications.
+(MIT/BSD/zlib/PSF/ISC, and the OFL for the font), and the two copyleft
+components (pystray, LGPLv3; certifi, MPL-2.0) are used unmodified, in a way
+their licences explicitly allow for proprietary applications.
