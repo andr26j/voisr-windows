@@ -37,6 +37,12 @@ from voisr.filelock import FileLock
 
 TYPING_WPM = 40  # the baseline Time saved is measured against
 
+# What may be added to a record after it is written: a verdict, an app id, a
+# count. Never text from another app; see merge_fields.
+_MERGEABLE_FIELDS = {"app": str, "delivery": str, "delivery_reason": str,
+                     "edit_end_reason": str, "words_corrected": int}
+_MERGED_STR_MAX = 200
+
 # Windows Defender and the search indexer can hold a history file open for a
 # moment right after it is written, surfacing as PermissionError/WinError 5 on
 # both the read and the commit. It is external and momentary, not corruption,
@@ -82,6 +88,23 @@ def _finite_timestamp_number(value) -> bool:
         return math.isfinite(float(value))
     except OverflowError:
         return False
+
+
+def _clean_timings(timings: dict) -> dict:
+    """Whole milliseconds, finite and nonnegative; anything else is dropped."""
+    return {str(k): int(round(v)) for k, v in timings.items()
+            if _finite_number(v) and v >= 0}
+
+
+def _clean_fields(fields: dict) -> dict:
+    """Only the known fields, of the right type; anything else is dropped."""
+    clean = {}
+    for key, value in fields.items():
+        kind = _MERGEABLE_FIELDS.get(key)
+        if kind is None or type(value) is not kind:
+            continue
+        clean[key] = value[:_MERGED_STR_MAX] if kind is str else value
+    return clean
 
 
 def _valid_record(item) -> bool:
@@ -185,17 +208,59 @@ class HistoryStore:
             self._write_atomic(items)
             return result
 
-    def add(self, text: str, duration_s: float) -> dict:
+    def add(self, text: str, duration_s: float, model: str | None = None,
+            timings_ms: dict | None = None, mode: str | None = None,
+            snippet: bool = False) -> dict:
+        """`model` and `timings_ms` are optional: lines written before they
+        existed stay valid and readers must treat both as possibly absent.
+        `mode` is how it was transcribed, when the transcriber says.
+        `snippet`: `text` is the trigger that was said, not what was pasted."""
         if not _finite_number(duration_s) or duration_s < 0:
             raise ValueError("duration_s must be a finite, nonnegative number")
         item = {"id": uuid.uuid4().hex, "ts": time.time(),
                 "text": text, "words": len(text.split()), "duration_s": duration_s}
+        if model:
+            item["model"] = str(model)
+        if mode:
+            item["mode"] = str(mode)
+        if snippet:
+            item["snippet"] = True
+        if timings_ms:
+            item["timings_ms"] = _clean_timings(timings_ms)
 
         def append(items):
             items.append(item)
             return item
 
         return self._mutate(append)
+
+    def merge_timings(self, item_id: str, timings_ms: dict) -> bool:
+        return self.merge_fields(item_id, timings_ms=timings_ms)
+
+    def merge_fields(self, item_id: str, *, timings_ms: dict | None = None,
+                     fields: dict | None = None) -> bool:
+        """Add later-stage timings (paste, total, verify) and delivery details
+        (see _MERGEABLE_FIELDS) to a record already on disk. All optional, and
+        readers must treat them as possibly absent. A record deleted in the
+        meantime is not brought back. Returns whether anything was written."""
+        extra = _clean_timings(timings_ms or {})
+        details = _clean_fields(fields or {})
+
+        def merge(items):
+            for item in items:
+                if item["id"] == item_id:
+                    if extra:
+                        item["timings_ms"] = {**item.get("timings_ms", {}), **extra}
+                    item.update(details)
+                    return True
+            return False
+
+        with self._mutation_lock():
+            items = self._read()
+            if not merge(items):
+                return False
+            self._write_atomic(items)
+            return True
 
     def list(self) -> list[dict]:
         return sorted(self._read(), key=lambda i: i["ts"], reverse=True)
