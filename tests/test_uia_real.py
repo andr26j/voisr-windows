@@ -247,6 +247,26 @@ def test_element_ids_are_stable_for_one_box_and_differ_between_boxes(window, ada
         window["edit"], BUDGET_S)))[2] == window["pid"]
 
 
+def test_a_field_read_fits_the_paste_checks_budget_on_an_idle_desktop(window, adapter, worker):
+    """The paste check reads the field once with 150 ms to do it in. A busy
+    machine can miss that and the read is then unknown; an idle one has room."""
+    from voisr.paste_verify import VERIFY_BUDGET_S
+
+    edit = window["edit"]
+    set_text(edit, "")
+    type_into(edit, "a few words to read back")
+    read(worker, adapter, edit)  # the first read of a window sets UIA up
+    took = []
+    for _ in range(20):
+        started = time.monotonic()
+        fields = read(worker, adapter, edit, budget=VERIFY_BUDGET_S)
+        took.append(time.monotonic() - started)
+        assert fields["readable"], fields
+    took.sort()
+    print(f"field reads: median {took[10] * 1000:.1f} ms, max {took[-1] * 1000:.1f} ms")
+    assert took[10] < VERIFY_BUDGET_S / 2
+
+
 def test_a_hung_app_costs_the_read_within_the_budget(window, adapter, worker):
     """The box's thread sleeps 3 s. The paste check's read must come back in
     its budget, and as unknown, not as an empty or unchanged field."""
