@@ -303,8 +303,12 @@ class WhisperServer:
                 self._ensure_loading_locked(model_path)
                 left = deadline - self._clock()
                 if left <= 0:
-                    self._fail_locked()
-                    raise ServerError("server not ready in time")
+                    # This dictation goes through whisper-cli, but the load
+                    # carries on under its own, longer limit (ready_timeout),
+                    # so the next one finds the model loaded. Stopping it here
+                    # meant a model slower to load than this wait never got
+                    # warm: every release killed it and started a cooldown.
+                    raise ServerError("server still loading; using whisper-cli")
                 self._cond.wait(min(left, 0.25))
             proc.inflight += 1
             port = proc.port
@@ -402,12 +406,6 @@ class WhisperServer:
              f"{self._cooldown:.0f} s")
         if detached is not None:
             detached.stop()
-
-    def _fail_locked(self) -> None:
-        self._failed_at = self._clock()
-        detached = self._detach_locked()
-        if detached is not None:
-            threading.Thread(target=detached.stop, daemon=True).start()
 
     def _ensure_loading_locked(self, model: str) -> None:
         """Make sure `model` is loaded or has a live loader. Lock held."""

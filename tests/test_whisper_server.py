@@ -168,6 +168,24 @@ def test_a_server_that_never_answers_is_bounded(tmp_path):
     assert time.monotonic() - start < 3
 
 
+def test_a_load_slower_than_the_release_wait_keeps_going(tmp_path):
+    # A big model on a slow PC: the release gives up waiting and that
+    # dictation uses whisper-cli, but the load carries on (no cooldown, no
+    # stop), so the next dictation is served warm.
+    rig = Rig(tmp_path, ready_timeout=5, wait_for_ready=0.1, clock=time.monotonic)
+    rig.probe_ok = False
+    with pytest.raises(ServerError, match="still loading"):
+        rig.server.transcribe(rig.wav, rig.model)
+    assert len(rig.spawned) == 1 and rig.spawned[0].stopped == 0
+    assert not rig.server._in_cooldown()
+    rig.probe_ok = True
+    end = time.monotonic() + 3
+    while not loaded(rig.server) and time.monotonic() < end:
+        time.sleep(0.005)
+    assert rig.server.transcribe(rig.wav, rig.model)[0] == "hello world"
+    assert len(rig.spawned) == 1
+
+
 def test_a_server_that_exits_while_loading_fails_fast(tmp_path):
     rig = Rig(tmp_path)
     rig.probe_ok = False
