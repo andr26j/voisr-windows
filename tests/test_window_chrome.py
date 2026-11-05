@@ -75,7 +75,7 @@ def test_colorref_is_bgr():
 
 
 def _theme_value(theme, token):
-    css = TOKENS.read_text()
+    css = TOKENS.read_text(encoding="utf-8")
     start = css.index(f':root[data-appearance="{theme}"]')
     block = css[start:css.index("}", start)]
     return re.search(rf"{token}:\s*(#[0-9A-Fa-f]{{6}})", block).group(1)

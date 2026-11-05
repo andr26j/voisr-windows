@@ -8,10 +8,12 @@ import vm from "node:vm";
 /* Runs widget.html's real inline script and js/meter.js against a small stub
    DOM and a fake clock, so the pill's state machine is tested as written. No
    CSS runs here: test_widget.py pins the rules a state depends on, and how it
-   looks can only be checked in WebKit. */
+   looks can only be checked in WebView2. */
 const WEB = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "voisr", "web");
 const html = readFileSync(path.join(WEB, "widget.html"), "utf8");
-const pageScript = html.slice(html.indexOf("<script>\n") + 9, html.lastIndexOf("</script>"));
+// the inline script, the one tag with no src; CRLF too, as a Windows checkout has it
+const scriptAt = html.search(/<script>\r?\n/);
+const pageScript = html.slice(html.indexOf("\n", scriptAt) + 1, html.lastIndexOf("</script>"));
 const meterScript = readFileSync(path.join(WEB, "js", "meter.js"), "utf8");
 
 function makeEl() {

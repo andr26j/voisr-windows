@@ -22,13 +22,13 @@ def test_old_monolith_files_are_gone():
 
 
 def test_index_loads_scripts_in_dependency_order():
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     order = [m for m in re.findall(r'<script src="([^"]+)"', html)]
     assert order == JS_FILES, f"got {order}"
 
 
 def test_index_loads_all_stylesheets():
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     hrefs = re.findall(r'<link rel="stylesheet" href="([^"]+)"', html)
     assert hrefs == CSS_FILES
 
@@ -36,16 +36,16 @@ def test_index_loads_all_stylesheets():
 def test_no_es_module_syntax_anywhere():
     # module imports over file:// are blocked, and the page loads from disk
     for rel in JS_FILES:
-        src = (WEB / rel).read_text()
+        src = (WEB / rel).read_text(encoding="utf-8")
         assert not re.search(r'^\s*(import|export)\s', src, re.M), rel
-    assert 'type="module"' not in INDEX.read_text()
+    assert 'type="module"' not in INDEX.read_text(encoding="utf-8")
 
 
 def test_every_js_file_attaches_to_the_voisr_namespace():
     for rel in JS_FILES:
         if rel.endswith("main.js"):
             continue
-        assert "window.Voisr" in (WEB / rel).read_text(), rel
+        assert "window.Voisr" in (WEB / rel).read_text(encoding="utf-8"), rel
 
 
 TOKENS = WEB / "css" / "tokens.css"
@@ -56,7 +56,7 @@ COLOR_TOKENS = ["--bg", "--surface", "--ink", "--muted", "--border",
 
 
 def test_every_colour_token_is_defined_in_both_themes():
-    css = TOKENS.read_text()
+    css = TOKENS.read_text(encoding="utf-8")
     parts = css.split(':root[data-appearance="dark"]', 1)
     assert len(parts) == 2, "no dark block in tokens.css"
     light, dark = parts
@@ -68,7 +68,7 @@ def test_every_colour_token_is_defined_in_both_themes():
 def test_each_token_is_declared_exactly_once_per_theme():
     """'system' is resolved to a concrete mode in JS, so the palette needs
     exactly two blocks and no value is written twice."""
-    css = TOKENS.read_text()
+    css = TOKENS.read_text(encoding="utf-8")
     for token in COLOR_TOKENS:
         assert css.count(f"{token}:") == 2, \
             f"{token} declared {css.count(f'{token}:')} times, expected 2"
@@ -76,12 +76,12 @@ def test_each_token_is_declared_exactly_once_per_theme():
 
 def test_tokens_do_not_use_a_colour_scheme_media_query():
     # the media query lives in main.js via matchMedia, not in CSS
-    assert "prefers-color-scheme" not in TOKENS.read_text()
+    assert "prefers-color-scheme" not in TOKENS.read_text(encoding="utf-8")
 
 
 def test_boot_script_sets_the_theme_before_stylesheets_paint():
     """Without this, the window flashes light before main.js runs."""
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     head = html.split("</head>", 1)[0]
     assert "matchMedia" in head
     assert "data-appearance" in head or "dataset.appearance" in head
@@ -137,7 +137,7 @@ def test_no_unlisted_literal_colours_outside_tokens():
     """
     # brand SVG markup in index.html is exempt; stylesheets are not
     for rel in ["css/base.css", "css/components.css", "css/views.css"]:
-        css = (WEB / rel).read_text()
+        css = (WEB / rel).read_text(encoding="utf-8")
         stripped = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
         found = LITERAL_COLOUR_RE.findall(stripped)
         unlisted = [c for c in found if c not in ALLOWED_LITERAL_COLOURS]
@@ -147,32 +147,32 @@ def test_no_unlisted_literal_colours_outside_tokens():
 def test_the_serif_is_bundled_and_never_fetched():
     """Nothing leaves this PC, and that includes a request for a font. The
     design's canvas loads Instrument Serif from Google; the app must not."""
-    css = (WEB / "css" / "base.css").read_text()
+    css = (WEB / "css" / "base.css").read_text(encoding="utf-8")
     for file in ("InstrumentSerif-Regular.ttf", "InstrumentSerif-Italic.ttf"):
         assert f'url("../fonts/{file}")' in css, file
         assert (WEB / "fonts" / file).stat().st_size > 0, file
     # the OFL requires the licence to travel with the font
-    assert "SIL Open Font License" in (WEB / "fonts" / "OFL.txt").read_text()
+    assert "SIL Open Font License" in (WEB / "fonts" / "OFL.txt").read_text(encoding="utf-8")
     for path in [*WEB.rglob("*.css"), *WEB.rglob("*.html")]:
-        text = re.sub(r"http://www\.w3\.org/\S+", "", path.read_text())
+        text = re.sub(r"http://www\.w3\.org/\S+", "", path.read_text(encoding="utf-8"))
         assert "http://" not in text and "https://" not in text, path
         assert "googleapis" not in text and "gstatic" not in text, path
 
 
 def test_titlebar_inset_is_reserved():
-    assert "--titlebar-h" in TOKENS.read_text()
-    assert "var(--titlebar-h)" in (WEB / "css" / "base.css").read_text()
+    assert "--titlebar-h" in TOKENS.read_text(encoding="utf-8")
+    assert "var(--titlebar-h)" in (WEB / "css" / "base.css").read_text(encoding="utf-8")
 
 
 def test_row_renderers_do_not_use_innerhtml():
     for rel in ["js/views/home.js", "js/views/history.js",
                 "js/views/dictionary.js"]:
-        src = (WEB / rel).read_text()
+        src = (WEB / rel).read_text(encoding="utf-8")
         assert "innerHTML" not in src, f"{rel} still builds rows with innerHTML"
 
 
 def test_ui_exposes_the_el_builder_and_dollar_shorthand():
-    src = (WEB / "js" / "ui.js").read_text()
+    src = (WEB / "js" / "ui.js").read_text(encoding="utf-8")
 
     # el() must be the DOM-builder helper — (tag, props, ...children) —
     # not the querySelector shorthand.
@@ -197,28 +197,28 @@ def test_ui_exposes_the_el_builder_and_dollar_shorthand():
 
 
 def test_home_has_a_permission_strip_container():
-    assert 'id="perm-strip"' in INDEX.read_text()
+    assert 'id="perm-strip"' in INDEX.read_text(encoding="utf-8")
 
 
 def test_home_view_calls_the_permission_api():
-    src = (WEB / "js" / "views" / "home.js").read_text()
+    src = (WEB / "js" / "views" / "home.js").read_text(encoding="utf-8")
     assert "get_permissions" in src
     assert "open_settings_pane" in src
 
 
 def test_api_mock_provides_permissions():
-    assert "get_permissions" in (WEB / "js" / "api.js").read_text()
+    assert "get_permissions" in (WEB / "js" / "api.js").read_text(encoding="utf-8")
 
 
 def test_permission_strip_refreshes_on_window_focus():
-    src = (WEB / "js" / "views" / "home.js").read_text()
+    src = (WEB / "js" / "views" / "home.js").read_text(encoding="utf-8")
     assert '"focus"' in src or "'focus'" in src
 
 
 def test_home_leads_with_a_banner_holding_the_key_and_click_to_record():
     """The banner states the contract and holds the fallback recorder: no status
     line above it, no record card, and no floating dock below."""
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     home = html[html.index('id="view-home"'):html.index("<!-- HISTORY -->")]
     assert 'class="banner home-hero"' in home
     assert 'id="ptt-key-name"' in home, "the headline names the key"
@@ -228,7 +228,7 @@ def test_home_leads_with_a_banner_holding_the_key_and_click_to_record():
 
 
 def test_click_to_record_lives_in_the_banner():
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     banner = html[html.index('id="home-hero"'):html.index('id="perm-strip"')]
     assert 'id="record-btn" class="btn-on-hero"' in banner
     assert 'id="record-time"' in banner, "the banner reports elapsed time while listening"
@@ -238,7 +238,7 @@ def test_click_to_record_lives_in_the_banner():
 
 def test_a_recording_cannot_change_the_banners_height():
     """Both of the banner's layers share one grid cell, whichever is showing."""
-    css = re.sub(r"/\*.*?\*/", "", (WEB / "css" / "views.css").read_text(), flags=re.S)
+    css = re.sub(r"/\*.*?\*/", "", (WEB / "css" / "views.css").read_text(encoding="utf-8"), flags=re.S)
     layer = re.search(r"\.hero-layer \{([^}]*)\}", css).group(1)
     assert "grid-area: 1 / 1" in layer
     assert "display: grid" in re.search(r"\.hero-copy \{([^}]*)\}", css).group(1)
@@ -248,13 +248,13 @@ def test_hero_renders_the_configured_hotkey_label():
     # the raw config value (e.g. "alt_r") must never reach the hero — it
     # resolves through Api.hotkey_display() so a fresh install with no
     # captured hotkey_label still shows a human-readable key name.
-    src = (WEB / "js" / "views" / "home.js").read_text()
+    src = (WEB / "js" / "views" / "home.js").read_text(encoding="utf-8")
     assert "hotkey_display" in src
     assert "cfg.hotkey" not in src
 
 
 def test_stats_are_one_column_with_no_sparklines():
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     home = html[html.index('id="view-home"'):html.index("<!-- HISTORY -->")]
     assert 'class="home-stats"' in home
     for el_id in ["stat-saved", "stat-words", "stat-streak", "home-status"]:
@@ -266,7 +266,7 @@ def test_stats_are_one_column_with_no_sparklines():
 def test_the_stats_column_stays_beside_the_feed_at_the_minimum_window():
     """It carries "Needs you", so it must not wrap under the feed and off screen.
     At 900 px the panel's content is 614 wide, or 599 with a classic scrollbar."""
-    css = re.sub(r"/\*.*?\*/", "", (WEB / "css" / "views.css").read_text(), flags=re.S)
+    css = re.sub(r"/\*.*?\*/", "", (WEB / "css" / "views.css").read_text(encoding="utf-8"), flags=re.S)
     layout = re.search(r"\.home-layout \{([^}]*)\}", css).group(1)
     assert "flex-wrap" not in layout
     assert re.search(r"@media \(max-width: 960px\) \{\s*\.home-stats \{ flex-basis: 200px; \}", css)
@@ -275,8 +275,8 @@ def test_the_stats_column_stays_beside_the_feed_at_the_minimum_window():
 def test_a_hidden_element_with_its_own_display_still_hides():
     """An author `display` beats the UA's [hidden]: "Load more" stayed on screen
     with nothing more to load."""
-    css = re.sub(r"/\*.*?\*/", "", (WEB / "css" / "views.css").read_text(), flags=re.S)
-    html = INDEX.read_text()
+    css = re.sub(r"/\*.*?\*/", "", (WEB / "css" / "views.css").read_text(encoding="utf-8"), flags=re.S)
+    html = INDEX.read_text(encoding="utf-8")
     for el_id, cls in re.findall(r'<\w+ id="([\w-]+)" class="([^"]+)"[^>]*\bhidden\b', html):
         for name in cls.split():
             rule = re.search(rf"^\.{name} \{{([^}}]*)\}}", css, flags=re.M)
@@ -285,7 +285,7 @@ def test_a_hidden_element_with_its_own_display_still_hides():
 
 
 def test_home_uses_time_saved_and_the_wave_not_the_old_trends():
-    src = (WEB / "js" / "views" / "home.js").read_text()
+    src = (WEB / "js" / "views" / "home.js").read_text(encoding="utf-8")
     assert "time_saved_seconds" in src
     assert "renderWave(stats.daily)" in src
     for gone in ("trendBars", "weekDelta"):
@@ -295,18 +295,18 @@ def test_home_uses_time_saved_and_the_wave_not_the_old_trends():
 def test_a_blocked_permission_takes_the_banners_place():
     """Without its grant, holding the key does nothing: a banner still promising
     it works was the app lying to the user."""
-    src = (WEB / "js" / "views" / "home.js").read_text()
+    src = (WEB / "js" / "views" / "home.js").read_text(encoding="utf-8")
     assert "banner-needs-you" in src
     assert "#home-hero" in src, "the dark banner has to be hideable"
     assert "perm-chip" not in src
 
 
 def test_ui_exposes_format_duration():
-    assert "formatDuration" in (WEB / "js" / "ui.js").read_text()
+    assert "formatDuration" in (WEB / "js" / "ui.js").read_text(encoding="utf-8")
 
 
 def test_mock_stats_include_the_new_keys():
-    src = (WEB / "js" / "api.js").read_text()
+    src = (WEB / "js" / "api.js").read_text(encoding="utf-8")
     assert "time_saved_seconds" in src and "daily" in src
 
 
@@ -314,7 +314,7 @@ def test_format_duration_rounds_to_minutes_before_splitting_hours():
     """Ensures formatDuration does not independently round minutes from the
     remainder, which can produce m=60. Instead, it must round to whole minutes
     first, then derive both h and m from that single rounded value."""
-    src = (WEB / "js" / "ui.js").read_text()
+    src = (WEB / "js" / "ui.js").read_text(encoding="utf-8")
 
     # The old broken pattern: independently rounding (s % 3600) / 60
     # This can produce m=60, leading to "60m" or "1h 60m".
@@ -336,29 +336,29 @@ def test_format_duration_rounds_to_minutes_before_splitting_hours():
 
 
 def test_palette_markup_and_binding_exist():
-    assert 'id="palette"' in INDEX.read_text()
-    src = (WEB / "js" / "palette.js").read_text()
+    assert 'id="palette"' in INDEX.read_text(encoding="utf-8")
+    src = (WEB / "js" / "palette.js").read_text(encoding="utf-8")
     assert "metaKey" in src and '"k"' in src
     assert "Escape" in src
     assert "ArrowDown" in src and "ArrowUp" in src
 
 
 def test_palette_registers_the_specified_commands():
-    src = (WEB / "js" / "palette.js").read_text()
+    src = (WEB / "js" / "palette.js").read_text(encoding="utf-8")
     for cmd in ["Start dictation", "Search history", "Settings",
                 "push-to-talk", "appearance", "Copy last dictation"]:
         assert cmd.lower() in src.lower(), cmd
 
 
 def test_history_has_search_and_export_controls():
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     assert 'id="history-search"' in html
     assert 'id="history-export"' in html
     assert 'id="history-more"' in html
 
 
 def test_history_binds_keyboard_navigation():
-    src = (WEB / "js" / "views" / "history.js").read_text()
+    src = (WEB / "js" / "views" / "history.js").read_text(encoding="utf-8")
     for key in ["ArrowDown", "ArrowUp", "Backspace", "Enter"]:
         assert key in src, key
     assert "PAGE" in src
@@ -366,32 +366,32 @@ def test_history_binds_keyboard_navigation():
 
 def test_no_confirm_dialogs_remain_in_the_web_layer():
     for path in WEB.rglob("*.js"):
-        assert "confirm(" not in path.read_text(), path.name
-    assert "confirm(" not in INDEX.read_text()
+        assert "confirm(" not in path.read_text(encoding="utf-8"), path.name
+    assert "confirm(" not in INDEX.read_text(encoding="utf-8")
 
 
 def test_delete_offers_undo():
-    src = (WEB / "js" / "views" / "history.js").read_text()
+    src = (WEB / "js" / "views" / "history.js").read_text(encoding="utf-8")
     assert "restore_history_item" in src
     assert "Undo" in src
 
 
 def test_export_is_wired_to_the_save_panel():
-    src = (WEB / "js" / "views" / "history.js").read_text()
+    src = (WEB / "js" / "views" / "history.js").read_text(encoding="utf-8")
     assert "export_history" in src and "save_text_file" in src
 
 
 def test_dictionary_supports_inline_edit_and_search():
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     assert 'id="dict-search"' in html
     assert 'id="dict-search-open"' in html
-    src = (WEB / "js" / "views" / "dictionary.js").read_text()
+    src = (WEB / "js" / "views" / "dictionary.js").read_text(encoding="utf-8")
     assert "row-input" in src
     assert "innerHTML" not in src
 
 
 def test_every_page_has_one_black_button_at_most_in_its_title_row():
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     for start, end in (("<!-- HISTORY -->", "<!-- DICTIONARY -->"), ("<!-- DICTIONARY -->", "<!-- SNIPPETS -->"),
                        ("<!-- SNIPPETS -->", "<!-- SETTINGS -->")):
         page = html[html.index(start):html.index(end)]
@@ -403,7 +403,7 @@ def test_every_page_has_one_black_button_at_most_in_its_title_row():
 def test_banner_copy_says_what_the_code_does():
     """The boards' first wording overclaimed: every paste puts text in another app,
     and each variant is its own entry, matched as a whole phrase."""
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     assert "Your history stays on this PC" in html
     assert "Voisr doesn&#39;t keep it anywhere else" in html or "Voisr doesn't keep it anywhere else" in html
     assert "Each variant needs its own line" in html
@@ -413,14 +413,14 @@ def test_banner_copy_says_what_the_code_does():
 
 
 def test_home_only_says_it_pastes_when_it_will():
-    src = (WEB / "js" / "views" / "home.js").read_text()
+    src = (WEB / "js" / "views" / "home.js").read_text(encoding="utf-8")
     assert "Let go and it lands at your cursor." in src
     assert "Let go and it's copied to your clipboard." in src
     assert "It's copied to your clipboard, not pasted." in src, "click to record never pastes"
 
 
 def test_settings_is_a_pop_up_with_the_macs_five_sections_and_updates():
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     # a dialog over the page, not a page of its own
     assert 'id="view-settings"' not in html
     assert 'id="settings-dialog"' in html and 'role="dialog"' in html
@@ -434,8 +434,8 @@ def test_settings_is_a_pop_up_with_the_macs_five_sections_and_updates():
 
 
 def test_the_palette_stays_above_settings_and_toasts_above_both():
-    views = (WEB / "css" / "views.css").read_text()
-    components = (WEB / "css" / "components.css").read_text()
+    views = (WEB / "css" / "views.css").read_text(encoding="utf-8")
+    components = (WEB / "css" / "components.css").read_text(encoding="utf-8")
     z_index = lambda css, rule: int(re.search(
         r"z-index:\s*(\d+)", css[css.index(rule):]).group(1))
     assert z_index(views, ".settings-scrim {") \
@@ -445,8 +445,8 @@ def test_the_palette_stays_above_settings_and_toasts_above_both():
 
 def test_the_settings_close_timer_matches_its_transition():
     # a timer shorter than the fade cuts it off; a longer one holds up the page
-    css = (WEB / "css" / "views.css").read_text()
-    src = (WEB / "js" / "views" / "settings.js").read_text()
+    css = (WEB / "css" / "views.css").read_text(encoding="utf-8")
+    src = (WEB / "js" / "views" / "settings.js").read_text(encoding="utf-8")
     ms = re.search(r"LEAVE_MS = (\d+)", src).group(1)
     assert f"transition: opacity {ms}ms ease-out;" in css
 
@@ -455,36 +455,36 @@ def test_appearance_is_chosen_by_picture():
     """An appearance choice is the one control that should show its own
     result, and so is the pill's: both are pictures, and the pill's two must
     look like the two real pills rather than like each other."""
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     assert 'id="appearance-grid"' in html and 'id="theme-grid"' in html
     assert 'id="appearance-select"' not in html
-    src = (WEB / "js" / "views" / "settings.js").read_text()
+    src = (WEB / "js" / "views" / "settings.js").read_text(encoding="utf-8")
     assert "renderAppearance" in src
     assert "thumb-art" in src
     assert "pill-preview" in src
-    css = (WEB / "css" / "views.css").read_text()
+    css = (WEB / "css" / "views.css").read_text(encoding="utf-8")
     assert '.pill-preview[data-theme="quiet"]' in css
     assert ".pp-live" in css
 
 
 def test_pill_previews_stand_still():
     """A Settings page left open must not keep animating on a modest PC."""
-    css = (WEB / "css" / "views.css").read_text()
+    css = (WEB / "css" / "views.css").read_text(encoding="utf-8")
     for rule in (".pill-preview {", ".pp-bar {", ".pp-dot {"):
         body = css[css.index(rule):]
         assert "animation" not in body[:body.index("}")], rule
-    assert "mini-pill" not in (WEB / "css" / "components.css").read_text()
+    assert "mini-pill" not in (WEB / "css" / "components.css").read_text(encoding="utf-8")
 
 
 def test_settings_has_the_new_controls():
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     for el_id in ["appearance-grid", "model-list", "launch-toggle",
                   "color-popover", "clear-history"]:
         assert f'id="{el_id}"' in html, el_id
 
 
 def test_colour_wheel_is_drawn_lazily():
-    src = (WEB / "js" / "views" / "settings.js").read_text()
+    src = (WEB / "js" / "views" / "settings.js").read_text(encoding="utf-8")
     assert "drawColorWheel" in src
     # the wheel must not be drawn during initial render
     assert "wheelDrawn" in src
@@ -494,7 +494,7 @@ def test_settings_binds_its_listeners_in_init():
     """settings.js must follow the same convention as every other view:
     listeners bind inside an init() that main.js calls once, never at
     module-parse time."""
-    src = (WEB / "js" / "views" / "settings.js").read_text()
+    src = (WEB / "js" / "views" / "settings.js").read_text(encoding="utf-8")
 
     assert re.search(r"^  function init\(\)\s*\{", src, re.M), \
         "settings.js no longer declares a module-level init()"
@@ -517,7 +517,7 @@ def test_settings_binds_its_listeners_in_init():
 def test_main_init_calls_settings_init():
     """The call must live inside main.js's own init(), alongside
     history.initKeys() / dictionary.initSearch() / palette.init()."""
-    src = (WEB / "js" / "main.js").read_text()
+    src = (WEB / "js" / "main.js").read_text(encoding="utf-8")
     assert "V.views.settings.init();" in src, \
         "main.js never calls V.views.settings.init()"
 
@@ -528,7 +528,7 @@ def test_main_init_calls_settings_init():
 
 
 def test_view_transition_class_exists_and_respects_reduced_motion():
-    css = (WEB / "css" / "base.css").read_text()
+    css = (WEB / "css" / "base.css").read_text(encoding="utf-8")
     assert ".view.entering" in css
     assert "prefers-reduced-motion" in css
     block = css.split("prefers-reduced-motion", 1)[1]
@@ -546,14 +546,14 @@ def test_view_transition_class_exists_and_respects_reduced_motion():
 
 
 def test_show_applies_the_entering_class():
-    assert "entering" in (WEB / "js" / "main.js").read_text()
+    assert "entering" in (WEB / "js" / "main.js").read_text(encoding="utf-8")
 
 
 def test_switching_views_returns_to_the_top():
     """.main is the single scroll container, so its offset survives a view
     switch — scrolled to the bottom of Home, Settings would otherwise open
     scrolled past its own content, showing a blank pane."""
-    src = (WEB / "js" / "main.js").read_text()
+    src = (WEB / "js" / "main.js").read_text(encoding="utf-8")
     show = re.search(r"function show\(view\)\s*\{(.*?)\n  \}", src, re.S)
     assert show, "could not find main.js's show()"
     assert "scrollTop = 0" in show.group(1)
@@ -566,14 +566,14 @@ def test_switching_views_returns_to_the_top():
 # label ("Dictation copied") both said otherwise.
 
 def test_settings_does_not_claim_clipboard_is_always_on():
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     assert "Always on" not in html
     assert "placed on your clipboard" not in html
     assert "Copied when auto-paste is off or blocked" in html
 
 
 def test_pill_done_label_does_not_say_copied():
-    widget = (WEB / "widget.html").read_text()
+    widget = (WEB / "widget.html").read_text(encoding="utf-8")
     assert 'aria-label="Dictation copied"' not in widget
     assert 'aria-label="Dictation ready"' in widget
 
@@ -603,7 +603,7 @@ def contrast_ratio(a, b):
 
 
 def test_primary_button_text_meets_aa_contrast_in_both_themes():
-    css = TOKENS.read_text()
+    css = TOKENS.read_text(encoding="utf-8")
     for selector in (':root[data-appearance="light"]', ':root[data-appearance="dark"]'):
         block = _theme_block(css, selector)
         ratio = contrast_ratio(_token(block, "--on-accent"), _token(block, "--accent"))
@@ -613,52 +613,52 @@ def test_primary_button_text_meets_aa_contrast_in_both_themes():
 def test_settings_explains_smart_join_spacing():
     """Where the field can't be read, consecutive dictations are joined with a
     space unless a key was pressed or the mouse clicked in between. Say so."""
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     assert "joined with a space" in html
     assert "mouse" in html
 
 
 def test_boot_toasts_a_moved_aside_config_and_the_mock_answers_it():
     # H3: a corrupt config.json is quarantined at load; boot must say so.
-    assert "take_config_notice" in (WEB / "js" / "main.js").read_text()
-    assert "take_config_notice" in (WEB / "js" / "api.js").read_text()
+    assert "take_config_notice" in (WEB / "js" / "main.js").read_text(encoding="utf-8")
+    assert "take_config_notice" in (WEB / "js" / "api.js").read_text(encoding="utf-8")
 
 
 def test_the_stats_note_says_its_numbers_are_all_time():
     # M9: the numbers are totals, so they say so
-    src = INDEX.read_text()
+    src = INDEX.read_text(encoding="utf-8")
     assert "All time, vs typing at 40 wpm" in src
     assert "words, all time" in src, "it sits under a 14-day wave, so it has to say it isn't one"
 
 
 def test_palette_dictation_goes_through_home():
     # M7: a recording started from another view was invisible
-    assert "dictateFromAnywhere" in (WEB / "js" / "palette.js").read_text()
+    assert "dictateFromAnywhere" in (WEB / "js" / "palette.js").read_text(encoding="utf-8")
 
 
 # ---- M11 (2026-10-12 audit) ----
 
 def test_theme_pickers_are_radio_groups():
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     for grid in ("appearance-grid", "theme-grid"):
         tag = re.search(rf'<div id="{grid}"[^>]*>', html).group(0)
         assert 'role="radiogroup"' in tag, grid
 
 
 def test_record_status_is_announced():
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     assert 'role="status"' in re.search(r'<p [^>]*id="record-status"[^>]*>', html).group(0)
     assert 'role="alert"' in re.search(r'<p [^>]*id="record-error"[^>]*>', html).group(0)
 
 
 def test_apply_appearance_tells_the_rest_of_the_app():
-    src = (WEB / "js" / "main.js").read_text()
+    src = (WEB / "js" / "main.js").read_text(encoding="utf-8")
     assert "voisr:appearance" in src
     assert "V.appearancePref" in src
 
 
 def test_accent_text_meets_aa_on_every_background_in_both_themes():
-    css = TOKENS.read_text()
+    css = TOKENS.read_text(encoding="utf-8")
     for selector in (':root[data-appearance="light"]', ':root[data-appearance="dark"]'):
         block = _theme_block(css, selector)
         for bg in ("--bg", "--surface", "--surface-2"):
@@ -668,7 +668,7 @@ def test_accent_text_meets_aa_on_every_background_in_both_themes():
 
 def test_the_more_disclosure_is_not_blue():
     # blue means "needs you", and a closed disclosure doesn't
-    css = (WEB / "css" / "views.css").read_text()
+    css = (WEB / "css" / "views.css").read_text(encoding="utf-8")
     rule = css[css.index(".more summary {"):]
     rule = rule[:rule.index("}")]
     assert "var(--muted)" in rule
@@ -677,13 +677,13 @@ def test_the_more_disclosure_is_not_blue():
 # ---- L8 (2026-10-12 audit) ----
 
 def test_settings_status_colour_follows_its_state():
-    css = (WEB / "css" / "views.css").read_text()
+    css = (WEB / "css" / "views.css").read_text(encoding="utf-8")
     assert '.setting-status[data-state="off"]' in css
 
 
 def test_dead_home_code_is_gone():
-    assert "PERM_HELP" not in (WEB / "js" / "views" / "home.js").read_text()
-    assert 'id="delta-streak"' not in INDEX.read_text()
+    assert "PERM_HELP" not in (WEB / "js" / "views" / "home.js").read_text(encoding="utf-8")
+    assert 'id="delta-streak"' not in INDEX.read_text(encoding="utf-8")
 
 
 def test_landed_wash_outranks_the_row_stagger():
@@ -692,13 +692,13 @@ def test_landed_wash_outranks_the_row_stagger():
     beat the wash's (0,2,0), so a row that arrived while you were away never
     showed where it went -- and under reduced motion, the stagger's
     `animation: none` erased it too."""
-    css = re.sub(r"/\*.*?\*/", "", (WEB / "css" / "base.css").read_text(), flags=re.S)
+    css = re.sub(r"/\*.*?\*/", "", (WEB / "css" / "base.css").read_text(encoding="utf-8"), flags=re.S)
     assert re.search(
         r"\.item-list\.is-staggering \.item-row\.is-landed[^{]*\{[^}]*animation:\s*wash", css)
 
 
 def test_settings_say_plainly_what_screen_context_reads():
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     for el_id in ("screen-context-toggle", "learn-toggle", "auto-add-toggle",
                   "dict-suggestions", "dict-suggestion-list"):
         assert f'id="{el_id}"' in html, el_id
@@ -713,17 +713,17 @@ def test_settings_say_plainly_what_screen_context_reads():
 def test_the_updates_ui_survives_the_redesign():
     """The auto-updater is Windows only: Home's banner and Settings' Updates
     section are what reach voisr/updater.py."""
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     home = html[html.index('id="view-home"'):html.index("<!-- HISTORY -->")]
     for el_id in ("update-banner", "update-banner-text", "update-install", "update-dismiss"):
         assert f'id="{el_id}"' in home, el_id
     updates = html[html.index('data-section="updates" hidden'):]
     for el_id in ("app-version", "update-result", "update-check", "update-toggle"):
         assert f'id="{el_id}"' in updates, el_id
-    home_js = (WEB / "js" / "views" / "home.js").read_text()
+    home_js = (WEB / "js" / "views" / "home.js").read_text(encoding="utf-8")
     for name in ("get_update_status", "install_update", "renderUpdateBanner(),"):
         assert name in home_js, name
-    settings_js = (WEB / "js" / "views" / "settings.js").read_text()
+    settings_js = (WEB / "js" / "views" / "settings.js").read_text(encoding="utf-8")
     for name in ("check_for_updates_now", "set_check_for_updates", '"updates"'):
         assert name in settings_js, name
 
@@ -732,14 +732,14 @@ def test_no_mac_key_symbols_or_macos_wording_reach_the_page():
     """Ctrl / Alt / Shift / Win, never the Mac's glyphs, and this PC, not this Mac."""
     pages = [INDEX, WEB / "widget.html", *sorted((WEB / "js").rglob("*.js"))]
     for path in pages:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         for glyph in "⌘⌥⌃⇧⇪":
             assert glyph not in text, f"{path.name}: {glyph}"
-    html = INDEX.read_text()
+    html = INDEX.read_text(encoding="utf-8")
     for mac in ("this Mac", "macOS", "System Settings", "Accessibility", "Input Monitoring"):
         assert mac not in html, mac
     for rel in ("js/views/home.js", "js/views/first-run.js", "js/views/settings.js"):
-        src = (WEB / rel).read_text()
+        src = (WEB / rel).read_text(encoding="utf-8")
         for mac in ("this Mac", "macOS grants", "System Settings\")", "Mac is listening"):
             assert mac not in src, f"{rel}: {mac}"
 
@@ -747,7 +747,7 @@ def test_no_mac_key_symbols_or_macos_wording_reach_the_page():
 def test_no_tcc_reset_or_relaunch_on_windows():
     # macOS-only bridge calls: Windows has no TCC grant to reset
     for path in (WEB / "js").rglob("*.js"):
-        src = path.read_text()
+        src = path.read_text(encoding="utf-8")
         assert "reset_permission" not in src, path.name
         assert "relaunch_app" not in src, path.name
 
@@ -755,19 +755,19 @@ def test_no_tcc_reset_or_relaunch_on_windows():
 def test_type_is_windows_type():
     """A macOS-only stack falls through to Arial on Windows, and macOS font
     smoothing thins Segoe and undoes ClearType."""
-    tokens = TOKENS.read_text()
+    tokens = TOKENS.read_text(encoding="utf-8")
     sans = re.search(r"--font-sans:([^;]*);", tokens).group(1)
     assert sans.strip().startswith('"Segoe UI Variable Text", "Segoe UI"')
     assert "-apple-system" not in sans and "SF Pro" not in sans
     for path in [*WEB.rglob("*.css"), WEB / "widget.html"]:
-        text = re.sub(r"/\*.*?\*/", "", path.read_text(), flags=re.S)
+        text = re.sub(r"/\*.*?\*/", "", path.read_text(encoding="utf-8"), flags=re.S)
         assert "-webkit-font-smoothing" not in text, path.name
-    assert "Segoe UI" in (WEB / "widget.html").read_text()
+    assert "Segoe UI" in (WEB / "widget.html").read_text(encoding="utf-8")
 
 
 def test_the_fonts_ship_in_the_build_and_are_in_the_notices():
     # build/voisr.spec copies voisr/web whole, fonts/ and OFL.txt with it
-    spec = (Path(__file__).resolve().parent.parent / "build" / "voisr.spec").read_text()
+    spec = (Path(__file__).resolve().parent.parent / "build" / "voisr.spec").read_text(encoding="utf-8")
     assert '(os.path.join(REPO_ROOT, "voisr", "web"), "voisr/web")' in spec
     notices = (Path(__file__).resolve().parent.parent / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
     assert "Instrument Serif" in notices and "SIL Open Font License 1.1" in notices
