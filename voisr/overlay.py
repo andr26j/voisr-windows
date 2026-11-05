@@ -7,6 +7,7 @@ click-through by applying four extended window styles to its HWND after
 creation. This module wraps that into the app's real overlay.
 """
 import ctypes
+import json
 import re
 import threading
 from ctypes import wintypes
@@ -18,10 +19,13 @@ from voisr.paths import web_dir as _web_dir
 
 WEB_DIR = _web_dir()
 
-# 6 px of headroom above and below the 44 px pill for its entrance rise;
-# the margin keeps the pill's centre where it has always been
-WIDTH, HEIGHT = 232, 56
-BOTTOM_MARGIN = 70
+# Holds the 196x44 pill's shadow (0 8px 24px in widget.html: 24 px beside it,
+# 32 px below), and 6 px more below for the entrance rise, or the shadow would
+# end in a hard edge. Transparent and click-through, so the extra room costs
+# nothing. The page centres the pill, and the margin keeps its centre 98 px up
+# the screen, where it has always been.
+WIDTH, HEIGHT = 248, 120
+BOTTOM_MARGIN = 38
 EXIT_S = 0.18  # the pill's 160 ms exit (widget.html), plus a frame
 LEVEL_HZ = 30  # pill bars follow the voice; the page smooths between pushes
 WINDOW_TITLE = "Voisr Recording"
@@ -56,15 +60,20 @@ user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 user32.GetForegroundWindow.restype = wintypes.HWND
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 
-# Themes must match web/widget.html's THEME_VALUES.
-_PILL_THEME_VALUES = {
-    "classic", "ember", "aurora", "ocean", "neon", "breathe", "scanner",
-}
+# Themes must match web/widget.html's THEME_VALUES. "classic" is Signature:
+# every existing config saved it under that name, so the value stays.
+_PILL_THEME_VALUES = {"classic", "quiet"}
+
+# The pill's line after a dictation it pasted nowhere: the text is on the
+# clipboard, and this says how to put it where it's wanted.
+COPIED_LABEL = "Copied — press Ctrl+V"
 _HEX_COLOR_RE = re.compile(r"#[0-9A-Fa-f]{6}")
 
 
 def sanitize_pill_theme(name) -> str:
-    """Whitelist a theme name from config before it reaches JS interpolation."""
+    """Whitelist a theme name from config before it reaches JS interpolation.
+    Anything else, including a theme this version no longer has (ember, aurora,
+    ocean, neon, breathe, scanner), lands on Signature."""
     return name if isinstance(name, str) and name in _PILL_THEME_VALUES else "classic"
 
 
@@ -328,7 +337,26 @@ class RecordingWidget:
                     pass
             wait(1 / LEVEL_HZ)
 
-    def _apply(self, state: str, theme: str | None, color: str | None) -> None:
+    def _apply_look(self, theme: str | None, color: str | None) -> None:
+        """sanitize_* whitelist both values, so config.json content can never
+        be interpolated into JS verbatim."""
+        self._window.evaluate_js(f'setTheme("{sanitize_pill_theme(theme)}")')
+        safe = sanitize_pill_color(color)
+        self._window.evaluate_js(f'setColor("{safe}")' if safe else "setColor(null)")
+
+    def set_look(self, theme: str | None, color: str | None) -> None:
+        """Set the theme without showing anything, ahead of a state that has no
+        dictation behind it (an error flash, a notice). A recording sets its
+        own. Never raises."""
+        if self._window is None:
+            return
+        try:
+            self._apply_look(theme, color)
+        except Exception:
+            pass  # never break the record path
+
+    def _apply(self, state: str, theme: str | None, color: str | None,
+               label: str | None = None) -> None:
         if self._window is None:
             return
         # first, so a failing JS call below still ends the previous state's
@@ -336,11 +364,10 @@ class RecordingWidget:
         gen = self._next_gen()
         try:
             if theme is not None:
-                # sanitize_* whitelist both values — config.json content
-                # can never be interpolated into JS verbatim
-                self._window.evaluate_js(f'setTheme("{sanitize_pill_theme(theme)}")')
-                safe = sanitize_pill_color(color)
-                self._window.evaluate_js(f'setColor("{safe}")' if safe else "setColor(null)")
+                self._apply_look(theme, color)
+            if label is not None:
+                # json.dumps: a word from the user's own text, as a JS string
+                self._window.evaluate_js(f"setLabel({json.dumps(label)})")
             self._window.evaluate_js(f'setState("{state}")')
         except Exception:
             pass  # never break the record path
@@ -366,9 +393,9 @@ class RecordingWidget:
                 pass
 
     def _set(self, state: str, theme: str | None = None, color: str | None = None,
-              is_current=None, if_current=None) -> None:
+              is_current=None, if_current=None, label: str | None = None) -> None:
         def apply():
-            self._apply(state, theme, color)
+            self._apply(state, theme, color, label)
 
         try:
             if if_current is not None:
@@ -391,6 +418,16 @@ class RecordingWidget:
 
     def show_error(self, is_current=None, if_current=None):
         self._set("error", is_current=is_current, if_current=if_current)
+
+    def show_notice(self, text: str, is_current=None, if_current=None):
+        """A short line in place of the bars, for something no icon can say
+        (a word added to the Dictionary). The page cuts off what doesn't fit."""
+        self._set("label", label=str(text), is_current=is_current,
+                  if_current=if_current)
+
+    def show_copied(self, is_current=None, if_current=None):
+        self._set("label", label=COPIED_LABEL, is_current=is_current,
+                  if_current=if_current)
 
     def _hide_window(self, gen: int) -> None:
         """Hide once the pill's exit animation is over -- and not at all if a

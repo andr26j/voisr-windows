@@ -18,6 +18,8 @@ def bin_dir() -> Path:
 
 
 def models_dir() -> Path:
+    """The models that ship with Voisr (ggml-base.en.bin): read-only, and
+    replaced by every install and update."""
     return resource_root() / "models"
 
 
@@ -61,6 +63,12 @@ def app_data_dir() -> Path:
     base = os.environ.get("LOCALAPPDATA")
     root = Path(base) if base else Path.home() / "AppData" / "Local"
     return root / "Voisr"
+
+
+def user_models_dir() -> Path:
+    """Where models downloaded from Settings go: %LOCALAPPDATA%\\Voisr\\models,
+    per user, kept across updates and never inside the install folder."""
+    return app_data_dir() / "models"
 
 
 def ensure_app_data_dir() -> Path:

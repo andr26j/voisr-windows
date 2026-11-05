@@ -389,3 +389,24 @@ def test_a_password_is_restored_when_the_paste_never_happened():
 def test_the_restore_waits_long_enough_for_a_busy_app():
     # 300 ms was shorter than an Electron app's stall on a large paste
     assert inject.PASTE_GRACE_S >= 1.0
+
+
+def test_a_paste_check_that_raises_restores_and_lands_in_the_log(monkeypatch):
+    # print() is silent in the windowed build: the reason must reach voisr.log
+    rows = []
+    monkeypatch.setattr("voisr.updater._log", rows.append)
+    adapter = FakeAdapter()
+
+    def broken_verifier(old_clipboard):
+        raise RuntimeError("UIA went away")
+
+    assert inject._paste_with_adapter(
+        "hello",
+        adapter=adapter,
+        post_ctrl_v=lambda: True,
+        fallback_ctrl_v=lambda: False,
+        sleeper=lambda s: None,
+        verifier=broken_verifier,
+    ) is True
+    assert rows == ["paste check skipped (RuntimeError)"]
+    assert ("restore", adapter.snapshot_value, adapter.owner_count) in adapter.calls

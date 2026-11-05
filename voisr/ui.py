@@ -8,7 +8,9 @@ dedicated Windows module is imported rather than re-implemented:
 `voisr.window_chrome` (DWM dark titlebar), `voisr.launch_agent` (per-user Run
 key), and `voisr.status_item` (the tray icon).
 """
+import atexit
 import functools
+import inspect
 import json
 import os
 import threading
@@ -19,12 +21,17 @@ import voisr
 from voisr import launch_agent, permissions, speech_gate
 from voisr.app import config_errors, load_config
 from voisr.app import config_path as default_config_path
+from voisr.ax_context import FocusTracker, make_ax_adapter
 from voisr.cleanup import clean
+from voisr.context_terms import (cli_safe_terms, context_terms, prompt_echoed,
+                                 terms_for_clip, triggers_recited)
+from voisr.edit_learning import EditWatcher, is_term_fix
 from voisr.history import HistoryStore
 from voisr.inject import paste_at_cursor, set_clipboard
 from voisr.keys import DEFAULT_HOTKEY, hotkey_options, key_label, resolve_key
 from voisr.keytap import WindowsKeyListener, capture_next_vk
 from voisr.overlay import RecordingWidget, sanitize_pill_color, sanitize_pill_theme
+from voisr.paste_verify import VERIFY_BUDGET_S, check_delivery, skipped
 from voisr.pasteboard import PasteDeliveryError
 from voisr.paths import app_data_dir, app_icon
 from voisr.paths import web_dir as _web_dir
@@ -34,14 +41,19 @@ from voisr.recording_queue import (
     RecordingSession,
     SessionResult,
 )
+from voisr.snippets import (SnippetError, dictation_wants_space, find_snippet,
+                            has_speech_evidence, needs_leading_space, snippet_warnings,
+                            tidy_trigger, trigger_hints, triggers_for_clip, with_saved)
 from voisr.status_item import StatusItem
 from voisr.stream_recorder import StreamRecorder
+from voisr.suggestions import (ACCEPTED, AUTO_ADDED, DISMISSED, PENDING, SuggestionStore,
+                               dictionary_allows, ready_to_auto_add)
 from voisr.updater import UpdateChecker
 # _log, not print: the shipped build is windowed (console=False), where
 # sys.stdout is None and print() is a silent no-op. Shared with updater.py
 # so both halves of an update failure land in the same file.
 from voisr.updater import _log as _update_log
-from voisr.window_chrome import apply_chrome
+from voisr.window_chrome import apply_chrome, launch_background
 
 WEB_DIR = _web_dir()
 WINDOW_TITLE = "Voisr"
@@ -62,18 +74,14 @@ def set_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> bool:
     except Exception:
         return False
 
-# Adding a theme? Also update: widget.html (theme CSS + THEME_VALUES),
-# style.css (mini-pill rule + keyframes), api.js's dev-mock get_pill_themes,
-# and voisr.overlay._PILL_THEME_VALUES. test_widget_html_covers_all_pill_themes
-# guards widget.html.
+# Adding a theme? Also update: widget.html (theme CSS + THEME_VALUES), the
+# Settings picker's preview (.pill-preview in css/views.css), the
+# get_pill_themes mock in js/api.js, and voisr.overlay._PILL_THEME_VALUES.
+# test_widget_html_covers_all_pill_themes guards widget.html.
 PILL_THEMES = [
-    {"value": "classic", "label": "Classic"},
-    {"value": "ember", "label": "Ember"},
-    {"value": "aurora", "label": "Aurora"},
-    {"value": "ocean", "label": "Ocean"},
-    {"value": "neon", "label": "Neon EQ"},
-    {"value": "breathe", "label": "Breathe"},
-    {"value": "scanner", "label": "Scanner"},
+    # Saved as "classic" in every existing config, so the value stays
+    {"value": "classic", "label": "Signature"},
+    {"value": "quiet", "label": "Quiet"},
 ]
 
 
@@ -105,20 +113,50 @@ GLOSSARY_MAX_TERMS = 40
 GLOSSARY_MAX_CHARS = 600
 
 
-def glossary_prompt(dictionary) -> str | None:
-    """Bias whisper toward the user's spellings: 'Glossary: A, B, C.'"""
-    if not dictionary:
-        return None
+def _glossary_text(terms) -> str:
+    return "Glossary: " + ", ".join(terms) + "."
+
+
+def glossary_prompt(dictionary, context_terms=(), triggers=()) -> str | None:
+    """Bias whisper toward the user's spellings: 'Glossary: A, B, C.' Snippet
+    triggers are kept first when over budget, then Dictionary terms; terms from
+    the screen only fill what budget is left, and only ever bias
+    recognition (clean() does not substitute them)."""
     seen = []
-    for written in reversed(list(dictionary.values())):
+    for written in reversed([*(dictionary or {}).values(), *triggers]):
         if written not in seen:
             seen.append(written)
         if len(seen) >= GLOSSARY_MAX_TERMS:
             break
     seen.reverse()
-    while seen and len("Glossary: " + ", ".join(seen) + ".") > GLOSSARY_MAX_CHARS:
+    while seen and len(_glossary_text(seen)) > GLOSSARY_MAX_CHARS:
         seen.pop(0)
-    return ("Glossary: " + ", ".join(seen) + ".") if seen else None
+    known = {term.casefold() for term in seen}
+    for term in context_terms:
+        if len(seen) >= GLOSSARY_MAX_TERMS:
+            break
+        if term.casefold() in known:
+            continue
+        if len(_glossary_text([*seen, term])) > GLOSSARY_MAX_CHARS:
+            break
+        known.add(term.casefold())
+        seen.append(term)
+    return _glossary_text(seen) if seen else None
+
+
+def takes_keyword(fn, name: str) -> bool:
+    """Can `fn` be called with `name=...`? A parameter of that name or a
+    **kwargs (how a wrapper passes keywords on) both count. A signature that
+    can't be read counts as no: the call then goes without the keyword, as
+    it did before the keyword existed."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.kind is p.VAR_KEYWORD
+               or (p.name == name and p.kind in (p.POSITIONAL_OR_KEYWORD,
+                                                 p.KEYWORD_ONLY))
+               for p in params)
 
 
 def capture_next_key(timeout: float = 8.0):
@@ -244,6 +282,17 @@ def _system_prefers_dark() -> bool:
         return True
 
 
+def _window_background(api):
+    """The window's colour before the page's first paint: the sidebar's, so
+    nothing flashes white in dark mode. Cosmetic, so a config that can't be
+    read must not stop startup."""
+    try:
+        appearance = api.get_config().get("appearance", "system")
+    except Exception:
+        appearance = "system"
+    return launch_background(appearance, _system_prefers_dark)
+
+
 def _run_save_dialog(suggested_name: str):
     """Native Win32 "Save As" dialog. Returns the chosen path, or None if
     the user cancelled."""
@@ -304,6 +353,10 @@ class HotkeyService:
     """Global push-to-talk listener driving the shared Api record path."""
 
     PANE_REOPEN_S = 60  # a refused permission's pane opens at most this often
+    COPIED_HOLD = 3  # "Copied — press Ctrl+V" stays this many times hide_delay
+    NOTICE_HOLD_S = 2.5
+    NOTICE_RETRY_S = 2.0
+    NOTICE_TRIES = 30
 
     def __init__(self, api, widget=None, hide_delay=1.2,
                  permissions_check=lambda: True, poll_interval=3.0,
@@ -311,6 +364,11 @@ class HotkeyService:
                  timer_factory=None, key_state=None,
                  stale_interval=STALE_CHECK_S):
         self._api = api
+        # Preloading the model is decided here, where the tap gate is known:
+        # only a recording that is really a dictation loads it.
+        takes_flag = takes_keyword(getattr(api, "start_recording", None), "prewarm")
+        self._start_kwargs = {"prewarm": False} if takes_flag else {}
+        self._can_prewarm = callable(getattr(api, "prewarm_now", None))
         self._widget = widget
         self._hide_delay = hide_delay
         self._permissions_check = permissions_check
@@ -359,6 +417,8 @@ class HotkeyService:
         self._target_vk = None
         self._state_lock = threading.RLock()
         self._epoch = 0  # bumped per recording; stale _finish threads must not touch the widget
+        self._pill_up = False  # shown, with no hide run since; see _take_pill_down
+        self._notice_after = 0.0  # the pill is showing a dictation's result until then
         # Key events are handed to this serial worker instead of being acted
         # on inside the hook callback: press() can wait on the previous
         # recorder's stop(), and Windows silently unregisters a
@@ -423,18 +483,29 @@ class HotkeyService:
     def _widget_enabled(self) -> bool:
         return self._widget is not None and bool(self._api.get_config().get("show_widget", True))
 
-    def _run_widget_action(self, epoch: int, action) -> None:
+    def _run_widget_action(self, epoch: int, action, name: str | None = None) -> None:
         with self._state_lock:
             if epoch == self._epoch:
                 action()
+                if name == "hide":
+                    self._pill_up = False  # only now: a newer epoch drops a queued hide
 
     def _widget_action(self, name: str, epoch: int, *args, **kwargs) -> None:
+        """Caller holds _state_lock."""
         method = getattr(self._widget, name)
+        if name != "hide":
+            self._pill_up = True
         if getattr(self._widget, "_supports_ownership_action", False):
             method(*args, **kwargs,
-                   if_current=lambda action: self._run_widget_action(epoch, action))
+                   if_current=lambda action: self._run_widget_action(epoch, action, name))
         else:
-            method(*args, **kwargs)
+            self._run_widget_action(epoch, lambda: method(*args, **kwargs), name)
+
+    def _take_pill_down(self, epoch: int) -> None:
+        """Hide the pill if one is up; caller holds _state_lock. This goes by
+        what was shown, not by the setting, which may have changed since."""
+        if self._pill_up:
+            self._widget_action("hide", epoch)
 
     def press(self, latched=False, at=None) -> None:
         at = self._clock() if at is None else at
@@ -465,7 +536,7 @@ class HotkeyService:
             self._spawn_finish(*finish)
             return
         try:
-            result = self._api.start_recording()
+            result = self._api.start_recording(**self._start_kwargs)
         except Exception as error:
             result = {"error": str(error)}
         except BaseException:
@@ -478,6 +549,7 @@ class HotkeyService:
         pane = None
         refused = False
         learn = False
+        preload = None   # (epoch, seconds until the press outlives the gate, toggle)
         with self._state_lock:
             self._starting = False
             released, cancelled = self._start_released, self._start_cancelled
@@ -509,12 +581,22 @@ class HotkeyService:
                             "show_recording", epoch,
                             theme=sanitize_pill_theme(cfg.get("pill_theme")),
                             color=sanitize_pill_color(cfg.get("pill_color")))
+                    else:
+                        # the setting went off under an older pill, and the
+                        # new epoch orphans that pill's own hide
+                        self._take_pill_down(epoch)
                     if released:
                         # a toggle ends at once; a held key goes through the gate
                         finish = (self._end_recording() if self._latched
                                   else self._release_held(self._start_released_at))
                     else:
                         learn = not self._latched
+                        if self._can_prewarm:
+                            wait = 0.0
+                            if not self._latched and self._tap_gate_s:
+                                wait = max(0.0, (self._pressed_at or 0)
+                                           + self._tap_gate_s - self._clock())
+                            preload = (epoch, wait, self._latched)
         if refused:
             if pane is not None:
                 try:
@@ -528,6 +610,34 @@ class HotkeyService:
             self._spawn_finish(*finish)
         elif learn:
             self._learn_key_state()
+        if preload is not None and finish is None and not cancelled:
+            self._schedule_preload(*preload)
+
+    def _schedule_preload(self, epoch, wait, toggle) -> None:
+        """Load the model once this recording is known to be a dictation: at
+        once for a toggle (hands-free from the start), else when the held key
+        outlives the tap gate. Called outside _state_lock."""
+        if toggle or wait <= 0:
+            self._preload_if_current(epoch)
+            return
+        timer = self._timer_factory(wait, lambda: self._preload_if_current(epoch))
+        timer.start()
+
+    def _preload_if_current(self, epoch) -> None:
+        """Timer thread. Skips a press that was released, dropped as a tap,
+        or is still a pending tap; asks the Api outside _state_lock."""
+        with self._state_lock:
+            real = (self._pressed and self._epoch == epoch
+                    and self._pending is None and not self._starting)
+        if real:
+            self._preload()
+
+    def _preload(self) -> None:
+        if self._can_prewarm:
+            try:
+                self._api.prewarm_now()   # spawns its own thread
+            except Exception:
+                pass
 
     def _settle_pending(self, at) -> bool:
         """A press while a quick tap waits. Within the tap gate it makes the
@@ -547,6 +657,7 @@ class HotkeyService:
                 self._drop_chord(self._epoch)
         if latched:
             _log("hands-free on (double-tap)")
+            self._preload()   # a real hands-free dictation: load the model now
             return True
         self._api._cancel_recording()
         return False
@@ -602,6 +713,16 @@ class HotkeyService:
         self._pane_opened_at = now
         return key
 
+    def _dress_widget(self) -> None:
+        """Only a recording sets the pill's theme. A state with no dictation
+        behind it would otherwise wear the last dictation's, or Signature
+        straight after launch."""
+        set_look = getattr(self._widget, "set_look", None)
+        if set_look is None:
+            return
+        cfg = self._api.get_config()
+        set_look(cfg.get("pill_theme"), cfg.get("pill_color"))
+
     def _flash_error(self) -> None:
         """Error pill, then hide; caller holds _state_lock. The timed hide
         runs on its own thread: nothing here may wait."""
@@ -609,6 +730,7 @@ class HotkeyService:
             return
         self._epoch += 1
         epoch = self._epoch
+        self._dress_widget()
         self._widget_action("show_error", epoch)
 
         def hide_later():
@@ -658,9 +780,11 @@ class HotkeyService:
         passes the result to _spawn_finish after letting go of it."""
         self._pressed = False
         epoch = self._epoch
-        show = self._widget_enabled()
+        show = self._pill_up and self._widget_enabled()
         if show:
             self._widget_action("show_processing", epoch)
+        else:
+            self._take_pill_down(epoch)
         future = self._api._release_recording(paste=True)
         return future, show, epoch
 
@@ -681,17 +805,56 @@ class HotkeyService:
             with self._state_lock:
                 if not show or epoch != self._epoch:
                     return
+                # a request to do something needs longer than a checkmark
+                hold = self._hide_delay
                 if "error" in result:
                     self._widget_action("show_error", epoch)
+                elif result.get("manual_paste"):
+                    self._widget_action("show_copied", epoch)
+                    hold = hold and hold * self.COPIED_HOLD
                 else:
                     self._widget_action("show_done", epoch)
-            if self._hide_delay:
-                time.sleep(self._hide_delay)
+                self._notice_after = time.monotonic() + (hold or 0)
+            if hold:
+                time.sleep(hold)
             with self._state_lock:
                 if epoch == self._epoch:
                     self._widget_action("hide", epoch)
         except Exception:
             pass
+
+    def show_notice(self, text: str) -> None:
+        """A brief line in the pill, when no dictation needs the pill. Waits
+        its turn off to the side, and gives up after a while."""
+        if not self._widget_enabled() or not hasattr(self._widget, "show_notice"):
+            return
+
+        def idle():
+            busy = getattr(self._api, "dictation_in_flight", None)
+            return not (self._pressed or self._starting or self._pending is not None
+                        or time.monotonic() < self._notice_after
+                        or (busy is not None and busy()))
+
+        def go():
+            for _ in range(self.NOTICE_TRIES):
+                with self._state_lock:
+                    if idle():
+                        if not self._widget_enabled():
+                            return  # turned off while this waited
+                        self._epoch += 1
+                        epoch = self._epoch
+                        self._dress_widget()
+                        self._widget_action("show_notice", epoch, text)
+                        break
+                time.sleep(self.NOTICE_RETRY_S)
+            else:
+                return
+            time.sleep(self.NOTICE_HOLD_S)
+            with self._state_lock:
+                if epoch == self._epoch:
+                    self._widget_action("hide", epoch)
+
+        threading.Thread(target=go, name="voisr-notice", daemon=True).start()
 
     def _resolve_target(self, key_name=None):
         """Return (vk, label) for the push-to-talk key.
@@ -860,7 +1023,8 @@ class HotkeyService:
         recording after letting go of it: closing a mic can block, and the
         pill's callbacks take the lock."""
         self._pressed = False
-        if self._widget_enabled():
+        # a pill that's up comes down even if the setting went off since
+        if self._pill_up or self._widget_enabled():
             self._widget_action("hide", epoch)
 
     def _spawn_listener(self) -> None:
@@ -1035,14 +1199,36 @@ class Api:
                  save_dialog_fn=None,
                  timer_factory=threading.Timer,
                  exit_fn=None,
-                 mic_check=None):
+                 mic_check=None,
+                 models_dir=None, model_downloader=None, system_info_fn=None,
+                 bundled_models_dir=None, warm_server=None,
+                 ax_adapter=None, suggestions=None):
         self._config_path = Path(config_path) if config_path else default_config_path()
+        # Kept-loaded whisper-server; None = every dictation uses whisper-cli
+        # (tests and the CLI paths that don't set one up).
+        self._warm = warm_server
+        # None = the per-user downloads folder plus the models that ship with
+        # Voisr (models.MODELS_DIR, models.BUNDLED_DIR). A test passes its own
+        # folder, and only that folder (and bundled_models_dir) is used.
+        self._models_dir = models_dir
+        self._bundled_models_dir = bundled_models_dir
+        self._model_downloader = model_downloader
+        self._model_downloader_lock = threading.Lock()
+        self._system_info_fn = system_info_fn
         self._history = history or HistoryStore(self._config_path.parent / "history.jsonl")
         self._transcribe_fn = transcribe_fn
         self._clock = clock
         self._hotkey_service = hotkey_service
         self._capture_fn = capture_fn
         self._paste_fn = paste_fn
+        # A paste function that reports when Ctrl+V went out lets the paste
+        # timing stop there, not after the clipboard-restore wait.
+        self._paste_reports_sent = takes_keyword(paste_fn, "on_sent")
+        self._paste_takes_verifier = takes_keyword(paste_fn, "verifier")
+        if ax_adapter is not None and not self._paste_takes_verifier:
+            # the screen can be read but the paste can't be checked: a missed
+            # paste would restore the old clipboard instead of keeping the text
+            _update_log("paste check off: the paste function takes no verifier")
         self._clipboard_fn = clipboard_fn
         self._save_dialog_fn = save_dialog_fn or _run_save_dialog
         self._timer_factory = timer_factory
@@ -1050,6 +1236,7 @@ class Api:
         # None = no check, so tests never probe the machine's real privacy
         # settings
         self._mic_check = mic_check
+        self._mic_heard = False  # a clip this launch held real audio
         # Both None until the matching attach_*(): a headless or test Api has
         # no updater and no window, and every method below tolerates that.
         self._updates = None
@@ -1064,6 +1251,7 @@ class Api:
         self._last_paste_ts = None
         self._typing_generation = 0
         self._last_paste_typing_generation = 0
+        self._last_paste_app = None
         self._paste_state_lock = threading.Lock()
         self._window = None
         self._status_item = None
@@ -1078,6 +1266,19 @@ class Api:
         self._config_lock = threading.RLock()
         self._config_stat_cache = None  # (stat key, parsed config) or None
         self._config_notice = None  # set when a corrupt config was moved aside
+        # Read the screen only with an adapter: None (tests, unless they pass a
+        # fake) never touches UI Automation.
+        self._focus = (FocusTracker(ax_adapter, self._screen_context_on, clock=clock)
+                       if ax_adapter is not None else None)
+        # beside history, so a test's tmp history keeps its pairs there too
+        self._suggestions = suggestions or SuggestionStore(
+            Path(getattr(self._history, "path", self._config_path.parent / "history.jsonl")).parent
+            / "suggestions.json")
+        self._edit_watcher = (
+            EditWatcher(ax_adapter, self._focus.worker, self._learning_on,
+                        self._edit_window_ended, clock=clock)
+            if self._focus is not None else None)
+        self._click_watch = None  # see install_click_watch
         self._recordings = RecordingQueue(
             recorder_factory=recorder_factory,
             fallback_recorder_factory=fallback_recorder_factory,
@@ -1085,16 +1286,384 @@ class Api:
             clock=clock,
         )
 
-    def _default_transcribe(self, wav, cfg):
-        """Transcribe with the release-time model and dictionary prompt."""
-        from voisr.transcriber import resolve_model, transcribe as _transcribe
-        return _transcribe(wav, model_path=resolve_model(cfg.get("model")),
-                           prompt=glossary_prompt(cfg.get("dictionary")))
+    def _default_transcribe(self, wav, cfg, terms=(), triggers=()):
+        """Transcribe with the release-time model and dictionary prompt, plus
+        any terms read off the screen and snippet triggers this clip could be.
+        Returns (text, info): see transcriber.transcribe_routed."""
+        from voisr.transcriber import resolve_model, transcribe_routed
+        unload = self.get_config().get("model_unload", "min5")
+        if self._warm is not None:
+            self._warm.configure(unload)
+        return transcribe_routed(
+            wav, resolve_model(cfg.get("model"), *self._model_dirs()),
+            prompt=glossary_prompt(cfg.get("dictionary"), terms, triggers),
+            # "" rather than None: no prompt at all, not the server's. Its
+            # command line is readable by other processes of this user while it
+            # runs, so no term that could be a code or a password shown on screen.
+            cli_prompt=glossary_prompt(cfg.get("dictionary"), cli_safe_terms(terms),
+                                       triggers) or "",
+            server=self._warm,
+            # the setting now, not the one the dictation began under: a
+            # queued dictation must not undo a change made in Settings since
+            unload=unload)
 
-    def _transcribe_audio(self, wav, cfg):
+    PREWARM_DELAY_S = 0.3   # for callers with no tap gate (the dashboard)
+
+    def prewarm_now(self):
+        """Start loading the model in the background, without waiting. Called
+        once a recording is known to be a real dictation: HotkeyService does
+        so when a press outlives its tap gate, when a double-tap latches
+        hands-free, and at a toggle start. Own thread, so the hotkey path
+        never waits for it and it can never raise into it. The press capture
+        of the screen context starts here too, for the same reason: an
+        accidental tap should read nothing."""
+        self._capture_press()
+        warm = self._warm
+        if warm is None:
+            return
+
+        def go():
+            try:
+                from voisr.transcriber import resolve_model
+                cfg = self.get_config()
+                warm.prewarm(resolve_model(cfg.get("model"), *self._model_dirs()),
+                             unload=cfg.get("model_unload", "min5"))
+            except Exception as error:
+                _update_log(f"model preload skipped: {error}")
+
+        threading.Thread(target=go, name="voisr-prewarm", daemon=True).start()
+
+    def _prewarm_later(self, sequence):
+        """A recording started with no hotkey gate in front of it: preload
+        after PREWARM_DELAY_S unless it has ended by then."""
+        if self._warm is None and self._focus is None:
+            return
+
+        def wait_then_go():
+            if self.PREWARM_DELAY_S:
+                time.sleep(self.PREWARM_DELAY_S)
+            if self._active_sequence != sequence:
+                return   # released or cancelled meanwhile
+            self.prewarm_now()
+
+        threading.Thread(target=wait_then_go, name="voisr-prewarm-wait",
+                         daemon=True).start()
+
+    def _screen_context_on(self) -> bool:
+        return self.get_config().get("use_screen_context", True) is True
+
+    def _capture_press(self) -> None:
+        """Queue the capture on the UIA worker. Never waits, never raises."""
+        focus = self._focus
+        if focus is None:
+            return
+        try:
+            sequence = self._active_sequence
+            if sequence is not None:
+                focus.capture_press(sequence)
+        except Exception as error:
+            _update_log(f"screen context skipped ({error.__class__.__name__})")
+
+    def _capture_release(self, sequence) -> None:
+        """Same contract as _capture_press."""
+        if self._focus is None:
+            return
+        try:
+            self._focus.capture_release(sequence)
+        except Exception as error:
+            _update_log(f"screen context skipped ({error.__class__.__name__})")
+
+    def _focus_details(self, sequence):
+        """(extra timings, history fields) for this dictation's captures: how
+        long they took on the UIA worker, and which app. A denylisted app isn't
+        named in History. None of it ever stops a dictation."""
+        state = self._focus.session(sequence) if self._focus is not None else None
+        if state is None:
+            return {}, {}
+        timings = {"ax_context": state.ax_ms()}
+        focus = state.for_app()
+        if focus is None or focus.secure:
+            return timings, {}
+        return timings, {"app": focus.bundle_id}
+
+    def _learning_on(self) -> bool:
+        cfg = self.get_config()
+        return (cfg.get("use_screen_context", True) is True
+                and cfg.get("learn_from_edits", True) is True)
+
+    def _open_edit_window(self, item, text, check, terms) -> None:
+        """After a verified paste, and only then. Best effort."""
+        before, after = check.get("before"), check.get("after")
+        verdict = check.get("verdict")
+        if (self._edit_watcher is None or verdict is None
+                or verdict.status != "verified" or not before.caret_known):
+            return
+        try:
+            if self._learning_on():
+                self._edit_watcher.watch(item["id"] if item else None, before,
+                                         after.element_id, text, terms)
+        except Exception as error:
+            _update_log(f"edit learning skipped ({error.__class__.__name__})")
+
+    def _read_paste_target(self):
+        """Read where the paste is about to go: the release capture may be of a
+        field the user has since left. Bounded, and not knowing means None."""
+        if self._focus is None or not self._screen_context_on():
+            return None
+        try:
+            return self._focus.read_now(VERIFY_BUDGET_S)
+        except Exception as error:
+            _update_log(f"screen context skipped ({error.__class__.__name__})")
+            return None
+
+    def _end_learning_for_snippet(self, session) -> None:
+        """Before the text can reach a field, where a window still open on an
+        earlier dictation would read it as the user's edit."""
+        if self._edit_watcher is None:
+            return
+        try:
+            state = self._focus.session(session.sequence)
+            self._edit_watcher.end_for_snippet(state.release_now() if state is not None else None)
+        except Exception as error:
+            _update_log(f"edit learning skipped ({error.__class__.__name__})")
+
+    def _edit_window_ended(self, result) -> None:
+        """Watcher thread. Only counts and corrected pairs get this far."""
+        if result.item_id is not None:
+            self._history.merge_fields(result.item_id, fields={
+                "edit_end_reason": result.reason,
+                "words_corrected": result.words_corrected})
+        if not result.pairs or not self._learning_on():
+            return
+        cfg = self.get_config()
+        dictionary = cfg.get("dictionary") or {}
+        pairs = self._suggestions.observe(
+            (heard, written) for heard, written in result.pairs
+            if dictionary.get(heard.casefold()) != written)
+        added = self._auto_add(pairs) if cfg.get("dictionary_auto_add", True) is True else []
+        # seen once: first time here. A pair seen again, or ordinary editing,
+        # stays quiet in the view.
+        self._notify_dictionary(added, [pair for pair in pairs
+                                        if pair.status == PENDING and pair.seen == 1
+                                        and is_term_fix(pair.heard, pair.written)])
+
+    def _auto_add(self, pairs) -> list:
+        ready = [pair for pair in pairs if ready_to_auto_add(pair)]
+        if not ready:
+            return []
+        added = []
+        with self._config_lock:
+            dictionary = dict(self.get_config().get("dictionary") or {})
+            for pair in ready:
+                if dictionary_allows(pair, dictionary):
+                    dictionary[pair.key] = pair.written
+                    added.append(pair)
+            if added:
+                self._update_config({"dictionary": dictionary})
+                for pair in added:
+                    self._suggestions.set_status(pair.id, AUTO_ADDED)
+        return added
+
+    def _notify_dictionary(self, added, suggested=()) -> None:
+        """Refresh an open Dictionary view; say what was added unasked, in the
+        pill and the dashboard, and what is newly suggested, in the pill. None
+        of it takes focus or waits for anything."""
+        win = self._window
+        if win is not None:
+            detail = json.dumps({"added": [
+                {"heard": pair.key, "written": pair.written} for pair in added]})
+
+            def go():
+                try:
+                    # json.dumps: these are words from the user's own text
+                    win.evaluate_js('window.dispatchEvent(new CustomEvent('
+                                    f'"voisr:dictionary-changed", {{detail: {detail}}}))')
+                except Exception:
+                    pass
+
+            threading.Thread(target=go, daemon=True).start()
+        svc = self._hotkey_service
+        if (added or suggested) and svc is not None and hasattr(svc, "show_notice"):
+            # short: the pill cuts off what doesn't fit, and the word must show
+            words = ", ".join(pair.written for pair in added or suggested)
+            svc.show_notice(f"Added {words} to Dictionary" if added else f"Suggested: {words}")
+
+    def dictation_in_flight(self) -> bool:
+        with self._session_lock:
+            return bool(self._sessions_in_flight)
+
+    def _bump_used(self, fired: dict) -> None:
+        """Off the delivery path: an fsync per dictation isn't worth a wait."""
+        if not fired:
+            return
+
+        def go():
+            try:
+                self._suggestions.bump_used(fired)
+            except Exception as error:
+                _update_log(f"dictionary counts not saved ({error.__class__.__name__})")
+
+        threading.Thread(target=go, daemon=True).start()
+
+    def get_suggestions(self):
+        """Bridge: what the Dictionary view needs beyond the entries."""
+        return {"pending": [{"id": p.id, "heard": p.heard, "written": p.written,
+                             "seen": p.seen}
+                            for p in self._suggestions.pending()],
+                "auto_added": self._suggestions.auto_added(),
+                "used": self._suggestions.used()}
+
+    def accept_suggestion(self, pair_id):
+        """Bridge: the user's click adds it, whichever kind it is."""
+        pair = self._suggestions.get(pair_id) if isinstance(pair_id, str) else None
+        if pair is None:
+            return {"error": "that suggestion has gone"}
+        with self._config_lock:
+            dictionary = dict(self.get_config().get("dictionary") or {})
+            dictionary[pair.key] = pair.written
+            self._update_config({"dictionary": dictionary})
+            self._suggestions.set_status(pair.id, ACCEPTED)
+        return {"ok": True}
+
+    def dismiss_suggestion(self, pair_id):
+        """Bridge: never suggested or auto-added again."""
+        if not isinstance(pair_id, str) or not self._suggestions.set_status(pair_id, DISMISSED):
+            return {"error": "that suggestion has gone"}
+        return {"ok": True}
+
+    def get_snippets(self):
+        """Bridge: the Snippets page's rows, with any warning about the trigger."""
+        snippets = self.get_config().get("snippets") or {}
+        warnings = snippet_warnings(snippets)
+        return [{"trigger": trigger, "text": text, "warning": warnings[trigger]}
+                for trigger, text in snippets.items()]
+
+    def save_snippet(self, old_trigger, trigger, text):
+        """Bridge: add one (old_trigger None) or replace one. The one place that
+        decides what may be saved, so the page can't disagree with matching."""
+        with self._config_lock:
+            snippets = self.get_config().get("snippets") or {}
+            try:
+                saved = with_saved(snippets, old_trigger, trigger, text)
+            except SnippetError as error:
+                return {"error": str(error)}
+            self._update_config({"snippets": saved})
+        tidy = tidy_trigger(trigger)
+        return {"ok": True, "trigger": tidy, "warning": snippet_warnings(saved)[tidy]}
+
+    def delete_snippet(self, trigger):
+        """Bridge. Removing one that has already gone is not a failure."""
+        with self._config_lock:
+            snippets = dict(self.get_config().get("snippets") or {})
+            if isinstance(trigger, str) and snippets.pop(trigger, None) is not None:
+                self._update_config({"snippets": snippets})
+        return {"ok": True}
+
+    def _make_verifier(self, session, text, check: dict):
+        """What the paste calls after its grace, with the old clipboard's text;
+        True leaves the dictation on the clipboard. Fills `check` for later:
+        the verdict, the two captures, and the read's time. Only reads, for at
+        most VERIFY_BUDGET_S. Skipped entirely when off or with no baseline.
+        Called before the paste, which is when the baseline is fixed: a capture
+        ending later may have read the text landing, and that would look like a
+        field the paste never changed."""
+        focus = self._focus
+        state = focus.session(session.sequence)
+        before = state.release_now() if state is not None else None
+
+        def verify(old_clipboard):
+            started = self._clock()
+            after = None
+            if not self._screen_context_on():
+                verdict = skipped("context_off")
+            elif before is None:
+                late = state is not None and state.release_now() is not None
+                verdict = skipped("late_baseline" if late else "no_baseline")
+            else:
+                try:
+                    after = focus.read_now(VERIFY_BUDGET_S)
+                    verdict = check_delivery(before, after, text, old_clipboard)
+                except Exception as error:
+                    _update_log(f"paste check skipped ({error.__class__.__name__})")
+                    verdict = skipped("error")
+            check.update(verdict=verdict, before=before, after=after,
+                         ms=(self._clock() - started) * 1000)
+            return verdict.missed
+
+        return verify
+
+    def _model_name(self, cfg):
+        """Model that transcribed this clip, or None when a test or caller
+        injected its own transcribe function and no model was involved."""
         if self._transcribe_fn is not None:
-            return self._transcribe_fn(wav)
-        return self._default_transcribe(wav, cfg)
+            return None
+        from voisr.models import id_from_path
+        from voisr.transcriber import resolve_model
+        return id_from_path(resolve_model(cfg.get("model"), *self._model_dirs()))
+
+    def _record_delivery_timings(self, item, t_start, paste_started, paste_sent=None,
+                                 extra_timings=None, fields=None):
+        """Best effort, after delivery: the paste has already happened and the
+        history line already exists, so a failure here costs only the numbers.
+        paste_sent is when Ctrl+V went out; the clipboard-restore wait after it
+        (inject.PASTE_GRACE_S) is not time the user waited for their text. When
+        the paste function doesn't report it, fall back to now."""
+        if item is None:
+            return
+        now = paste_sent if paste_sent is not None else self._clock()
+        timings = {"total": (now - t_start) * 1000, **(extra_timings or {})}
+        if paste_started is not None:
+            timings["paste"] = (now - paste_started) * 1000
+        try:
+            self._history.merge_fields(item["id"], timings_ms=timings, fields=fields)
+        except Exception as error:
+            _update_log(f"history: timings not recorded: {error}")
+
+    def _transcribe_audio(self, wav, cfg, terms=(), triggers=()):
+        """(raw text, info) where info has the mode and any extra timings."""
+        if self._transcribe_fn is not None:
+            return self._transcribe_fn(wav), {"mode": None, "timings": {}}
+        if triggers:
+            return self._default_transcribe(wav, cfg, terms, triggers)
+        return self._default_transcribe(wav, cfg, terms)
+
+    def _session_terms(self, session, wav):
+        """Terms from whichever capture has finished by now: nothing waits for
+        one, so a hung app costs this dictation its context and nothing else."""
+        state = self._focus.session(session.sequence) if self._focus is not None else None
+        if state is None:
+            return []
+        try:
+            if not self._screen_context_on():
+                return []
+            terms = context_terms(state.for_terms())
+            return terms_for_clip(terms, wav_seconds(wav))
+        except Exception as error:
+            _update_log(f"context terms skipped ({error.__class__.__name__})")
+            return []
+
+    def _transcribe_with_terms(self, wav, cfg, terms):
+        """Context terms and trigger hints may only ever help. A failure with
+        them, or a transcript that recites them (screen words must not reach a
+        paste or History that way), is redone without; a second failure is the
+        real one."""
+        seconds = wav_seconds(wav)
+        triggers = triggers_for_clip(trigger_hints(cfg.get("snippets")), seconds)
+        if not terms and not triggers:
+            return self._transcribe_audio(wav, cfg)
+        try:
+            raw, info = self._transcribe_audio(wav, cfg, terms, triggers)
+        except Exception as error:
+            _update_log(f"transcription with context terms failed "
+                        f"({error.__class__.__name__}); retrying without")
+            return self._transcribe_audio(wav, cfg)
+        # One trigger, said, is what hints are for, even if its words are on screen.
+        if find_snippet(raw, cfg.get("snippets")) is not None or not (
+                prompt_echoed(raw, terms, seconds)
+                or triggers_recited(raw, triggers, [*(cfg.get("dictionary") or {}).values(), *terms])):
+            return raw, info
+        _update_log("transcript echoed the glossary; retrying without context terms")
+        return self._transcribe_audio(wav, cfg)
 
     def current_level(self):
         """Live mic level of the dictation being captured (0..1), or None.
@@ -1107,7 +1676,7 @@ class Api:
         return self.current_level()
 
     def note_user_typing(self):
-        """Record manual typing without blocking the event-tap callback."""
+        """Record typing, or a click, without blocking the hook's callback."""
         with self._paste_state_lock:
             self._typing_generation += 1
 
@@ -1149,6 +1718,11 @@ class Api:
             else:
                 self._sessions_in_flight.discard(sequence)
             busy = bool(self._sessions_in_flight)
+            if not in_flight and self._focus is not None:
+                self._focus.forget(sequence)  # its screen text goes with it
+            if self._warm is not None:
+                # holds off the idle unload from key down to the last paste
+                self._warm.set_busy(busy)
             status = self._status_item
             if status is None or busy == self._glyph_busy:
                 return
@@ -1177,8 +1751,9 @@ class Api:
 
     def capture_hotkey(self):
         """'Press any key' flow: suspend the live listener (so the pressed
-        key doesn't trigger a dictation), capture the next key, persist it,
-        and restart the listener on it."""
+        key doesn't trigger a dictation), capture the next key -- any key
+        except Esc, which cancels, since in the Settings pop-up Esc means back
+        out -- persist it, and restart the listener on it."""
         svc = self._hotkey_service
         if svc is not None:
             svc.stop()
@@ -1187,6 +1762,8 @@ class Api:
             if not got:
                 return {"error": "no key detected — click Change and press a key"}
             vk, label = got
+            if vk == ESC_VK:
+                return {"cancelled": True}
             self._update_config({"hotkey_vk": vk, "hotkey_label": label})
             return {"vk": vk, "label": label}
         finally:
@@ -1208,20 +1785,28 @@ class Api:
         duration = max((session.released_at - session.started_at), 0.1)
         # Some audio but too little is a tap, not a mic fault. No audio at
         # all still falls through to the permission message below.
-        if 0 < wav_seconds(wav) < MIN_SPEECH_S:
+        seconds = wav_seconds(wav)
+        if 0 < seconds < MIN_SPEECH_S:
+            _update_log(f"audio: clip {seconds:.2f} s, too short")
             return SessionResult.failure(
                 session.sequence, "audio",
                 "too short — hold the key while you speak")
         if not wav.exists() or wav.stat().st_size < 1000:
+            _update_log("audio: no usable recording")
             detail = session.capture_stderr.strip()[:120]
             return SessionResult.failure(
                 session.sequence, "audio",
                 f"recording failed (mic permission?) {detail}".rstrip())
         span = speech_gate.gate_wav(wav)  # None: unreadable, skip the gate
+        # Measurements only, never what was said: the evidence the gate's
+        # limits are tuned from. voisr.log, since print() is silent in the
+        # windowed build.
+        _update_log(f"audio: {speech_gate.describe(span, seconds)}")
         if span is not None:
             if span.verdict == "all_zeros":
                 return SessionResult.failure(
                     session.sequence, "audio", MIC_SILENT_MESSAGE)
+            self._mic_heard = True
             if span.verdict == "no_speech":
                 return SessionResult.failure(
                     session.sequence, "audio", NO_SPEECH_MESSAGE)
@@ -1232,9 +1817,26 @@ class Api:
             except Exception as error:
                 # an untrimmed clip still transcribes
                 _update_log(f"audio: trim failed: {error}")
+        t_start = self._clock()
         try:
-            raw = self._transcribe_audio(wav, cfg)
-            text = clean(raw, dictionary=cfg.get("dictionary", {}))
+            terms = self._session_terms(session, wav)
+            raw, info = self._transcribe_with_terms(wav, cfg, terms)
+            t_transcribed = self._clock()
+            fired = {}
+            # Before clean(): a snippet matches what Whisper heard, and its text
+            # is pasted as saved, with no cleanup or Dictionary changes.
+            found = find_snippet(raw, cfg.get("snippets"))
+            snippet = found if has_speech_evidence(span) else None
+            if snippet is not None:
+                text = snippet.text
+            else:
+                if found is not None:
+                    # names no trigger: the only trace of why it pasted as words
+                    _update_log(f"snippet held back, sustained speech "
+                                f"{span.sustained_ms if span else 'unknown'} ms")
+                text = clean(raw, dictionary=cfg.get("dictionary", {}),
+                             on_replace=lambda key: fired.__setitem__(key, fired.get(key, 0) + 1))
+            t_cleaned = self._clock()
         except Exception as error:
             return SessionResult.failure(
                 session.sequence, "transcription",
@@ -1243,11 +1845,22 @@ class Api:
             return SessionResult.failure(
                 session.sequence, "transcription",
                 "nothing transcribed — try speaking a bit longer")
+        if snippet is not None:
+            self._end_learning_for_snippet(session)
 
         item = None
         warning = None
         try:
-            item = self._history.add(text, duration_s=duration)
+            # Written before pasting so the dictation is durable whatever
+            # the paste does. Paste and total are merged in afterwards.
+            # A snippet's row is its trigger: personal details stay out of it.
+            item = self._history.add(
+                text if snippet is None else snippet.trigger,
+                duration_s=duration, model=self._model_name(cfg),
+                mode=info["mode"], snippet=snippet is not None,
+                timings_ms={"transcribe": (t_transcribed - t_start) * 1000,
+                            "cleanup": (t_cleaned - t_transcribed) * 1000,
+                            **info["timings"]})
             self._notify_dictation()
         except Exception as error:
             warning = f"history failed: {error}"[:250]
@@ -1256,39 +1869,77 @@ class Api:
         paste_error = None
         fallback_safe = True
         typing_generation = None
+        paste_started = None
+        paste_sent = [None]  # clock reading when the paste function sent Ctrl+V
+        check = {}  # filled by the verifier, when there is one
+        checking = self._focus is not None and self._paste_takes_verifier
         if session.paste_requested and cfg.get("paste") and not self._quitting:
+            paste_started = self._clock()
             with self._paste_state_lock:
                 typing_generation = self._typing_generation
-                join = (
+                recent = (
                     self._last_paste_text
                     and typing_generation == self._last_paste_typing_generation
                     and self._clock() - self._last_paste_ts <= self.SPACE_JOIN_WINDOW_S
                     and not self._last_paste_text[-1].isspace()
                 )
+                last_app = self._last_paste_app
+            # outside the lock: this waits on the UIA worker
+            target = self._read_paste_target()
+            join = (needs_leading_space(target, text) if snippet is not None
+                    else dictation_wants_space(target, text, recent, last_app))
             try:
-                pasted = self._paste_fn((" " if join else "") + text)
+                pasted = self._paste_fn(
+                    (" " if join else "") + text,
+                    **({"on_sent": lambda: paste_sent.__setitem__(0, self._clock())}
+                       if self._paste_reports_sent else {}),
+                    **({"verifier": self._make_verifier(session, text, check)}
+                       if checking else {}))
             except PasteDeliveryError as error:
                 pasted = error.pasted
                 fallback_safe = error.fallback_safe
                 paste_error = error
             except Exception as error:
                 paste_error = error
-            if pasted:
+            if pasted and checking and paste_error is None and "verdict" not in check:
+                # the paste returned without waiting: a concealed clipboard
+                check["verdict"] = skipped("concealed_clipboard")
+            if pasted and not (check.get("verdict") and check["verdict"].missed):
                 with self._paste_state_lock:
                     self._last_paste_text = text
                     self._last_paste_ts = self._clock()
                     self._last_paste_typing_generation = typing_generation
+                    self._last_paste_app = target.bundle_id if target is not None else None
 
-        copied = pasted
+        verdict = check.get("verdict")
+        manual_paste = bool(pasted and verdict and verdict.missed)
+        copied = pasted  # a missed paste left the dictation on the clipboard
+        pasted = pasted and not manual_paste
         clipboard_error = None
-        if not pasted and fallback_safe and not self._quitting:
+        if not copied and fallback_safe and not self._quitting:
             try:
                 self._clipboard_fn(text)
                 copied = True
             except Exception as error:
                 clipboard_error = error
 
+        extra_timings, details = self._focus_details(session.sequence)
+        if verdict is not None:
+            details.update(verdict.fields())
+            if "ms" in check:
+                extra_timings["verify"] = check["ms"]
+        self._record_delivery_timings(item, t_start, paste_started, paste_sent[0],
+                                      extra_timings, details)
+
+        self._bump_used(fired)
+        if snippet is None:
+            self._open_edit_window(item, text, check, terms)
+
         fields = {"text": text, "copied": copied, "pasted": pasted}
+        if verdict is not None:
+            fields["delivery"] = verdict.status
+        if manual_paste:
+            fields["manual_paste"] = True
         if item is not None:
             fields["item"] = item
         if warning is not None:
@@ -1305,7 +1956,8 @@ class Api:
                 f"delivery failed: {detail}"[:250], **fields)
         return SessionResult.success(session.sequence, **fields)
 
-    def start_recording(self):
+    def start_recording(self, prewarm=True):
+        """prewarm=False: the caller (HotkeyService) decides when to preload."""
         if self._mic_check is not None:
             try:
                 mic = self._mic_check()
@@ -1321,6 +1973,8 @@ class Api:
         self._active_sequence = session.sequence
         self._is_recording = True
         self._mark_session(session.sequence, True)
+        if prewarm:
+            self._prewarm_later(session.sequence)
         return {"recording": True, "session_id": session.sequence}
 
     def _release_recording(self, paste=False):
@@ -1329,6 +1983,7 @@ class Api:
         future = self._recordings.release(
             paste_requested=paste, context=self.get_config())
         if sequence is not None:
+            self._capture_release(sequence)
             # Safety net for the path that never reaches _process_session --
             # a recorder whose stop() throws is completed straight from the
             # queue worker. Retiring twice (the normal path's finally also
@@ -1355,7 +2010,18 @@ class Api:
         # words and go to History), but nothing may paste or touch the
         # clipboard after the user has left the app.
         self._quitting = True
+        if self._model_downloader is not None:
+            self._model_downloader.cancel()  # its .part stays, to resume
         self._recordings.close()
+        if self._edit_watcher is not None:
+            self._edit_watcher.stop()
+        if self._focus is not None:
+            self._focus.close()
+        watch, self._click_watch = self._click_watch, None
+        if watch is not None:
+            watch.stop()
+        if self._warm is not None:
+            self._warm.shutdown()
         if self._status_item is not None:
             self._status_item.release()
 
@@ -1390,6 +2056,9 @@ class Api:
             return copy.deepcopy(cached[1])
         cfg = load_config(self._config_path,
                           on_corrupt=self._note_corrupt_config)
+        # the theme the pill will really show, so the Settings picker has one
+        # to highlight after a theme this version no longer has was saved
+        cfg["pill_theme"] = sanitize_pill_theme(cfg.get("pill_theme"))
         self._config_stat_cache = (key, copy.deepcopy(cfg))
         return cfg
 
@@ -1502,12 +2171,34 @@ class Api:
         if errors:
             return {"error": "; ".join(errors)}
         with self._config_lock:
-            old_hotkey = self.get_config().get("hotkey")
+            old_cfg = self.get_config()
+            old_hotkey = old_cfg.get("hotkey")
             cfg = self._update_config(updates)
+        self._apply_warm_settings(old_cfg, cfg)
+        if "dictionary" in updates:
+            try:
+                self._suggestions.dictionary_changed(
+                    old_cfg.get("dictionary") or {}, cfg.get("dictionary") or {})
+            except Exception as error:
+                _update_log(f"suggestions not updated ({error.__class__.__name__})")
         new_hotkey = cfg.get("hotkey")
         if self._hotkey_service and new_hotkey != old_hotkey:
             self._hotkey_service.restart(new_hotkey)
         return cfg
+
+    def _apply_warm_settings(self, old_cfg, cfg):
+        """A different model must not stay loaded (it holds hundreds of MB
+        and the next dictation would use the wrong one); a new unload choice
+        takes effect now."""
+        if self._warm is None:
+            return
+        try:
+            if cfg.get("model") != old_cfg.get("model"):
+                self._warm.unload()
+            if cfg.get("model_unload") != old_cfg.get("model_unload"):
+                self._warm.configure(cfg.get("model_unload", "min5"))
+        except Exception as error:
+            _update_log(f"warm model settings not applied: {error}")
 
     def get_hotkey_options(self):
         # voisr.keys.hotkey_options() returns {"name", "label"}; the JS
@@ -1560,10 +2251,51 @@ class Api:
                 "health": getattr(svc, "health", "off")}
 
     def get_permissions(self):
-        return {"panes": permissions.states()}
+        return {"panes": self._with_mic_heard(permissions.states())}
+
+    def _with_mic_heard(self, panes):
+        """The probe can't always tell: the registry switches may be unset
+        and opening a stream can fail while the device is busy. Real audio
+        settles it, since a switched-off or dead mic sends only zeros. Only
+        an unknown is overruled, never a known refusal."""
+        if self._mic_heard:
+            for pane in panes:
+                if pane["key"] == "microphone" and pane["granted"] is None:
+                    pane["granted"] = True
+        return panes
 
     def open_settings_pane(self, key):
         return {"ok": permissions.open_pane(key)}
+
+    def first_run_pending(self) -> bool:
+        """Does first run still need showing? A saved first_run_done answers.
+        With none, an existing config.json or history means an install from
+        before first run, which skips it and stays unwritten. Otherwise this is
+        a fresh install: save False now, so a change made during first run can't
+        make it look like an existing install if they quit midway."""
+        with self._config_lock:
+            done = self.get_config().get("first_run_done")
+            if done is None:
+                if self._config_path.exists() or self._has_history():
+                    return False
+                try:
+                    self._update_config({"first_run_done": False})
+                except OSError as error:
+                    _log(f"first run not saved ({error})")
+            elif done:
+                return False
+        return True
+
+    def _has_history(self) -> bool:
+        path = getattr(self._history, "path", None)
+        try:
+            return path is not None and Path(path).stat().st_size > 0
+        except OSError:
+            return False
+
+    def get_first_run(self):
+        """Bridge: whether the page opens on first run rather than Home."""
+        return {"pending": self.first_run_pending()}
 
     def restore_history_item(self, item):
         try:
@@ -1579,18 +2311,76 @@ class Api:
             return {"error": str(e)}
         return {"ok": True, "removed": removed}
 
+    def _model_dirs(self):
+        """(downloads folder, bundled folder or None), read at call time so a
+        test can point models.MODELS_DIR elsewhere."""
+        if self._models_dir is None:
+            from voisr import models
+            return models.MODELS_DIR, models.BUNDLED_DIR
+        bundled = self._bundled_models_dir
+        return Path(self._models_dir), Path(bundled) if bundled else None
+
+    def _downloader(self):
+        from voisr.models import ModelDownloader
+        with self._model_downloader_lock:
+            if self._model_downloader is None:
+                models_dir, bundled = self._model_dirs()
+                self._model_downloader = ModelDownloader(models_dir,
+                                                         bundled_dir=bundled)
+            return self._model_downloader
+
+    def _system_info(self):
+        from voisr.models import system_info
+        return (self._system_info_fn or system_info)()
+
+    def _active_model_id(self):
+        from voisr.models import id_from_path
+        from voisr.transcriber import resolve_model
+        p = resolve_model(self.get_config().get("model"), *self._model_dirs())
+        return id_from_path(p) if p.is_file() else None
+
     def get_models(self):
-        from voisr.transcriber import MODELS_DIR, PREFERRED_MODELS
-        labels = {"small.en": "Small — best accuracy",
-                  "base.en": "Base — fastest"}
-        models = []
-        for name in PREFERRED_MODELS:
-            path = MODELS_DIR / f"ggml-{name}.bin"
-            installed = path.exists()
-            models.append({"value": name, "label": labels.get(name, name),
-                           "installed": installed,
-                           "bytes": path.stat().st_size if installed else 0})
-        return {"models": models, "active": self.get_config().get("model")}
+        """Settings' model list: every registry model and any custom file,
+        what's installed and in use, this PC's processor and memory, and the
+        current or last download. Rows with "bundled" ship with Voisr."""
+        from voisr.models import list_models
+        system = self._system_info()
+        active = self._active_model_id()
+        models_dir, bundled = self._model_dirs()
+        return {"models": list_models(models_dir, system, active, bundled_dir=bundled),
+                "active": active, "system": system,
+                "download": self._downloader().progress()}
+
+    def download_model(self, model_id):
+        return self._downloader().start(model_id, self._system_info())
+
+    def get_download_progress(self):
+        return self._downloader().progress()
+
+    def delete_model(self, model_id):
+        from voisr.models import delete_file, installed_paths, is_bundled
+        models_dir, bundled = self._model_dirs()
+        installed = installed_paths(models_dir, bundled)
+        path = installed.get(model_id)
+        if path is None:
+            return {"error": "That model isn't installed."}
+        if is_bundled(path, bundled):
+            return {"error": "That model comes with Voisr, so it can't be deleted."}
+        if len(installed) <= 1:
+            return {"error": "It's the only model installed; "
+                             "dictation needs at least one."}
+        if model_id == self._active_model_id():
+            return {"error": "That model is in use. Pick another one first."}
+        if self._warm is not None:
+            self._warm.forget_model(path)  # a loaded copy would outlive the file
+        try:
+            delete_file(path)
+        except PermissionError:
+            return {"error": "Windows says that file is in use. "
+                             "Try again in a moment."}
+        except OSError as e:
+            return {"error": str(e)}
+        return {"ok": True}
 
     def set_launch_at_login(self, enabled):
         try:
@@ -1780,11 +2570,14 @@ class Api:
 # Every Api method the dashboard calls, and nothing else.
 # tests/test_js_bridge_surface.py pins this to the V.api() calls in voisr/web/js.
 BRIDGE_METHODS = (
-    "capture_hotkey", "check_for_updates_now", "clear_history", "copy_text",
-    "delete_history_item", "export_history", "get_config", "get_history",
+    "accept_suggestion", "capture_hotkey", "check_for_updates_now",
+    "clear_history", "copy_text", "delete_history_item", "delete_model",
+    "delete_snippet", "dismiss_suggestion", "download_model", "export_history",
+    "get_config", "get_download_progress", "get_first_run", "get_history",
     "get_hotkey_status", "get_level", "get_models", "get_permissions",
-    "get_pill_themes", "get_stats", "get_update_status", "hotkey_display",
-    "install_update", "open_settings_pane", "restore_history_item",
+    "get_pill_themes", "get_snippets", "get_stats", "get_suggestions",
+    "get_update_status", "hotkey_display", "install_update",
+    "open_settings_pane", "restore_history_item", "save_snippet",
     "save_text_file", "set_appearance", "set_check_for_updates", "set_config",
     "set_launch_at_login", "start_recording", "stop_recording",
     "take_config_notice",
@@ -1805,6 +2598,21 @@ def bridge_functions(api):
     return [forward(name) for name in BRIDGE_METHODS]
 
 
+def install_click_watch(on_click, watch_factory=None):
+    """Call on_click when a mouse button goes down in any app. Raw Input only
+    watches (see voisr.click_watch), so unlike a mouse hook it can't hold up a
+    click. Returns the watch to keep, or None: without it a click just doesn't
+    stop the joining space."""
+    try:
+        if watch_factory is None:
+            from voisr.click_watch import ClickWatch as watch_factory
+        watch = watch_factory(on_click)
+        return watch if watch.start() else None
+    except Exception as e:
+        _update_log(f"click watch not installed ({e})")
+        return None
+
+
 def start_hotkey_service(service):
     """Start push-to-talk without letting a failure abort the rest of startup:
     the window chrome is applied after this, and an app with no hotkey can
@@ -1816,6 +2624,20 @@ def start_hotkey_service(service):
         _log(service.status)
         return str(e)
     return None
+
+
+def make_warm_server():
+    """The kept-loaded whisper-server manager. Never raises: without it Voisr
+    just uses whisper-cli. Nothing to clean up from an earlier run: a server
+    can't outlive the Voisr that started it (voisr.whisper_guard)."""
+    try:
+        from voisr.whisper_server import WhisperServer
+        server = WhisperServer()
+        atexit.register(server.shutdown)  # normal interpreter exits
+        return server
+    except Exception as error:
+        _update_log(f"kept-loaded model unavailable: {error}")
+        return None
 
 
 def main():
@@ -1831,7 +2653,15 @@ def main():
     updates = None
     try:
         set_app_user_model_id()
-        api = Api(mic_check=permissions.microphone_switch)
+        api = Api(mic_check=permissions.microphone_switch,
+                  warm_server=make_warm_server(),
+                  ax_adapter=make_ax_adapter())
+        # settled before anything can write config.json, which would make a
+        # fresh install look like an existing one
+        try:
+            api.first_run_pending()
+        except Exception as e:  # startup must not die over this
+            _log(f"first run not checked ({e})")
         widget = RecordingWidget(level_source=api.current_level)
         service = HotkeyService(api, widget=widget, key_state=hotkey_key_down)
         api.attach_hotkey_service(service)
@@ -1845,7 +2675,8 @@ def main():
         # No js_api: see bridge_functions
         window = webview.create_window(
             WINDOW_TITLE, str(WEB_DIR / "index.html"),
-            width=1060, height=700, min_size=(900, 620))
+            width=1060, height=700, min_size=(900, 620),
+            background_color=_window_background(api))
         window.expose(*bridge_functions(api))
         api.attach_window(window)
 
@@ -1910,6 +2741,8 @@ def main():
             # only during an actual dictation, so nothing here blocks
             # startup or shows a mic-in-use indicator while idle.
             start_hotkey_service(service)  # config-driven: prefers captured hotkey_vk
+            # a click can move the caret, so the next dictation may not follow on
+            api._click_watch = install_click_watch(api.note_user_typing)
             try:
                 mode = api.get_config().get("appearance", "system")
                 dark = mode == "dark" or (mode == "system" and _system_prefers_dark())

@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from voisr import snippets
 from voisr.cleanup import clean
 from voisr.history import HistoryStore
 from voisr.inject import paste_at_cursor, set_clipboard
@@ -34,6 +35,12 @@ DEFAULT_CONFIG = {
     "launch_at_login": False,
     "appearance": "system",
     "check_for_updates": True,
+    "use_screen_context": True,
+    "learn_from_edits": True,
+    "dictionary_auto_add": True,
+    "snippets": {},
+    "dismissed_banners": [],
+    "model_unload": "min5",
 }
 
 
@@ -58,9 +65,18 @@ def _is_vk(v):
     return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 0xFFFF
 
 
+def _is_unload(v):
+    from voisr.whisper_server import valid_unload
+    return valid_unload(v)
+
+
 def _is_dictionary(v):
     return isinstance(v, dict) and all(
         isinstance(k, str) and k and isinstance(w, str) for k, w in v.items())
+
+
+def _is_str_list(v):
+    return isinstance(v, list) and all(isinstance(item, str) for item in v)
 
 
 CONFIG_VALIDATORS = {
@@ -69,7 +85,14 @@ CONFIG_VALIDATORS = {
     "pill_theme": _is_str, "pill_color": _is_optional_str,
     "appearance": _is_str, "launch_at_login": _is_bool,
     "model": _is_optional_str, "hotkey_vk": _is_vk, "hotkey_label": _is_str,
-    "check_for_updates": _is_bool,
+    "check_for_updates": _is_bool, "model_unload": _is_unload,
+    "use_screen_context": _is_bool, "learn_from_edits": _is_bool,
+    "dictionary_auto_add": _is_bool, "snippets": snippets.is_valid,
+    # the page banners (Dictionary, Snippets) someone closed, by name
+    "dismissed_banners": _is_str_list,
+    # not in DEFAULT_CONFIG: missing means first run hasn't been decided yet
+    # (Api.first_run_pending), which is how an existing install is recognised
+    "first_run_done": _is_bool,
 }
 
 
@@ -100,6 +123,9 @@ def _salvage(data: dict, path) -> dict:
             out[key] = {k: w for k, w in value.items()
                         if isinstance(k, str) and k and isinstance(w, str)}
             print(f"voisr: dropped invalid dictionary entries in {path}", flush=True)
+        elif key == "snippets" and isinstance(value, dict):
+            out[key] = snippets.salvage(value)
+            print(f"voisr: dropped invalid snippets in {path}", flush=True)
         else:
             print(f"voisr: ignoring invalid {key} in {path}", flush=True)
     return out

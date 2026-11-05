@@ -262,8 +262,39 @@ def _restore_after_ownership_check_failure(adapter, snapshot, owner_count,
     raise error
 
 
+def _old_clipboard_text(snapshot) -> str | None:
+    """What the clipboard held as text, to recognise it landing instead."""
+    for item in snapshot.items:
+        for fmt, payload in item.payloads:
+            if fmt == str(CF_UNICODETEXT):
+                # GlobalSize can round up past the terminator
+                return payload.decode("utf-16-le", "replace").split("\x00", 1)[0]
+    return None
+
+
+def _missed(verifier, snapshot) -> bool:
+    """Ask the verifier whether the paste missed. Its failure means no: that
+    is today's behaviour, and the clipboard goes back."""
+    try:
+        return bool(verifier(_old_clipboard_text(snapshot)))
+    except Exception as error:
+        _log(f"paste check skipped ({error.__class__.__name__})")
+        return False
+
+
+def _log(message: str) -> None:
+    """voisr.log, beside the rest of the paste-check rows: print() is silent
+    in the windowed build. Never raises."""
+    try:
+        from voisr.updater import _log as log
+        log(message)
+    except Exception:
+        pass
+
+
 def _paste_with_adapter(text, *, adapter, post_ctrl_v,
-                        fallback_ctrl_v, sleeper) -> bool:
+                        fallback_ctrl_v, sleeper, on_sent=None,
+                        verifier=None) -> bool:
     snapshot = adapter.snapshot()
     owner_count = adapter.write_text_if_unchanged(text, snapshot)
     try:
@@ -298,6 +329,8 @@ def _paste_with_adapter(text, *, adapter, post_ctrl_v,
             ) from restore_error
         raise PasteDeliveryError(
             "paste was blocked; clipboard preserved", pasted=False)
+    if on_sent is not None:
+        on_sent()  # Ctrl+V is out; only the clipboard-restore wait remains
     if snapshot.concealed:
         # A late Ctrl+V would paste whatever is back on the clipboard; a
         # password must never be that. Leaving the dictation there instead
@@ -305,6 +338,12 @@ def _paste_with_adapter(text, *, adapter, post_ctrl_v,
         return True
     try:
         sleeper(PASTE_GRACE_S)
+        # Read-only and bounded (paste_verify.VERIFY_BUDGET_S), and it never
+        # sends Ctrl+V again. When the paste missed, the dictation stays on the
+        # clipboard for the user to paste; putting the old one back would lose
+        # the only copy within reach.
+        if verifier is not None and _missed(verifier, snapshot):
+            return True
     except BaseException as error:
         _restore_after_failure(
             adapter, snapshot, owner_count, error,
@@ -319,23 +358,34 @@ def _paste_with_adapter(text, *, adapter, post_ctrl_v,
     return True
 
 
-def paste_at_cursor(text: str, restore_clipboard: bool = True) -> bool:
+def paste_at_cursor(text: str, restore_clipboard: bool = True,
+                    on_sent=None, verifier=None) -> bool:
     """Put text on the clipboard and paste it into the frontmost app.
 
     With restoration enabled (the default), a blocked paste raises a
     preservation-aware PasteDeliveryError. Set restore_clipboard=False to
     leave text available for a manual paste and receive False when blocked.
+    on_sent, if given, is called once Ctrl+V has been sent, before the
+    clipboard-restore wait. verifier, if given, is called after that wait with
+    the old clipboard's text, and returning True leaves the dictation on the
+    clipboard instead of restoring. Not called when the old clipboard was
+    concealed, or with restore_clipboard=False: neither restores anyway.
     """
     if not restore_clipboard:
         set_clipboard(text)
         try:
-            return _post_ctrl_v() or _fallback_ctrl_v()
+            sent = _post_ctrl_v() or _fallback_ctrl_v()
         except Exception:
             return False
+        if sent and on_sent is not None:
+            on_sent()
+        return sent
     return _paste_with_adapter(
         text,
         adapter=WindowsClipboard(),
         post_ctrl_v=_post_ctrl_v,
         fallback_ctrl_v=_fallback_ctrl_v,
         sleeper=time.sleep,
+        on_sent=on_sent,
+        verifier=verifier,
     )

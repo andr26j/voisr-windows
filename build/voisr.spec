@@ -9,6 +9,8 @@
 # stages one under build\_whisper_cpu and points this at it.
 import os
 
+from PyInstaller.utils.hooks import collect_data_files
+
 block_cipher = None
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(SPEC), ".."))
@@ -26,8 +28,15 @@ a = Analysis(
         (os.path.join(REPO_ROOT, "assets"), "assets"),
         (os.path.join(REPO_ROOT, "models", "ggml-base.en.bin"), "models"),
         (WHISPER_DIR, "bin"),
+        # certifi's cacert.pem: models.ssl_context() adds it to the Windows
+        # store for model downloads. The contrib hook collects it too; this
+        # keeps a download working if that hook ever goes away.
+        *collect_data_files("certifi"),
     ],
-    hiddenimports=[],
+    # Imported inside functions only, so a frozen build that missed them
+    # would fail at the first download or dictation, not at startup.
+    hiddenimports=["certifi", "voisr.models", "voisr.whisper_guard",
+                   "voisr.whisper_server"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

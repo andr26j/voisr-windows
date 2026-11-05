@@ -1,7 +1,76 @@
+import atexit
 import math
 import operator
 import threading
+import time
 import wave
+
+# The mic's own audio thread stops its stream: the callback raises
+# CallbackAbort once a stop is asked for, and PortAudio's host thread (MME or
+# WASAPI) stops the device itself and reports it through finished_callback.
+# The stop()/close() that follow then find a stream that is already stopped.
+# On the Mac this avoids a CoreAudio deadlock between the stopping thread and
+# the IO thread; Windows has no such lock order, but a stop from outside can
+# still hang in a driver (waveInReset on a dropped Bluetooth or USB device),
+# and the self-stop keeps that call off the common path.
+#
+# A stop that still sticks for STOP_TIMEOUT_S can't be interrupted, so the
+# stream is abandoned and new recordings are refused: opening the same device
+# again could hang the same way, and there is no fallback recorder on Windows.
+# If the stuck close finishes later, the stream is closed after all and
+# recording works again; otherwise only a restart clears it.
+_mic_wedged = threading.Event()
+_abandoned_streams = []  # kept referenced: collecting one could close it
+_wedge_lock = threading.Lock()
+
+WEDGED_NOTICE = ("The microphone got stuck. Your dictation is safe. "
+                 "Quit and reopen Voisr to fix it.")
+WEDGED_START_ERROR = "the microphone got stuck — quit and reopen Voisr to fix it"
+
+
+def _log(message: str) -> None:
+    """voisr.log, as everything else: print() is silent in the windowed
+    build. Never raises."""
+    try:
+        from voisr.updater import _log as log
+        log(f"audio: {message}")
+    except Exception:
+        pass
+
+
+def _notify_wedged() -> None:
+    """Best effort. The next press shows WEDGED_START_ERROR as well."""
+    _log(WEDGED_NOTICE)
+
+
+def _abandon_stream(stream) -> None:
+    with _wedge_lock:
+        _abandoned_streams.append(stream)
+        first = not _mic_wedged.is_set()
+        _mic_wedged.set()
+    if not first:
+        return
+    try:
+        # sounddevice's exit handler terminates PortAudio, which closes every
+        # open stream, this one included: Quit would hang on the same stop
+        import sounddevice as sd
+        atexit.unregister(sd._exit_handler)
+    except Exception:
+        pass
+    _notify_wedged()
+
+
+def _abandoned_stream_closed(stream) -> None:
+    """A stuck close finished after all: once none is left, the mic is free."""
+    with _wedge_lock:
+        try:
+            _abandoned_streams.remove(stream)
+        except ValueError:
+            return
+        if _abandoned_streams:
+            return
+        _mic_wedged.clear()
+    _log("the stuck mic stop finished; recording works again")
 
 # Speaking voice fills the meter: a quiet room sits under the floor, a raised
 # voice reaches the ceiling. Linear in decibels between the two.
@@ -26,10 +95,11 @@ def level_from_int16(block) -> float:
     return min(1.0, max(0.0, level))
 
 
-def _default_stream_factory(samplerate, callback):
+def _default_stream_factory(samplerate, callback, finished_callback):
     import sounddevice as sd
     return sd.RawInputStream(samplerate=samplerate, channels=1, dtype="int16",
-                             callback=callback)
+                             callback=callback,
+                             finished_callback=finished_callback)
 
 
 class StreamRecorder:
@@ -49,6 +119,22 @@ class StreamRecorder:
     # else means the stream is wedged: reopen it once (spec item 5).
     ZERO_REOPEN_S = 6.0
 
+    # How long to wait for a stopping stream before abandoning it. A healthy
+    # stop takes about one audio block; this only ever catches a hung driver.
+    STOP_TIMEOUT_S = 3.0
+    # How long the audio thread gets to stop its own stream. A healthy one
+    # does it within a block (MME's are the longest, about 50 ms at the
+    # default latency); this much covers a stream still starting up. After
+    # it, a device sending nothing is stopped from outside.
+    SELF_STOP_WAIT_S = 0.5
+    # PortAudio reports the stop from its host thread just before that thread
+    # ends: let it finish before stop() and close() touch the stream.
+    SELF_STOP_UNWIND_S = 0.02
+    # A stop row goes to voisr.log only when it was out of the ordinary: from
+    # outside, failed, slower than this, or finished after being abandoned.
+    # Routine stops would add a log line to every dictation.
+    SLOW_STOP_LOG_MS = 500
+
     def __init__(self, stream_factory=None, timer_factory=threading.Timer):
         self._lock = threading.Lock()
         self._frames = []
@@ -67,6 +153,8 @@ class StreamRecorder:
         self._heard = False  # a non-zero sample arrived this recording
         self._reopened = False
         self._watchdog = None
+        self._stop_requested = False
+        self._stream_finished = threading.Event()
 
     @property
     def reopened(self) -> bool:
@@ -80,6 +168,9 @@ class StreamRecorder:
         return self._level
 
     def _on_audio(self, indata, frames, time_info, status):
+        if self._stop_requested:
+            import sounddevice as sd
+            raise sd.CallbackAbort
         if not self._recording:
             return
         chunk = bytes(indata)
@@ -113,6 +204,8 @@ class StreamRecorder:
     def start(self, out_path) -> None:
         if self._recording:
             raise RuntimeError("already recording")
+        if _mic_wedged.is_set():
+            raise RuntimeError(WEDGED_START_ERROR)
         with self._lock:
             self._frames = []
             self._bytes = 0
@@ -133,7 +226,9 @@ class StreamRecorder:
         watchdog.start()
 
     def _open_stream(self):
-        stream = self._stream_factory(self.SAMPLERATE, self._on_audio)
+        self._stop_requested = False
+        finished = self._stream_finished = threading.Event()
+        stream = self._stream_factory(self.SAMPLERATE, self._on_audio, finished.set)
         try:
             stream.start()
         except Exception:
@@ -158,14 +253,15 @@ class StreamRecorder:
                 self._close_stream()
             except Exception:
                 pass
+            if _mic_wedged.is_set():
+                return
             try:
                 self._stream = self._open_stream()
             except Exception as error:
-                print(f"Voisr audio: reopening the silent mic failed: {error}",
-                      flush=True)
+                _log(f"reopening the silent mic failed: {error}")
                 return
-        print("Voisr audio: the mic sent only silence for "
-              f"{self.ZERO_REOPEN_S:.0f} s — reopened it once", flush=True)
+        _log("the mic sent only silence for "
+             f"{self.ZERO_REOPEN_S:.0f} s — reopened it once")
 
     def _stop_watchdog(self) -> None:
         watchdog, self._watchdog = self._watchdog, None
@@ -198,10 +294,56 @@ class StreamRecorder:
         stream, self._stream = self._stream, None
         if stream is None:
             return
-        try:
-            stream.stop()
-        finally:
-            stream.close()
+        began = time.monotonic()
+        self._stop_requested = True
+        stopped_itself = self._stream_finished.wait(self.SELF_STOP_WAIT_S)
+        if stopped_itself:
+            time.sleep(self.SELF_STOP_UNWIND_S)
+        errors = []
+        # Whether the close finished in time and whether it was abandoned are
+        # decided under one lock, so exactly one side clears the wedge: a
+        # close ending at the very moment of the timeout is either seen as
+        # finished (never listed) or finds itself listed and takes itself off.
+        # Thread.is_alive() can't decide it: a thread is still alive for a
+        # moment after its last line has run.
+        decided = threading.Lock()
+        finished = threading.Event()
+        abandoned = threading.Event()
+
+        def stop_and_close():
+            try:
+                try:
+                    stream.stop()
+                finally:
+                    stream.close()
+            except Exception as error:
+                errors.append(error)
+            with decided:
+                finished.set()
+                late = abandoned.is_set()
+            # Timing only, never audio or text. Also runs after the stream
+            # was abandoned: a stuck stop that logs nothing never finished,
+            # and one that logs a long time was only slow.
+            elapsed = (time.monotonic() - began) * 1000
+            how = "" if stopped_itself else ", from outside"
+            if errors:
+                how += f", failed: {type(errors[0]).__name__}"
+            if how or late or elapsed >= self.SLOW_STOP_LOG_MS:
+                _log(f"mic stop {elapsed:.0f} ms{how}")
+            if late:
+                _abandoned_stream_closed(stream)
+
+        closer = threading.Thread(target=stop_and_close,
+                                  name="voisr-mic-close", daemon=True)
+        closer.start()
+        closer.join(self.STOP_TIMEOUT_S)
+        with decided:
+            if not finished.is_set():
+                abandoned.set()
+                _abandon_stream(stream)
+                return
+        if errors:
+            raise errors[0]
 
     def cancel(self) -> None:
         """Close the mic and discard buffered audio; safe to repeat."""

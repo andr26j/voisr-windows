@@ -107,9 +107,12 @@ def test_an_unregistered_hook_is_respawned_and_the_held_key_checked():
     svc._check_stale_key = lambda force=False: forced.append(force)
     svc.start()
     made[0].state = "failed"
-    assert wait_until(lambda: len(made) >= 2 and svc.health == "active")
+    # health turns active inside the respawn, before the held-key check is
+    # queued on the serial worker, so wait for both rather than read forced
+    # the moment health flips
+    assert wait_until(lambda: len(made) >= 2 and svc.health == "active"
+                      and True in forced)
     assert made[0].stopped
-    assert True in forced
     svc.stop()
 
 

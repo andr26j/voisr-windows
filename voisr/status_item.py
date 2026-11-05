@@ -13,46 +13,25 @@ try/except is kept: a tray failure must never take down the app.
 """
 import threading
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from voisr import logo
 
-# Recording badge, drawn over the mark's lower-right corner. A colour
-# logo cannot signal state by changing its own bars -- at 16px that
-# difference is invisible -- so the state is carried by a badge instead,
-# the same convention Teams and Zoom use in the notification area.
-BADGE_FILL = (0xE5, 0x1C, 0x23, 255)
-BADGE_RING = (255, 255, 255, 255)
-
 
 def glyph_image(recording: bool, size: int = 32, dark_taskbar=None) -> Image.Image:
-    """The Voisr mark for the notification area, with a red badge while a
-    dictation is in flight.
+    """The Voisr mark for the notification area: the Ribbon tile, and the
+    same tile in the signal colour while a dictation is in flight.
 
-    Shares voisr.logo's geometry with the taskbar and Start Menu icon, so
-    the app presents one mark everywhere rather than a bespoke tray glyph.
+    Shares voisr.logo with the exe and installer icon, so the app presents one
+    mark everywhere. The Mac's menu-bar wave keeps its shape and changes
+    colour while live; on a coloured tile that has to be the tile's colour, or
+    the difference vanishes at 16 px (see voisr.logo.LIVE_TILE_START).
 
-    `dark_taskbar` is accepted and ignored: it exists because macOS template
-    images auto-invert against the menu bar, and the previous monochrome
-    glyph had to emulate that. A full-colour mark carries its own rounded
-    background and reads on a light or dark taskbar alike -- inverting it
-    would corrupt the brand colour. The parameter is kept so callers and
-    tests that pass it keep working.
+    `dark_taskbar` is accepted and ignored: the tile carries its own dark
+    background and reads on a light or dark taskbar alike. The parameter is
+    kept so callers and tests that pass it keep working.
     """
-    img = logo.render(size)
-
-    if not recording:
-        return img
-
-    draw = ImageDraw.Draw(img)
-    # Sized off the frame so it stays visible at 16px without swamping 48px.
-    d = max(5, round(size * 0.42))
-    x1, y1 = size - 1, size - 1
-    x0, y0 = x1 - d, y1 - d
-    ring = max(1, round(size * 0.055))
-    draw.ellipse((x0 - ring, y0 - ring, x1, y1), fill=BADGE_RING)
-    draw.ellipse((x0, y0, x1 - ring, y1 - ring), fill=BADGE_FILL)
-    return img
+    return logo.render(size, live=recording)
 
 
 class StatusItem:

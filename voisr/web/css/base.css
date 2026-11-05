@@ -1,125 +1,101 @@
+/* Instrument Serif ships in voisr/web/fonts (SIL OFL 1.1, see OFL.txt there).
+   It is never fetched: nothing leaves this PC, and that includes font requests. */
+@font-face {
+  font-family: "Instrument Serif";
+  src: url("../fonts/InstrumentSerif-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: "Instrument Serif";
+  src: url("../fonts/InstrumentSerif-Italic.ttf") format("truetype");
+  font-weight: 400;
+  font-style: italic;
+  font-display: block;
+}
+
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 html, body { height: 100%; }
 
 body {
-  font-family: var(--font-ui);
-  font-size: var(--text-base);
-  font-weight: var(--weight-normal);
-  line-height: 1.5;
-  letter-spacing: var(--track-snug);
+  font-family: var(--font-sans);
+  font-size: 14.5px;
+  line-height: 1.45;
   color: var(--ink);
   background: var(--bg);
-  /* No -webkit-font-smoothing here. It is a macOS hint; on Windows it thins
-     Segoe's stems and undoes ClearType, which made the old build look washed
-     out. Windows' own rasteriser is what we want. */
-  text-rendering: optimizeLegibility;
-  font-variant-numeric: tabular-nums;
+  /* No -webkit-font-smoothing: it is a macOS hint, and on Windows it thins
+     Segoe's stems and undoes ClearType. */
   user-select: none;
 }
 
-h1, h2, h3, .hero-line, .stat-num {
-  font-family: var(--font-display);
-  font-optical-sizing: auto;
-}
+/* Windows draws classic scrollbars, the loudest thing on the page; macOS
+   overlays them. A thin one in the theme's own grey. */
+* { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--muted) 45%, transparent) transparent; }
 
 code {
   font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  background: var(--surface-3);
+  font-size: 12px;
+  background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: var(--radius-xs);
-  padding: 1.5px 6px;
+  border-radius: 5px;
+  padding: 1px 5px;
 }
 
 button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
 
-/* A soft ring reads as focus; a hard 2px outline reads as an error state. */
-:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-  border-radius: var(--radius-xs);
-}
-
-::selection { background: var(--accent-soft); color: var(--ink); }
-
-/* Scrollbars: the default Windows chrome is the loudest thing on the page. */
-* { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
-*::-webkit-scrollbar { width: 11px; height: 11px; }
-*::-webkit-scrollbar-track { background: transparent; }
-*::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
-  border: 3px solid transparent;
-  background-clip: content-box;
-  border-radius: 99px;
-}
-*::-webkit-scrollbar-thumb:hover { background: var(--faint); background-clip: content-box; }
+:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 6px; }
 
 .shell { display: flex; height: 100vh; }
 
 /* ---------- Sidebar ---------- */
 
+/* Flat: the sidebar is the window's own background, and the panel sits inset
+   on it. The brand sits as far below the panel's top edge as on the Mac. */
 .sidebar {
-  width: 228px;
+  width: 204px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  padding: var(--titlebar-h) var(--s3) var(--s5);
-  border-right: 1px solid var(--border);
-  background: var(--sidebar-bg);
-  backdrop-filter: blur(20px) saturate(140%);
-}
-
-/* vibrancy fallback: when the native effect view is unavailable the shell
-   sets data-vibrancy="off" and the sidebar paints a solid tint instead */
-:root[data-vibrancy="off"] .sidebar {
-  background: var(--surface-2);
-  backdrop-filter: none;
+  padding: calc(var(--titlebar-h) + 16px) 10px 12px 12px;
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: var(--s3);
-  padding: 0 var(--s3) var(--s6);
+  gap: 9px;
+  padding: 0 8px 22px;
 }
 
 .brand-mark {
-  width: 27px; height: 27px;
-  border-radius: 7px;
+  width: 26px; height: 26px;
   flex-shrink: 0;
-  box-shadow: var(--shadow-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 23%;
+  background: linear-gradient(165deg, var(--tile-from), var(--tile-to));
+  box-shadow: inset 0 .5px 0 var(--tile-edge);
+  color: var(--hero-wave);
 }
 
-.brand-name {
-  font-size: var(--text-md);
-  font-weight: var(--weight-semi);
-  letter-spacing: var(--track-tight);
-}
+.brand-mark svg { width: 78%; height: 78%; display: block; }
 
-.nav { position: relative; display: flex; flex-direction: column; gap: 2px; }
+.brand-name { font-family: var(--font-serif); font-size: 25px; line-height: 1; }
+
+/* Fills the sidebar so Settings can sit at the bottom and still be one of the
+   items the glide measures against this element. */
+.nav { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 4px; }
 
 /* the active item's surface: one element that glides between items
    (main.js glideTo), transitions on only after its first placement */
 .nav-glide {
   position: absolute; top: 0; left: 0; right: 0;
-  box-sizing: border-box;
   border-radius: var(--radius-sm);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-sm);
+  background: var(--active);
   pointer-events: none;
-}
-
-/* Accent rail on the selection -- states it without tinting the whole row. */
-.nav-glide::before {
-  content: "";
-  position: absolute;
-  left: -1px; top: 50%;
-  width: 3px; height: 18px;
-  transform: translateY(-50%);
-  border-radius: 0 3px 3px 0;
-  background: var(--accent);
 }
 .nav-glide.is-live { transition: transform 180ms var(--ease); }
 
@@ -127,87 +103,120 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
   position: relative;  /* paints above .nav-glide */
   display: flex;
   align-items: center;
-  gap: var(--s3);
-  min-height: 40px;
-  padding: 0 var(--s3);
+  gap: 11px;
+  height: 36px;
+  flex-shrink: 0;
+  padding: 0 10px;
   border-radius: var(--radius-sm);
-  font-size: var(--text-base);
-  font-weight: var(--weight-medium);
-  color: var(--muted);
-  transition: background var(--fast) var(--ease),
-              color var(--fast) var(--ease);
+  font-size: 14px;
+  color: var(--ink);
 }
 
 .nav-item svg { width: 17px; height: 17px; flex-shrink: 0; }
 
-/* A neutral wash on hover. The old accent-tinted hover made every pass of
-   the cursor look like a selection. */
-.nav-item:hover { background: var(--surface-3); color: var(--ink); }
+.nav-settings { margin-top: auto; }
 
-/* The selected surface and its accent rail are .nav-glide's, so they slide
-   between items; the active item itself only sets the text. */
-.nav-item.active, .nav-item.active:hover {
-  background: transparent;
-  color: var(--ink);
-  font-weight: var(--weight-semi);
+@media (hover: hover) and (pointer: fine) {
+  .nav-item:hover { background: color-mix(in srgb, var(--active) 55%, transparent); }
 }
 
-.nav-item.active svg { color: var(--accent); }
+/* the surface is .nav-glide's; hovering the active item doesn't tint over it */
+.nav-item.active, .nav-item.active:hover { background: transparent; font-weight: 500; }
 
-/* the dock's mic is open (set by views/home.js); visible from every view */
+/* the mic is open (set by views/home.js); visible from every view */
 .nav-item[data-recording="true"]::after {
   content: ""; margin-left: auto;
   width: 7px; height: 7px; border-radius: 50%;
   background: var(--accent);
 }
 
-.sidebar-foot {
-  margin-top: auto;
+.sidebar-foot { margin-top: 4px; display: flex; flex-direction: column; gap: 4px; }
+
+.commands-btn {
   display: flex;
   align-items: center;
-  gap: var(--s2);
-  padding: var(--s3);
-  font-size: var(--text-sm);
+  justify-content: space-between;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
   color: var(--muted);
-  border-top: 1px solid var(--border);
 }
 
-.sidebar-foot svg { width: 14px; height: 14px; flex-shrink: 0; }
+@media (hover: hover) and (pointer: fine) {
+  .commands-btn:hover { color: var(--ink); }
+}
 
-/* ---------- Main ---------- */
+/* ---------- Panel ---------- */
 
-/* --main-pad-b is shared with the sticky dock (views.css), whose edge is
-   inset by this padding */
+/* .main is the one scroll container for every view. */
 .main {
-  --main-pad-b: var(--s10);
+  --main-pad-b: 28px;
   flex: 1;
+  min-width: 0;
+  margin: var(--titlebar-h) 8px 8px 0;
+  padding: 28px 36px var(--main-pad-b);
   overflow-y: auto;
-  padding: var(--titlebar-h) var(--s9) var(--main-pad-b);
-  background: var(--bg);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
 }
 
-.page-head { margin-bottom: var(--s7); }
+/* pages are a centred 720 px column; Home alone takes the panel's full width
+   for its stats column */
+.view { width: 100%; max-width: 720px; margin: 0 auto; }
+#view-home { max-width: none; }
 
-.page-head h1 {
-  font-size: var(--text-2xl);
-  font-weight: var(--weight-semi);
-  letter-spacing: var(--track-tight);
-  line-height: 1.2;
+/* a page title, and at most one black button on the right */
+.page-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 16px;
+  min-height: 36px;
+  margin-bottom: 18px;
 }
 
-.sub {
+.page-head h1 { font-size: 24px; font-weight: 600; line-height: 1.2; letter-spacing: -.015em; }
+
+.page-head > .sub, .page-head > .page-head-row { flex: 1 1 100%; }
+
+.sub { color: var(--muted); max-width: 58ch; }
+
+/* a label over a list, with room for one quiet action on the right */
+.date-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 18px;
+  margin: 22px 0 8px;
+}
+
+.date-label {
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: .07em;
+  text-transform: uppercase;
   color: var(--muted);
-  margin-top: var(--s2);
-  max-width: 60ch;
-  font-size: var(--text-base);
+}
+
+/* the serif at heading size: Settings headings, and first run at a larger size */
+.heading-serif {
+  font-family: var(--font-serif);
+  font-size: 36px;
+  font-weight: 400;
+  line-height: 1.06;
+  letter-spacing: -.01em;
 }
 
 /* ---------- Transitions ---------- */
 
-.view.entering { animation: view-in var(--slow) var(--ease-out); }
+.view.entering { animation: view-in var(--slow) var(--ease); }
 
 @keyframes view-in {
-  from { opacity: 0; transform: translateY(6px); }
+  from { opacity: 0; transform: translateY(4px); }
   to   { opacity: 1; transform: none; }
 }
 
@@ -229,12 +238,13 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 
 @keyframes row-in { from { opacity: 0; } to { opacity: 1; } }
 
-/* a new, restored or edited row: holds the accent for the first 35%, then
-   fades. It outranks the stagger, including reduced motion's `none` below:
-   a row that lands while a page opens still shows where it went. */
+/* a new, restored or edited row: holds a grey for the first 35%, then fades.
+   It outranks the stagger, including reduced motion's `none` below: a row
+   that lands while a page opens still shows where it went. Grey, because a
+   landing row doesn't need you. */
 .item-row.is-landed,
 .item-list.is-staggering .item-row.is-landed { animation: wash 1.6s linear; }
-@keyframes wash { 0%, 35% { background: var(--accent-soft); } 100% { background: transparent; } }
+@keyframes wash { 0%, 35% { background: var(--active); } 100% { background: transparent; } }
 
 @media (prefers-reduced-motion: reduce) {
   /* the wash stays: it is colour, not movement */
