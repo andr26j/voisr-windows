@@ -25,11 +25,11 @@ if sys.platform == "win32":
     user32.SendMessageW.restype = ctypes.c_ssize_t
     user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
                                     wintypes.LPARAM]
-    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 
 WINDOW = Path(__file__).with_name("_text_window.py")
 WM_SETTEXT = 0x000C
+WM_GETTEXT = 0x000D
+WM_GETTEXTLENGTH = 0x000E
 WM_CHAR = 0x0102
 EM_GETSEL = 0x00B0
 EM_SETSEL = 0x00B1
@@ -59,15 +59,16 @@ class TextWindow:
 
 
 def text_of(hwnd) -> str:
-    length = user32.GetWindowTextLengthW(hwnd)
+    """WM_GETTEXT, as GetWindowText won't fetch another process's box."""
+    length = user32.SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0)
     buffer = ctypes.create_unicode_buffer(length + 1)
-    user32.GetWindowTextW(hwnd, buffer, length + 1)
+    user32.SendMessageW(hwnd, WM_GETTEXT, length + 1, ctypes.addressof(buffer))
     return buffer.value
 
 
 def set_text(hwnd, text):
-    user32.SendMessageW(hwnd, WM_SETTEXT, 0, ctypes.cast(ctypes.c_wchar_p(text),
-                                                         ctypes.c_void_p).value)
+    buffer = ctypes.create_unicode_buffer(text)
+    user32.SendMessageW(hwnd, WM_SETTEXT, 0, ctypes.addressof(buffer))
 
 
 def type_into(hwnd, text):

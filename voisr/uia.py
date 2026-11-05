@@ -114,6 +114,7 @@ _NODE_PROPERTIES = {
     "IsReadOnly": UIA_ValueIsReadOnlyPropertyId,
 }
 
+_IUNKNOWN_RELEASE = 2
 # IUIAutomation(2) slots
 _UIA_ELEMENT_FROM_HANDLE_BUILD_CACHE = 10
 _UIA_GET_FOCUSED_ELEMENT_BUILD_CACHE = 12
@@ -211,7 +212,7 @@ def _vcall(ptr, index, argtypes=(), *args, restype=HRESULT):
 
 def _release(ptr) -> None:
     if ptr:
-        _vcall(ptr, 2, restype=ctypes.c_ulong)
+        _vcall(ptr, _IUNKNOWN_RELEASE, restype=ctypes.c_ulong)
 
 
 def _out(ptr, index, *args, argtypes=()) -> int | None:
