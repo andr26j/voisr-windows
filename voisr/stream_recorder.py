@@ -300,6 +300,14 @@ class StreamRecorder:
         if stopped_itself:
             time.sleep(self.SELF_STOP_UNWIND_S)
         errors = []
+        # Whether the close finished in time and whether it was abandoned are
+        # decided under one lock, so exactly one side clears the wedge: a
+        # close ending at the very moment of the timeout is either seen as
+        # finished (never listed) or finds itself listed and takes itself off.
+        # Thread.is_alive() can't decide it: a thread is still alive for a
+        # moment after its last line has run.
+        decided = threading.Lock()
+        finished = threading.Event()
         abandoned = threading.Event()
 
         def stop_and_close():
@@ -310,6 +318,9 @@ class StreamRecorder:
                     stream.close()
             except Exception as error:
                 errors.append(error)
+            with decided:
+                finished.set()
+                late = abandoned.is_set()
             # Timing only, never audio or text. Also runs after the stream
             # was abandoned: a stuck stop that logs nothing never finished,
             # and one that logs a long time was only slow.
@@ -317,23 +328,20 @@ class StreamRecorder:
             how = "" if stopped_itself else ", from outside"
             if errors:
                 how += f", failed: {type(errors[0]).__name__}"
-            if how or abandoned.is_set() or elapsed >= self.SLOW_STOP_LOG_MS:
+            if how or late or elapsed >= self.SLOW_STOP_LOG_MS:
                 _log(f"mic stop {elapsed:.0f} ms{how}")
-            if abandoned.is_set():
+            if late:
                 _abandoned_stream_closed(stream)
 
         closer = threading.Thread(target=stop_and_close,
                                   name="voisr-mic-close", daemon=True)
         closer.start()
         closer.join(self.STOP_TIMEOUT_S)
-        if closer.is_alive():
-            # Set before the stream is listed, so a close that ends right
-            # now still takes it off the list and clears the wedge.
-            abandoned.set()
-            _abandon_stream(stream)
-            if not closer.is_alive():
-                _abandoned_stream_closed(stream)
-            return
+        with decided:
+            if not finished.is_set():
+                abandoned.set()
+                _abandon_stream(stream)
+                return
         if errors:
             raise errors[0]
 

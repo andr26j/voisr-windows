@@ -285,6 +285,27 @@ def test_a_stuck_stop_that_finishes_frees_the_mic_again(tmp_path, wedge, rows):
     next_rec.cancel()
 
 
+def test_a_close_that_ends_while_it_is_being_abandoned_still_frees_the_mic(
+        tmp_path, wedge, monkeypatch):
+    # The close finishes in the gap between the timeout and the stream being
+    # listed as abandoned. Exactly one side must take it off the list again,
+    # or every later press is refused until a restart.
+    rec, made = hanging_recorder()
+    real_abandon = stream_recorder._abandon_stream
+
+    def abandon_while_the_close_ends(stream):
+        stream.release.set()
+        time.sleep(0.1)  # the closer's stop() and close() return now
+        real_abandon(stream)
+
+    monkeypatch.setattr(stream_recorder, "_abandon_stream",
+                        abandon_while_the_close_ends)
+    rec.start(tmp_path / "a.wav")
+    rec.stop()
+    assert wait_for(lambda: not stream_recorder._mic_wedged.is_set())
+    assert stream_recorder._abandoned_streams == []
+
+
 def test_the_wedge_stays_while_any_abandoned_stream_is_still_stuck(tmp_path, wedge):
     rec, made = hanging_recorder()
     rec.start(tmp_path / "a.wav")
