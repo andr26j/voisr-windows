@@ -19,3 +19,13 @@ build/MicrosoftEdgeWebview2Setup.exe
 
 # Inno Setup compiled installer
 build/Output/
+
+# AI tool files, notes and plans: none of this ships
+.claude/
+.cursor/
+.superpowers/
+.worktrees/
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+docs/
