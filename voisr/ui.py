@@ -1117,6 +1117,7 @@ class Api:
         # None = no check, so tests never probe the machine's real privacy
         # settings
         self._mic_check = mic_check
+        self._mic_heard = False  # a clip this launch held real audio
         # Both None until the matching attach_*(): a headless or test Api has
         # no updater and no window, and every method below tolerates that.
         self._updates = None
@@ -1374,6 +1375,7 @@ class Api:
             if span.verdict == "all_zeros":
                 return SessionResult.failure(
                     session.sequence, "audio", MIC_SILENT_MESSAGE)
+            self._mic_heard = True
             if span.verdict == "no_speech":
                 return SessionResult.failure(
                     session.sequence, "audio", NO_SPEECH_MESSAGE)
@@ -1753,7 +1755,18 @@ class Api:
                 "health": getattr(svc, "health", "off")}
 
     def get_permissions(self):
-        return {"panes": permissions.states()}
+        return {"panes": self._with_mic_heard(permissions.states())}
+
+    def _with_mic_heard(self, panes):
+        """The probe can't always tell: the registry switches may be unset
+        and opening a stream can fail while the device is busy. Real audio
+        settles it, since a switched-off or dead mic sends only zeros. Only
+        an unknown is overruled, never a known refusal."""
+        if self._mic_heard:
+            for pane in panes:
+                if pane["key"] == "microphone" and pane["granted"] is None:
+                    pane["granted"] = True
+        return panes
 
     def open_settings_pane(self, key):
         return {"ok": permissions.open_pane(key)}
