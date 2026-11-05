@@ -341,9 +341,8 @@ class HotkeyService:
                  timer_factory=None, key_state=None,
                  stale_interval=STALE_CHECK_S):
         self._api = api
-        # What a real dictation starts (the screen capture, and loading the
-        # model where there is a kept-loaded one) is decided here, where the
-        # tap gate is known: an accidental tap reads nothing.
+        # Preloading the model is decided here, where the tap gate is known:
+        # only a recording that is really a dictation loads it.
         try:
             takes_flag = "prewarm" in inspect.signature(
                 api.start_recording).parameters
@@ -623,7 +622,7 @@ class HotkeyService:
                 self._drop_chord(self._epoch)
         if latched:
             _log("hands-free on (double-tap)")
-            self._preload()   # a real hands-free dictation
+            self._preload()   # a real hands-free dictation: load the model now
             return True
         self._api._cancel_recording()
         return False
