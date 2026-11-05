@@ -80,10 +80,14 @@ jobs:
 
       - name: Smoke test the frozen app
         run: |
-          # The frozen app must at least import every module it ships with.
-          # --help exits before any window, hook or microphone is touched.
-          $p = Start-Process -FilePath build\dist\Voisr\Voisr.exe -ArgumentList "--help" -PassThru -Wait -NoNewWindow
-          if ($p.ExitCode -ne 0) { throw "Voisr.exe --help exited $($p.ExitCode)" }
+          # build/entry.py's --self-test imports every module the frozen app
+          # ships and checks its bundled files, then exits without opening a
+          # window, hooking the keyboard or touching the microphone.
+          $report = Join-Path $env:RUNNER_TEMP "selftest.txt"
+          $p = Start-Process -FilePath build\dist\Voisr\Voisr.exe -ArgumentList "--self-test", "`"$report`"" -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw "Voisr.exe --self-test hung for 2 minutes" }
+          if (Test-Path $report) { Get-Content $report }
+          if ($p.ExitCode -ne 0) { throw "Voisr.exe --self-test exited $($p.ExitCode)" }
 
       - uses: actions/upload-artifact@v4
         with:
