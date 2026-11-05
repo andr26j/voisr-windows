@@ -13,6 +13,11 @@ MODEL_PATH = BUNDLED_DIR / "ggml-base.en.bin"
 # checkout set up with it alone. A model downloaded from Settings is never
 # chosen automatically: the person picks it with "Use".
 FALLBACK_MODELS = ["base.en", "small.en"]
+# Before 1.1, Windows picked small.en over base.en whenever it sat beside
+# the app (the only models folder there was), with nothing saved in config.
+# A small.en put there, by setup or by hand, keeps winning for an install
+# that never chose a model; one downloaded from Settings still waits for Use.
+LEGACY_PREFERRED = "small.en"
 
 # Without this every dictation flashes a console window over the user's app.
 CREATE_NO_WINDOW = 0x08000000
@@ -36,7 +41,8 @@ def _timeout_for(wav_path) -> float:
 def resolve_model(name: str | None = None, models_dir: Path | None = None,
                   bundled_dir: Path | None = None) -> Path:
     """Best model on disk: the configured one (a registry id or the name of a
-    custom ggml-<name>.bin), else base.en, else small.en.
+    custom ggml-<name>.bin), else base.en, else small.en; with nothing
+    configured, a small.en beside the app comes first (LEGACY_PREFERRED).
 
     With no models_dir, looks in the per-user downloads folder and then in
     the models that ship with Voisr. With one, looks there (and in
@@ -45,6 +51,9 @@ def resolve_model(name: str | None = None, models_dir: Path | None = None,
         models_dir, bundled_dir = MODELS_DIR, BUNDLED_DIR
     dirs = search_dirs(models_dir, bundled_dir)
     candidates = ([name] if name else []) + FALLBACK_MODELS
+    if not name and bundled_dir is not None and (
+            Path(bundled_dir) / filename_for(LEGACY_PREFERRED)).is_file():
+        candidates = [LEGACY_PREFERRED] + candidates
     for n in candidates:
         for d in dirs:
             p = d / filename_for(n)

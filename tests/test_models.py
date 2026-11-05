@@ -441,3 +441,23 @@ def test_ssl_context_verifies_with_the_store_and_certifi():
 def test_requirements_pin_certifi():
     reqs = (Path(__file__).resolve().parent.parent / "requirements.txt").read_text()
     assert any(l.startswith("certifi==") for l in reqs.splitlines())
+
+
+def test_a_small_en_beside_the_app_still_wins_with_nothing_configured(tmp_path):
+    # Windows before 1.1 preferred small.en in its one models folder; an
+    # install that never chose a model must not drop to base.en on update.
+    user, bundled = tmp_path / "user", tmp_path / "bundled"
+    user.mkdir(); bundled.mkdir()
+    (bundled / "ggml-base.en.bin").write_bytes(b"x")
+    (bundled / "ggml-small.en.bin").write_bytes(b"x")
+    assert resolve_model(None, user, bundled) == bundled / "ggml-small.en.bin"
+    # a choice made in Settings still wins
+    assert resolve_model("base.en", user, bundled) == bundled / "ggml-base.en.bin"
+
+
+def test_a_downloaded_small_en_still_waits_for_use(tmp_path):
+    user, bundled = tmp_path / "user", tmp_path / "bundled"
+    user.mkdir(); bundled.mkdir()
+    (bundled / "ggml-base.en.bin").write_bytes(b"x")
+    (user / "ggml-small.en.bin").write_bytes(b"x")
+    assert resolve_model(None, user, bundled) == bundled / "ggml-base.en.bin"
