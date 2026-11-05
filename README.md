@@ -83,6 +83,22 @@ The dashboard (Start Menu → Voisr, or the Desktop shortcut) launches to a syst
 
 **Settings** are grouped into Dictation, Push-to-talk, Appearance, and Privacy & Data sections, including launch-at-login.
 
+**Snippets** turn a short phrase into saved text. Say the phrase on its own and Voisr pastes your text exactly as you wrote it; in a sentence, the phrase stays as spoken. History shows only the phrase. A snippet fires only when the clip holds sustained speech, so a key's thump that Whisper hears as the phrase pastes as words instead.
+
+### Screen context
+
+On by default (`use_screen_context`). Once a press is a real dictation (an accidental tap reads nothing), Voisr reads the field you are typing in, the window title and nearby labels through UI Automation, and does three things with them:
+
+- **Names on screen are spelled right.** Names and identifiers near your cursor are added to the glossary whisper is given, after your dictionary terms. They only bias recognition; they never replace anything. whisper-cli takes the glossary on its command line, so letter-and-digit tokens (what a one-time code looks like) are never put there.
+- **A paste that didn't land is caught.** After the paste, the field is read again. If the text isn't there, the dictation stays on the clipboard (instead of your old clipboard coming back) and the pill says so. Browsers, Electron apps and terminals can show a field as unchanged when it isn't, so there a missing paste is never called a miss.
+- **It learns from your corrections** (`learn_from_edits`). For up to a minute after a verified paste, Voisr re-reads that field (at 3, 10, 30 and 60 seconds; it does not watch your keystrokes) to find words you fixed, and suggests them in Dictionary. With `dictionary_auto_add` on, a capitalization or close spelling fix of a single uncommon word made in two separate dictations is added without asking, and the pill says so.
+
+The leading space goes by the field too: a dictation joins the text before it with a space only where a word or sentence has just ended. Where the field can't be read, only a dictation moments after the last one, in the same app, with no typing or mouse click since, gets one.
+
+**Password fields and password managers are never read**: nothing from a field UI Automation marks as a password (or one whose password state can't be read), and no UI Automation call at all into a denylisted app (1Password, Bitwarden, KeePass/KeePassXC, LastPass, Dashlane, Keeper, the Windows credential and sign-in prompts, Settings and others; see `DENYLIST` in `voisr\ax_context.py`). Every read is time-limited (0.15 s, through UI Automation's own transaction timeout), runs off the push-to-talk path, and a failure or a hung app only costs that dictation its context: a read that runs out of time counts as unknown, never as a missed paste.
+
+Screen text stays in memory for that dictation and is never written to history, logs or any file, and never sent anywhere. History records which app you dictated into (its process name, left out for password managers), the paste's verdict and how many words you corrected. `%LOCALAPPDATA%\Voisr\suggestions.json` holds only corrected word pairs (`voiser` → `Voisr`), what happened to each, and how often each dictionary entry fired. Clicks are noticed through Raw Input, which only watches: it never delays a click.
+
 ## Configuration (`config.json`)
 
 `%LOCALAPPDATA%\Voisr\config.json`:
@@ -101,11 +117,15 @@ The dashboard (Start Menu → Voisr, or the Desktop shortcut) launches to a syst
   "pill_color": null,
   "launch_at_login": false,
   "appearance": "system",
-  "check_for_updates": true
+  "check_for_updates": true,
+  "use_screen_context": true,
+  "learn_from_edits": true,
+  "dictionary_auto_add": true,
+  "snippets": {"my email": "andre@example.com"}
 }
 ```
 
-Add a dictionary entry for **every variant the ASR produces** for a term — dictate the word once, see what comes out, and map it. The dictionary's written forms are also passed to whisper as a glossary prompt (most recent 40 terms) to bias spelling.
+Add a dictionary entry for **every variant the ASR produces** for a term — dictate the word once, see what comes out, and map it. The dictionary's written forms are also passed to whisper as a glossary prompt (most recent 40 terms, after snippet phrases a clip that short could be, then terms from the screen if room is left) to bias spelling.
 
 A hand-edited value of the wrong type falls back to its default (the rest of the file is kept, and a dictionary keeps its valid entries). A file that isn't valid JSON at all is moved aside to `config.json.corrupt-<timestamp>` rather than overwritten, and the dashboard says so once on the next launch. Settings are written atomically.
 
@@ -152,6 +172,8 @@ The two tests marked `slow` need **ffmpeg** on PATH (`winget install Gyan.FFmpeg
 ```powershell
 venv\Scripts\python -m pytest -m "not slow"
 ```
+
+`tests\test_uia_real.py` reads real Edit and RichEdit boxes in another process through UI Automation, takes the foreground for a moment and pastes once through the real clipboard. `scripts\bench_context.py` prints what screen context costs on your PC; with `--focused` it reads whichever field you click into (Chrome, Word, Teams), so you can see what an app gives and how fast.
 
 `node --test tests/js/` (without the glob) fails on Node 24 — it treats the directory path as a module specifier instead of discovering the `.test.mjs` files inside it. Use the glob form.
 
