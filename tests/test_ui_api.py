@@ -281,7 +281,7 @@ def test_history_failure_warns_but_still_delivers(tmp_path):
         recorder_factory=FakeRecorder,
         transcribe_fn=lambda wav: "still usable",
         clipboard_fn=copied.append,
-        clock=iter([1.0, 2.0]).__next__,
+        clock=iter([1.0, 2.0] + [3.0] * 20).__next__,
     )
     try:
         api.start_recording()

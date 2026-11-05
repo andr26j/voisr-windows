@@ -223,7 +223,9 @@ def test_dismissed_stays_dismissed(tmp_path):
     assert store.pending() == []
 
 
-def test_store_keeps_only_the_pair_and_is_private(tmp_path):
+def test_store_keeps_only_the_pair(tmp_path):
+    # Private by where it lives: %LOCALAPPDATA% is the user's own, and Windows
+    # has no mode bits to set (history.py says the same).
     path = tmp_path / "s.json"
     store = SuggestionStore(path)
     store.observe([("voiser", "Voisr")])
@@ -232,7 +234,7 @@ def test_store_keeps_only_the_pair_and_is_private(tmp_path):
     assert set(data) == {"pairs", "used"}
     assert set(data["pairs"][0]) == {"id", "heard", "written", "seen", "status", "last_seen"}
     assert data["used"] == {"voiser": 2}
-    assert path.stat().st_mode & 0o077 == 0
+    assert not list(tmp_path.glob(".s.json.*.tmp")), "no temp file left behind"
 
 
 def test_a_corrupt_store_is_set_aside_not_overwritten(tmp_path):

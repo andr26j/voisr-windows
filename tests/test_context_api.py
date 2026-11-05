@@ -1015,6 +1015,7 @@ def test_a_notice_does_not_cover_a_dictation_result(tmp_path):
 
     service = HotkeyService(api, widget=Widget(), hide_delay=0.1)
     service.NOTICE_RETRY_S = 0.01
+    service.NOTICE_TRIES = 300  # outlasts the 0.3 s hold however sleep rounds
     service.NOTICE_HOLD_S = 0
     done = Future()
     done.set_result(Result())
